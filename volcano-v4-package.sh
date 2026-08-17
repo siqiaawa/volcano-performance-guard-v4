@@ -41,7 +41,7 @@ Overrides:
 Inspection/output:
   --list-profiles             Print maintained profiles and exit
   --list-images               Resolve and print configured images without pulling
-  --split-size SIZE           Optional split(1) size, e.g. 1900m
+  --split-size SIZE           Optional split(1) size, e.g. 1900M
   --publish OWNER/REPOSITORY  Upload generated assets with gh
   --release-tag TAG           Required with --publish
   --keep-work-dir             Keep temporary staging
@@ -431,7 +431,7 @@ if [[ -n "$SPLIT_SIZE" ]]; then
   need split
   split -b "$SPLIT_SIZE" -d -a 3 "$BUNDLE_PATH" "${BUNDLE_PATH}.part-"
   (cd "$OUTPUT_DIR" && sha256sum "$(basename "$BUNDLE_PATH").part-"* > "$(basename "$BUNDLE_PATH").parts.sha256")
-  UPLOAD_ASSETS=("${BUNDLE_PATH}.part-"* "${BUNDLE_PATH}.parts.sha256" "${BUNDLE_PATH}.sha256")
+  UPLOAD_ASSETS=("${BUNDLE_PATH}.part-"* "${BUNDLE_PATH}.parts.sha256")
 fi
 if [[ -n "$PUBLISH_REPO" ]]; then
   need gh

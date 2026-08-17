@@ -17,13 +17,13 @@ README.md                   使用与维护说明
 外网 CentOS 8 服务器执行一条命令：
 
 ```bash
-bash volcano-v4-package.sh --k8s-version v1.32.5 --volcano-ref v1.15.0 --profile full --output ./release-assets
+bash volcano-v4-package.sh --k8s-version v1.32.5 --volcano-ref v1.15.0 --profile full --output ./release-assets --split-size 1900M
 ```
 
-把生成的 `.tar.gz` 和 `.tar.gz.sha256` 传到内网 CentOS 7 服务器，然后执行一条命令：
+把生成的全部 `.part-NNN` 和 `.parts.sha256` 放到内网 CentOS 7 服务器的同一目录，然后执行一条命令：
 
 ```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.32.5-*-full.tar.gz --output ./results
+bash volcano-v4-deploy.sh --bundle ./release-assets/volcano-v4-1.32.5-*-full.tar.gz.part-000 --output ./results
 ```
 
 `full` 默认依次运行完整 E2E 能力集合和全部已维护 Benchmark 配置。第一次验证建议先用较小的 `e2e-basic`：
@@ -275,7 +275,7 @@ bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --list-capabilities --output 
 ```bash
 bash volcano-v4-package.sh \
   --k8s-version v1.32.5 --volcano-ref v1.15.0 --profile full \
-  --output ./release-assets \
+  --output ./release-assets --split-size 1900M \
   --publish siqiaawa/volcano-performance-guard-v4 --release-tag v2.0
 ```
 
@@ -283,7 +283,7 @@ bash volcano-v4-package.sh \
 
 1. 打包机只生成文件，然后用能登录 GitHub 的电脑在 Release 网页上传；
 2. 用 `scp`、SFTP、内网文件中转或对象存储把文件传到能访问 GitHub 的电脑；
-3. GitHub 单文件限制或链路不稳定时加 `--split-size 1900m`，上传所有 `.part-NNN` 和 `.parts.sha256`；内网只需把 `--bundle` 指向 `.part-000`，部署脚本会校验并重组；
+3. 完整包建议始终加 `--split-size 1900M`，使每个 Release asset 低于 GitHub 的 2 GiB 单文件限制；上传所有 `.part-NNN` 和 `.parts.sha256`，内网只需把 `--bundle` 指向 `.part-000`，部署脚本会校验并重组；
 4. 在另一台已安装 `gh` 且已认证的机器执行 `gh release upload TAG 文件... --repo siqiaawa/volcano-performance-guard-v4`。
 
 不要只传分片而漏掉 `.parts.sha256`；也不要在传输后跳过 SHA256 校验。
