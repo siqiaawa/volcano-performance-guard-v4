@@ -95,6 +95,8 @@ bash volcano-v4-deploy.sh \
   --bundle ./volcano-v4-1.36.1-5a15213d8ebb-both.tar.gz
 ```
 
+如果旧的 v4.1.0 包在 CentOS 7 上报 `loaded image ID mismatch`，不需要重新传输大包：只把仓库中最新的 `volcano-v4-deploy.sh` 作为包外入口传到同一台服务器，再用上面的 `--bundle` 命令指向原 `.tar.gz`。不要覆盖已解压包内受 `SHA256SUMS` 保护的旧脚本；新版入口会校验并使用原包内容。
+
 也可以直接给出可访问的下载地址：
 
 ```bash
@@ -288,7 +290,7 @@ SHA256SUMS
 - `tools.tar.gz`：Kind、kubectl、Helm、jq、Go 和 Ginkgo 的 Linux AMD64 文件。
 - `SHA256SUMS`：上述四个运行文件的内部完整性校验。
 
-外层还会生成 `BUNDLE.tar.gz.sha256`。部署脚本在校验文件与压缩包相邻时会先校验外层哈希，解压后始终校验内部 `SHA256SUMS`，然后才执行 `docker load`。
+外层还会生成 `BUNDLE.tar.gz.sha256`。部署脚本在校验文件与压缩包相邻时会先校验外层哈希，解压后始终校验内部 `SHA256SUMS`，然后才执行 `docker load`。Docker 的 containerd 镜像存储会把 OCI 索引/manifest-list 摘要显示为镜像 ID，而 CentOS 7 上的较老 Docker 在加载同一归档后可能显示具体镜像的配置摘要；部署脚本会从已校验的 `images.tar.gz` 中取得配置摘要并接受这两种等价身份，同时仍要求镜像标签存在且实际解析为 `linux/amd64`。
 
 依赖包不包含：
 

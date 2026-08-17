@@ -4,7 +4,7 @@
 # code, Benchmark code or module cache is stored in the bundle.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.1.0"
+SCRIPT_VERSION="v4.1.1"
 DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
 DEFAULT_KIND_VERSION="v0.32.0"
 DEFAULT_HELM_VERSION="v3.21.4"

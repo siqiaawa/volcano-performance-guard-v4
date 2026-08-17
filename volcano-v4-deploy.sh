@@ -4,7 +4,7 @@
 # E2E or Benchmark code. No Python or project-specific helper is required.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.1.0"
+SCRIPT_VERSION="v4.1.1"
 DEFAULT_GOPROXY="https://proxy.golang.org,direct"
 DEFAULT_GOSUMDB="sum.golang.org"
 
@@ -240,23 +240,6 @@ valid_text "$BENCHMARK_SCENARIO" || die "invalid selected Benchmark scenario"
 valid_text "$BENCHMARK_PROFILE" || die "invalid selected Benchmark profile"
 [[ "$BENCHMARK_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "invalid Benchmark rounds"
 
-log "loading ordinary Docker images from bundle"
-gzip -dc "$BUNDLE_ROOT/images.tar.gz" | docker image load | tee "$OUTPUT_DIR/docker-load.log"
-NODE_IMAGE=""
-RUNTIME_IMAGES=()
-for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
-  key="${IMAGE_KEYS[$index]}"; save_ref="${IMAGE_SAVE_REFS[$index]}"; expected_id="${IMAGE_IDS[$index]}"
-  observed="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "$save_ref" 2>/dev/null)" || \
-    die "loaded image is missing: $save_ref"
-  [[ "${observed%%|*}" == "linux/amd64" ]] || die "loaded image platform mismatch: $save_ref"
-  [[ "${observed#*|}" == "$expected_id" ]] || die "loaded image ID mismatch: $save_ref"
-  if [[ "$key" == "kind-node" ]]; then NODE_IMAGE="$save_ref"; fi
-  if [[ "$key" == e2e-* || "$key" == benchmark-* || "$key" == "kwok" || "$key" == extra-* ]]; then
-    RUNTIME_IMAGES+=("$save_ref")
-  fi
-done
-[[ -n "$NODE_IMAGE" ]] || die "bundle does not define kind-node"
-
 TOOLS_DIR="$WORK_DIR/tools"
 BIN_DIR="$TOOLS_DIR/bin"
 mkdir -p "$BIN_DIR"
@@ -320,6 +303,50 @@ go version | grep -F " $GO_TOOLCHAIN " >/dev/null || die "packaged Go version mi
 ginkgo version | tee "$OUTPUT_DIR/ginkgo-version.log"
 ginkgo version | grep -F "${GINKGO_VERSION#v}" >/dev/null || die "packaged Ginkgo version mismatch"
 go env GOPROXY GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
+
+# Docker's containerd image store reports an OCI index/manifest-list digest as
+# .Id, while older Docker releases report the selected image config digest
+# after loading the same docker-save archive. Both identities are bound to the
+# already verified images.tar.gz. Read the archive's config identity so the
+# cross-version check remains strict without assuming one Docker storage model.
+IMAGE_ARCHIVE_MANIFEST="$WORK_DIR/image-manifest.json"
+gzip -dc "$BUNDLE_ROOT/images.tar.gz" | tar -xOf - manifest.json > "$IMAGE_ARCHIVE_MANIFEST"
+[[ -s "$IMAGE_ARCHIVE_MANIFEST" ]] || die "image archive manifest is missing"
+jq -e 'type == "array" and length > 0' "$IMAGE_ARCHIVE_MANIFEST" >/dev/null || \
+  die "image archive manifest is invalid"
+
+log "loading ordinary Docker images from bundle"
+gzip -dc "$BUNDLE_ROOT/images.tar.gz" | docker image load | tee "$OUTPUT_DIR/docker-load.log"
+NODE_IMAGE=""
+RUNTIME_IMAGES=()
+for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
+  key="${IMAGE_KEYS[$index]}"; save_ref="${IMAGE_SAVE_REFS[$index]}"; expected_id="${IMAGE_IDS[$index]}"
+  [[ "$expected_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid packaged image ID: $save_ref"
+  archive_config_path="$(jq -er --arg ref "$save_ref" '
+    [.[] | select((.RepoTags // []) | index($ref)) | .Config] | unique |
+    if length == 1 then .[0] else error("image tag is absent or ambiguous") end
+  ' "$IMAGE_ARCHIVE_MANIFEST")" || die "image archive identity is missing: $save_ref"
+  archive_config_hash="${archive_config_path##*/}"
+  archive_config_hash="${archive_config_hash%.json}"
+  [[ "$archive_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "invalid image archive identity: $save_ref"
+  archive_config_id="sha256:$archive_config_hash"
+
+  observed="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "$save_ref" 2>/dev/null)" || \
+    die "loaded image is missing: $save_ref"
+  [[ "${observed%%|*}" == "linux/amd64" ]] || die "loaded image platform mismatch: $save_ref"
+  observed_id="${observed#*|}"
+  if [[ "$observed_id" != "$expected_id" && "$observed_id" != "$archive_config_id" ]]; then
+    die "loaded image ID mismatch: $save_ref (loaded $observed_id; expected $expected_id or $archive_config_id)"
+  fi
+  if [[ "$observed_id" == "$archive_config_id" && "$observed_id" != "$expected_id" ]]; then
+    log "accepted Docker config identity for $save_ref: $observed_id"
+  fi
+  if [[ "$key" == "kind-node" ]]; then NODE_IMAGE="$save_ref"; fi
+  if [[ "$key" == e2e-* || "$key" == benchmark-* || "$key" == "kwok" || "$key" == extra-* ]]; then
+    RUNTIME_IMAGES+=("$save_ref")
+  fi
+done
+[[ -n "$NODE_IMAGE" ]] || die "bundle does not define kind-node"
 
 CHECKOUT="$WORK_DIR/volcano"
 log "fetching exact Volcano commit $VOLCANO_COMMIT"
