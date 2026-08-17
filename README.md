@@ -2,11 +2,11 @@
 
 这个项目用两个 Bash 脚本完成 Volcano Candidate 的依赖打包和一键验证：
 
-- `volcano-v4-package.sh`：在外网 CentOS 8 服务器上拉取少量基础/运行镜像，生成可传输的依赖包。
-- `volcano-v4-deploy.sh`：在内网 CentOS 7 服务器上校验并加载依赖包，拉取精确 Candidate 源码，构建并运行 E2E、Benchmark 或两者。
+- `volcano-v4-package.sh`：在外网 CentOS 8 服务器上拉取少量基础/运行镜像和精确版本工具，生成可传输的依赖包。
+- `volcano-v4-deploy.sh`：在内网 CentOS 7 服务器上校验并加载镜像和工具，拉取精确 Candidate 源码，构建并运行 E2E、Benchmark 或两者。
 - `README.md`：项目用法说明。它不是运行时依赖，也不会被放进生成的依赖包。
 
-项目没有 Python、Go 辅助程序、私有 registry、适配器或额外配置框架。外网使用 `docker pull` 和 `docker save`，内网使用 `docker load`，导入的内容就是普通的本地 Docker 镜像。
+项目没有 Python、Go 辅助程序、私有 registry、适配器或额外配置框架。外网使用 `docker pull` 和 `docker save`，内网使用 `docker load`，导入的内容就是普通的本地 Docker 镜像。版本敏感的 Linux 工具以普通文件放在 `tools.tar.gz`，不会安装或覆盖服务器的系统工具。
 
 ## 外网与内网的明确职责
 
@@ -15,20 +15,22 @@
 1. 根据命令行选择维护列表中的几个镜像。
 2. 用 `docker pull --platform linux/amd64` 下载这些镜像。
 3. 用 `docker save` 把这些镜像保存成 `images.tar.gz`。
-4. 记录所选 Kubernetes、Volcano ref、解析后的精确 commit 和镜像 ID，生成校验文件与最终压缩包。
-5. 根据需要把压缩包上传到 GitHub Release，或交给其他文件传输渠道。
+4. 从精确 Candidate commit 的单个 `go.mod` 读取 Go/Ginkgo 版本；公开 GitHub 仓库直接读取 commit-addressed raw 文件，其他仓库才回退到临时浅 fetch，二者都不进入交付包。
+5. 下载并校验 Kind、kubectl、Helm、jq、Go，构建 Candidate 锁定版本的 Ginkgo，保存为 `tools.tar.gz`。
+6. 记录所选版本、Candidate commit、镜像 ID 和每个工具的 SHA256，生成最终压缩包。
+7. 根据需要把压缩包上传到 GitHub Release，或交给其他文件传输渠道。
 
-外网打包脚本不会执行 `git clone`、`git fetch` 或源码构建。对于分支/tag，它只使用 `git ls-remote` 查询对应 commit；对于命令行直接给出的 40 位 commit，连这一步查询也不需要。它不会把 Volcano 源码、E2E/Benchmark 源码、Go module 或已经构建好的 Candidate 组件镜像放入依赖包。
+外网打包脚本会把分支/tag 解析成精确 commit，并读取该 commit 的 `go.mod`、构建匹配版本的 Ginkgo。公开 GitHub 仓库不需要为此 fetch 整个 commit；非 GitHub/无法读取 raw 文件时才使用临时浅 fetch。临时文件和构建缓存完成后会删除；它不会把 Volcano 源码、E2E/Benchmark 源码、Go module cache 或已经构建好的 Candidate 组件镜像放入依赖包。
 
 内网服务器才做以下事情：
 
-1. 校验依赖包，并用 `docker load` 把基础镜像和测试运行镜像导入普通的本地 Docker 镜像列表。
+1. 校验依赖包，用 `docker load` 把镜像导入普通的本地 Docker 镜像列表，并把包内工具解压到本次工作目录。
 2. 根据 `bundle.meta` 中固定的 40 位 commit，从所选 Volcano 仓库重新拉取 Candidate 源码并核对 `HEAD`。
 3. 使用 Candidate 自己的 Dockerfile、Makefile、Helm Chart、E2E 和 Benchmark 代码。
 4. 使用外网导入的基础镜像，在本地构建 `vc-scheduler`、`vc-controller-manager`、`vc-webhook-manager` 等 Candidate 组件运行镜像。
 5. 把刚构建的 Candidate 组件镜像，以及外网导入的 E2E/Benchmark 运行镜像，一起加载到新建的 Kind 集群并执行验证。
 
-也就是说，传输包负责“少量基础镜像和测试镜像”，精确 Candidate 源码与 Candidate 组件运行镜像负责“内网重新拉取和本地组合构建”。整个过程不启动额外 registry，也不会把外网机器上的源码快照混入 Candidate。
+也就是说，传输包负责“少量基础/测试镜像和精确工具”，精确 Candidate 源码与 Candidate 组件运行镜像负责“内网重新拉取和本地组合构建”。整个过程不启动额外 registry，也不会把外网机器上的源码快照混入 Candidate。
 
 ## 默认镜像及精确版本
 
@@ -45,6 +47,21 @@
 | `kwok` | `registry.k8s.io/kwok/kwok:v0.7.0` | `benchmark`、`both` | Benchmark 的 KWOK 节点模拟镜像 |
 
 因此，默认 `both` 是 7 个逻辑项，但两个 busybox 项指向同一个镜像，实际只保存 6 个唯一镜像。执行 `--list-images` 可以在下载前看到本次选择的最终列表。未来 Candidate 基础镜像或测试依赖变化时，应通过 `--set-image`/`--add-image` 调整，或者直接更新脚本顶部的这份小列表。
+
+## 包内工具及版本规则
+
+以下版本敏感工具会进入 `tools.tar.gz`，内网不再从官方下载站点重新下载：
+
+| 工具 | 版本来源 |
+| --- | --- |
+| Kind | `--kind-version`，默认 `v0.32.0` |
+| kubectl | 跟随必填的 `--k8s-version` |
+| Helm | `--helm-version`，默认 `v3.21.4` |
+| jq | 脚本锁定 `jq-1.8.2` |
+| Go | 从精确 Candidate 的 `go.mod` 读取；缺少 patch 时与精确 `go-builder` 镜像版本对齐 |
+| Ginkgo | 从精确 Candidate 的 `go.mod` 读取并在外网构建 |
+
+这些工具只会解压到本次 `--work-dir` 下并临时加入 `PATH`，不会写入 `/usr/bin`，也不会覆盖服务器已经安装的同名程序。Bash、Git、Docker/Buildx、curl、tar、gzip、sha256sum、make 等宿主基础能力不会放进包，部署脚本只检查并复用服务器现有版本。
 
 ## 最短使用方式
 
@@ -103,12 +120,12 @@ bash volcano-v4-deploy.sh
 
 - Bash 4+
 - 可用的 Docker daemon
-- `git`、`tar`、`gzip`、`sha256sum`、`awk`、`sed`、`sort`、`mktemp`
+- `curl`、`git`、`tar`、`gzip`、`sha256sum`、`awk`、`sed`、`sort`、`mktemp`
 - 当前用户有 Docker 权限
-- 能访问所选镜像仓库和 Volcano Git 仓库
+- 能访问所选镜像仓库、Volcano Git 仓库、Go/module 渠道及各工具官方下载地址
 - 如使用自动发布功能，还需要已登录的 GitHub CLI `gh`
 
-打包脚本不会安装系统软件，也不会下载或保存 Volcano 源码、Go module、E2E 源码或 Benchmark 源码。
+打包脚本不会安装系统软件。它会临时读取 Candidate `go.mod` 并使用 Go module 渠道构建精确 Ginkgo，但不会把 Volcano 源码、Go module cache、E2E 源码或 Benchmark 源码放进交付包。
 
 ### 内网 CentOS 7
 
@@ -119,10 +136,10 @@ bash volcano-v4-deploy.sh
 - Docker buildx 插件，并且 `default` builder 的 driver 是 `docker`
 - `curl`、`git`、`tar`、`gzip`、`sha256sum`、`awk`、`sed`、`grep`、`sort`、`mktemp`、`make`、`tee`
 - 当前用户有 Docker 权限
-- 能访问 Volcano Git 仓库、Go 下载站点、Go module 渠道，以及 Kind、kubectl、Helm、jq 的官方下载地址
+- 能访问 Volcano Git 仓库和运行 Candidate 所需的 Go module 渠道；不再需要访问 Kind、kubectl、Helm、jq、Go 的官方下载地址
 - 足够的磁盘空间用于 Docker 镜像、Candidate 构建、Kind 节点和测试结果
 
-部署脚本会把精确版本的 Kind、kubectl、Helm、jq、Go 和 Candidate 锁定的 Ginkgo 下载到临时工作目录，不会安装到系统目录，因此不依赖 CentOS 7 自带的旧 Python 或旧 Go。
+部署脚本会校验并解压包内精确版本的 Kind、kubectl、Helm、jq、Go 和 Candidate 锁定的 Ginkgo，不会联网重新下载这些工具，也不会安装到系统目录，因此不依赖 CentOS 7 自带的旧 Python 或旧 Go。
 
 如果服务器已有可用的代理环境变量，脚本会自动继承 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`；不需要填写任何占位符。Go 默认使用：
 
@@ -131,7 +148,7 @@ GOPROXY=https://proxy.golang.org,direct
 GOSUMDB=sum.golang.org
 ```
 
-只有内网规定了专用 Go 渠道时才需要显式覆盖：
+这里的 Go 渠道用于 Candidate 构建/E2E 所需 module，而不是下载 Go 工具本身。只有内网规定了专用 Go 渠道时才需要显式覆盖：
 
 ```bash
 bash volcano-v4-deploy.sh \
@@ -255,19 +272,21 @@ Candidate 新增了 E2E 或 Benchmark 运行镜像时，直接追加：
 
 ## 依赖包里有什么
 
-生成的 `.tar.gz` 只有一个顶层目录，目录内固定为四个文件：
+生成的 `.tar.gz` 只有一个顶层目录，目录内固定为五个文件：
 
 ```text
 volcano-v4-deploy.sh
 bundle.meta
 images.tar.gz
+tools.tar.gz
 SHA256SUMS
 ```
 
 - `volcano-v4-deploy.sh`：内网入口脚本。
-- `bundle.meta`：精确版本、Candidate commit、模式、镜像引用和镜像 ID。
+- `bundle.meta`：精确版本、Candidate commit、模式、镜像引用/ID、工具路径和工具 SHA256。
 - `images.tar.gz`：`docker save` 结果的 gzip 压缩文件。
-- `SHA256SUMS`：上述三个运行文件的内部完整性校验。
+- `tools.tar.gz`：Kind、kubectl、Helm、jq、Go 和 Ginkgo 的 Linux AMD64 文件。
+- `SHA256SUMS`：上述四个运行文件的内部完整性校验。
 
 外层还会生成 `BUNDLE.tar.gz.sha256`。部署脚本在校验文件与压缩包相邻时会先校验外层哈希，解压后始终校验内部 `SHA256SUMS`，然后才执行 `docker load`。
 
@@ -277,7 +296,7 @@ SHA256SUMS
 - E2E/Benchmark 源码副本
 - Go module cache
 - 已构建的 Volcano Candidate 组件镜像
-- Python、Go 辅助程序或额外 registry
+- Python、项目自定义 Go 辅助程序或额外 registry
 
 这些内容由内网部署脚本根据包内精确 commit 和 Candidate 自身文件在线获取或构建。
 

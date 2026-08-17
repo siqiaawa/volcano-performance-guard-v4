@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# External-server entrypoint: download a small maintained image set and create
-# one transport bundle.  No Volcano source, E2E code, Benchmark code or module
-# cache is stored in the bundle.
+# External-server entrypoint: download a small maintained image set and the
+# exact test tools, then create one transport bundle. No Volcano source, E2E
+# code, Benchmark code or module cache is stored in the bundle.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.0.0"
+SCRIPT_VERSION="v4.1.0"
 DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
 DEFAULT_KIND_VERSION="v0.32.0"
 DEFAULT_HELM_VERSION="v3.21.4"
+DEFAULT_GOPROXY="https://proxy.golang.org,direct"
+DEFAULT_GOSUMDB="sum.golang.org"
+JQ_VERSION="jq-1.8.2"
+JQ_SHA256="b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f"
 DEFAULT_GO_BUILDER="golang:1.26.2"
 DEFAULT_RUNTIME_BASE="alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
 DEFAULT_E2E_BUSYBOX="busybox:1.36"
@@ -34,6 +38,8 @@ Selection:
   --volcano-repo URL          Default: official Volcano repository
   --kind-version VERSION      Default: v0.32.0
   --helm-version VERSION      Default: v3.21.4
+  --goproxy VALUE             Go module source used to build packaged Ginkgo
+  --gosumdb VALUE             Go checksum database used to build Ginkgo
   --e2e-type TYPE             Candidate E2E_TYPE; default: SCHEDULINGGATES
   --benchmark-scenario NAME   Default: gang
   --benchmark-profile PATH    Candidate-relative profile; default:
@@ -58,8 +64,10 @@ Output and publication:
   -h, --help
 
 The script inherits HTTP_PROXY/HTTPS_PROXY/NO_PROXY from the server. It does
-not require proxy placeholders. The generated bundle contains only
-volcano-v4-deploy.sh, bundle.meta, images.tar.gz and SHA256SUMS.
+not require proxy placeholders. The generated bundle contains
+volcano-v4-deploy.sh, bundle.meta, images.tar.gz, tools.tar.gz and SHA256SUMS.
+tools.tar.gz contains exact linux/amd64 Kind, kubectl, Helm, jq, Go and
+Candidate-defined Ginkgo.
 EOF
 }
 
@@ -74,6 +82,8 @@ VOLCANO_REF=""
 K8S_VERSION=""
 KIND_VERSION="$DEFAULT_KIND_VERSION"
 HELM_VERSION="$DEFAULT_HELM_VERSION"
+GOPROXY_VALUE="${GOPROXY:-$DEFAULT_GOPROXY}"
+GOSUMDB_VALUE="${GOSUMDB:-$DEFAULT_GOSUMDB}"
 MODE=""
 OUTPUT_DIR=""
 E2E_TYPE="SCHEDULINGGATES"
@@ -96,6 +106,8 @@ while [[ $# -gt 0 ]]; do
     --volcano-ref) VOLCANO_REF="${2:-}"; shift 2 ;;
     --kind-version) KIND_VERSION="${2:-}"; shift 2 ;;
     --helm-version) HELM_VERSION="${2:-}"; shift 2 ;;
+    --goproxy) GOPROXY_VALUE="${2:-}"; shift 2 ;;
+    --gosumdb) GOSUMDB_VALUE="${2:-}"; shift 2 ;;
     --mode) MODE="${2:-}"; shift 2 ;;
     --output) OUTPUT_DIR="${2:-}"; shift 2 ;;
     --e2e-type) E2E_TYPE="${2:-}"; shift 2 ;;
@@ -129,6 +141,8 @@ valid_text "$VOLCANO_REF" || die "invalid --volcano-ref"
 valid_text "$E2E_TYPE" || die "invalid --e2e-type"
 valid_text "$BENCHMARK_SCENARIO" || die "invalid --benchmark-scenario"
 valid_text "$BENCHMARK_PROFILE" || die "invalid --benchmark-profile"
+valid_text "$GOPROXY_VALUE" || die "invalid --goproxy"
+valid_text "$GOSUMDB_VALUE" || die "invalid --gosumdb"
 if [[ -n "$PUBLISH_REPO" && -z "$RELEASE_TAG" ]]; then
   die "--release-tag is required with --publish"
 fi
@@ -187,7 +201,7 @@ if [[ "$LIST_IMAGES" == true ]]; then
   exit 0
 fi
 
-for command in docker git tar gzip sha256sum awk sed sort mktemp; do need "$command"; done
+for command in curl docker git tar gzip sha256sum awk sed sort mktemp; do need "$command"; done
 docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
 [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] || \
   die "packaging requires Linux x86_64"
@@ -232,6 +246,145 @@ DEPLOY_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/volcano-v4-deplo
 cp "$DEPLOY_SCRIPT" "$STAGE/volcano-v4-deploy.sh"
 chmod 0755 "$STAGE/volcano-v4-deploy.sh"
 
+# Fetch only enough Candidate metadata to lock its host Go and Ginkgo tools.
+# Public GitHub repositories use one commit-addressed raw file; other URLs
+# fall back to a temporary shallow fetch. Neither path is copied to the bundle.
+META_CHECKOUT="$WORK_DIR/candidate-meta"
+CANDIDATE_GO_MOD="$WORK_DIR/candidate.go.mod"
+log "reading Candidate tool versions from exact commit $VOLCANO_COMMIT"
+raw_loaded=false
+if [[ "$VOLCANO_REPO" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
+  github_owner="${BASH_REMATCH[1]}"
+  github_repo="${BASH_REMATCH[2]%.git}"
+  if curl --fail --location --retry 1 --connect-timeout 10 --max-time 20 \
+    -o "${CANDIDATE_GO_MOD}.part" \
+    "https://raw.githubusercontent.com/${github_owner}/${github_repo}/${VOLCANO_COMMIT}/go.mod"; then
+    mv "${CANDIDATE_GO_MOD}.part" "$CANDIDATE_GO_MOD"
+    raw_loaded=true
+  else
+    rm -f "${CANDIDATE_GO_MOD}.part"
+    log "raw Candidate metadata unavailable; falling back to a shallow Git fetch"
+  fi
+fi
+if [[ "$raw_loaded" != true ]]; then
+  git init "$META_CHECKOUT" >/dev/null
+  git -C "$META_CHECKOUT" remote add origin "$VOLCANO_REPO"
+  git -C "$META_CHECKOUT" fetch --depth 1 origin "$VOLCANO_COMMIT"
+  git -C "$META_CHECKOUT" show FETCH_HEAD:go.mod > "$CANDIDATE_GO_MOD"
+fi
+[[ -s "$CANDIDATE_GO_MOD" ]] || die "Candidate go.mod is empty"
+
+GO_DIRECTIVE="$(awk '$1=="go" && NF==2 {print $2; exit}' "$CANDIDATE_GO_MOD")"
+GO_TOOLCHAIN="$(awk '$1=="toolchain" && NF==2 {print $2; exit}' "$CANDIDATE_GO_MOD")"
+if [[ -z "$GO_TOOLCHAIN" ]]; then GO_TOOLCHAIN="go${GO_DIRECTIVE}"; fi
+[[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "Candidate has no usable Go version"
+if [[ ! "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  builder_go=""
+  for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
+    if [[ "${IMAGE_KEYS[$index]}" == "go-builder" && "${IMAGE_REFS[$index]}" =~ golang:([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+      builder_go="${BASH_REMATCH[1]}"
+    fi
+  done
+  if [[ -n "$builder_go" && "$builder_go" == "${GO_TOOLCHAIN#go}."* ]]; then
+    GO_TOOLCHAIN="go${builder_go}"
+  fi
+fi
+[[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+  die "Candidate Go version has no patch component; use an exact go-builder image"
+
+GINKGO_VERSION="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2; exit} $1=="require" && $2=="github.com/onsi/ginkgo/v2" {print $3; exit}' "$CANDIDATE_GO_MOD")"
+[[ "$GINKGO_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "Candidate does not lock Ginkgo v2"
+
+TOOLS_STAGE="$WORK_DIR/tools"
+TOOLS_BIN="$TOOLS_STAGE/bin"
+mkdir -p "$TOOLS_BIN"
+download_verified() {
+  local url="$1" checksum_url="$2" destination="$3" expected actual
+  expected="$(curl --fail --location --retry 3 --silent --show-error "$checksum_url" | awk 'NR==1 {print $1}')"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid upstream checksum: $checksum_url"
+  curl --fail --location --retry 3 --connect-timeout 30 -o "${destination}.part" "$url"
+  actual="$(sha256sum "${destination}.part" | awk '{print $1}')"
+  [[ "${actual,,}" == "${expected,,}" ]] || die "download hash mismatch: $url"
+  mv "${destination}.part" "$destination"
+}
+
+log "downloading exact Kind $KIND_VERSION"
+download_verified \
+  "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \
+  "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" \
+  "$TOOLS_BIN/kind"
+log "downloading exact kubectl $K8S_VERSION"
+download_verified \
+  "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" \
+  "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl.sha256" \
+  "$TOOLS_BIN/kubectl"
+log "downloading exact Helm $HELM_VERSION"
+helm_archive="$WORK_DIR/helm.tar.gz"
+download_verified \
+  "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+  "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz.sha256sum" \
+  "$helm_archive"
+tar -xzf "$helm_archive" -C "$WORK_DIR"
+mv "$WORK_DIR/linux-amd64/helm" "$TOOLS_BIN/helm"
+rm -rf -- "$WORK_DIR/linux-amd64" "$helm_archive"
+log "downloading exact jq $JQ_VERSION"
+curl --fail --location --retry 3 --connect-timeout 30 -o "$TOOLS_BIN/jq.part" \
+  "https://github.com/jqlang/jq/releases/download/${JQ_VERSION}/jq-linux-amd64"
+[[ "$(sha256sum "$TOOLS_BIN/jq.part" | awk '{print $1}')" == "$JQ_SHA256" ]] || die "jq hash mismatch"
+mv "$TOOLS_BIN/jq.part" "$TOOLS_BIN/jq"
+chmod 0755 "$TOOLS_BIN/kind" "$TOOLS_BIN/kubectl" "$TOOLS_BIN/helm" "$TOOLS_BIN/jq"
+
+log "downloading Candidate Go toolchain $GO_TOOLCHAIN"
+go_filename="${GO_TOOLCHAIN}.linux-amd64.tar.gz"
+go_archive="$WORK_DIR/$go_filename"
+go_release_index="$WORK_DIR/go-releases.json"
+curl --fail --location --retry 3 --connect-timeout 30 \
+  -o "$go_release_index" 'https://go.dev/dl/?mode=json&include=all'
+# The dollar-prefixed names below are jq variables, not shell expansions.
+# shellcheck disable=SC2016
+go_expected_sha="$("$TOOLS_BIN/jq" -r --arg version "$GO_TOOLCHAIN" --arg filename "$go_filename" '
+  .[] | select(.version == $version) | .files[] |
+  select(.filename == $filename and .os == "linux" and .arch == "amd64" and .kind == "archive") |
+  .sha256
+' "$go_release_index" | head -n 1)"
+[[ "$go_expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] || die "Go release is absent from the official download index: $GO_TOOLCHAIN"
+if ! curl --fail --location --retry 3 --connect-timeout 30 \
+  -o "${go_archive}.part" "https://dl.google.com/go/${go_filename}"; then
+  rm -f "${go_archive}.part"
+  log "direct Go storage download failed; retrying through go.dev"
+  curl --fail --location --retry 3 --connect-timeout 30 \
+    -o "${go_archive}.part" "https://go.dev/dl/${go_filename}"
+fi
+go_actual_sha="$(sha256sum "${go_archive}.part" | awk '{print $1}')"
+[[ "${go_actual_sha,,}" == "${go_expected_sha,,}" ]] || die "Go toolchain hash mismatch: $GO_TOOLCHAIN"
+mv "${go_archive}.part" "$go_archive"
+tar -xzf "$go_archive" -C "$TOOLS_STAGE"
+rm -f "$go_archive" "$go_release_index"
+
+export GOROOT="$TOOLS_STAGE/go"
+export GOTOOLCHAIN=local
+export GOPROXY="$GOPROXY_VALUE"
+export GOSUMDB="$GOSUMDB_VALUE"
+export GOPATH="$WORK_DIR/tool-gopath"
+export GOMODCACHE="$WORK_DIR/tool-go-mod-cache"
+export GOCACHE="$WORK_DIR/tool-go-build-cache"
+export PATH="$GOROOT/bin:$TOOLS_BIN:$PATH"
+log "building Candidate-defined Ginkgo $GINKGO_VERSION"
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOBIN="$TOOLS_BIN" \
+  go install "github.com/onsi/ginkgo/v2/ginkgo@${GINKGO_VERSION}"
+chmod 0755 "$TOOLS_BIN/ginkgo"
+
+"$TOOLS_BIN/kind" version | grep -F "$KIND_VERSION" >/dev/null || die "downloaded Kind version mismatch"
+kubectl_client_version="$("$TOOLS_BIN/kubectl" version --client -o json | "$TOOLS_BIN/jq" -r '.clientVersion.gitVersion')"
+[[ "$kubectl_client_version" == "$K8S_VERSION" ]] || die "downloaded kubectl version mismatch"
+"$TOOLS_BIN/helm" version --short | grep -F "$HELM_VERSION" >/dev/null || die "downloaded Helm version mismatch"
+[[ "$("$TOOLS_BIN/jq" --version)" == "$JQ_VERSION" ]] || die "downloaded jq version mismatch"
+"$GOROOT/bin/go" version | grep -F " $GO_TOOLCHAIN " >/dev/null || die "downloaded Go version mismatch"
+"$TOOLS_BIN/ginkgo" version | grep -F "${GINKGO_VERSION#v}" >/dev/null || die "built Ginkgo version mismatch"
+
+tar -C "$TOOLS_STAGE" -czf "$STAGE/tools.tar.gz" .
+[[ -s "$STAGE/tools.tar.gz" ]] || die "tool archive is empty"
+
 META="$STAGE/bundle.meta"
 {
   printf 'FORMAT=volcano-performance-guard-v4\n'
@@ -241,6 +394,9 @@ META="$STAGE/bundle.meta"
   printf 'K8S_VERSION=%s\n' "$K8S_VERSION"
   printf 'KIND_VERSION=%s\n' "$KIND_VERSION"
   printf 'HELM_VERSION=%s\n' "$HELM_VERSION"
+  printf 'JQ_VERSION=%s\n' "$JQ_VERSION"
+  printf 'GO_TOOLCHAIN=%s\n' "$GO_TOOLCHAIN"
+  printf 'GINKGO_VERSION=%s\n' "$GINKGO_VERSION"
   printf 'VOLCANO_REPO=%s\n' "$VOLCANO_REPO"
   printf 'VOLCANO_REF=%s\n' "$VOLCANO_REF"
   printf 'VOLCANO_COMMIT=%s\n' "$VOLCANO_COMMIT"
@@ -249,6 +405,12 @@ META="$STAGE/bundle.meta"
   printf 'BENCHMARK_SCENARIO=%s\n' "$BENCHMARK_SCENARIO"
   printf 'BENCHMARK_PROFILE=%s\n' "$BENCHMARK_PROFILE"
   printf 'BENCHMARK_ROUNDS=%s\n' "$BENCHMARK_ROUNDS"
+  printf 'TOOL=kind|%s|bin/kind|%s\n' "$KIND_VERSION" "$(sha256sum "$TOOLS_BIN/kind" | awk '{print $1}')"
+  printf 'TOOL=kubectl|%s|bin/kubectl|%s\n' "$K8S_VERSION" "$(sha256sum "$TOOLS_BIN/kubectl" | awk '{print $1}')"
+  printf 'TOOL=helm|%s|bin/helm|%s\n' "$HELM_VERSION" "$(sha256sum "$TOOLS_BIN/helm" | awk '{print $1}')"
+  printf 'TOOL=jq|%s|bin/jq|%s\n' "$JQ_VERSION" "$(sha256sum "$TOOLS_BIN/jq" | awk '{print $1}')"
+  printf 'TOOL=go|%s|go/bin/go|%s\n' "$GO_TOOLCHAIN" "$(sha256sum "$TOOLS_STAGE/go/bin/go" | awk '{print $1}')"
+  printf 'TOOL=ginkgo|%s|bin/ginkgo|%s\n' "$GINKGO_VERSION" "$(sha256sum "$TOOLS_BIN/ginkgo" | awk '{print $1}')"
 } > "$META"
 
 SAVE_REFS=()
@@ -293,7 +455,7 @@ docker image save "${SAVE_REFS[@]}" | gzip -1 -n > "$STAGE/images.tar.gz"
 [[ -s "$STAGE/images.tar.gz" ]] || die "image archive is empty"
 (
   cd "$STAGE"
-  sha256sum bundle.meta images.tar.gz volcano-v4-deploy.sh > SHA256SUMS
+  sha256sum bundle.meta images.tar.gz tools.tar.gz volcano-v4-deploy.sh > SHA256SUMS
 )
 tar -C "$WORK_DIR" -czf "$BUNDLE_PATH" "$BUNDLE_NAME"
 (

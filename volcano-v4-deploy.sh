@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Internal-server entrypoint: load ordinary Docker images, fetch the exact
-# Candidate source, build it with its own Dockerfiles and invoke its own E2E or
-# Benchmark code. No Python or project-specific helper binary is required.
+# Internal-server entrypoint: load packaged images and exact tools, fetch the
+# exact Candidate source, build it with its own Dockerfiles and invoke its own
+# E2E or Benchmark code. No Python or project-specific helper is required.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.0.0"
+SCRIPT_VERSION="v4.1.0"
 DEFAULT_GOPROXY="https://proxy.golang.org,direct"
 DEFAULT_GOSUMDB="sum.golang.org"
-JQ_VERSION="jq-1.8.2"
-JQ_SHA256="b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f"
 
 log() { printf '[vpg4-deploy] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -42,8 +40,8 @@ Optional selection overrides:
   --gosumdb VALUE             Default: inherited GOSUMDB or sum.golang.org
 
 The server needs Bash, curl, git, Docker, tar, gzip, sha256sum, make and basic
-POSIX utilities. Exact Kind, kubectl, Helm, jq, Go and Ginkgo are placed under
-the work directory automatically. Nothing is installed system-wide.
+POSIX utilities. Exact Kind, kubectl, Helm, jq, Go and Ginkgo are extracted
+from tools.tar.gz into the work directory. Nothing is installed system-wide.
 EOF
 }
 
@@ -171,15 +169,17 @@ else
   BUNDLE_ROOT="${roots[0]}"
 fi
 
-for required in bundle.meta images.tar.gz SHA256SUMS volcano-v4-deploy.sh; do
+for required in bundle.meta images.tar.gz tools.tar.gz SHA256SUMS volcano-v4-deploy.sh; do
   [[ -f "$BUNDLE_ROOT/$required" ]] || die "bundle is missing $required"
 done
 (cd "$BUNDLE_ROOT" && sha256sum -c SHA256SUMS)
 
-FORMAT=""; K8S_VERSION=""; KIND_VERSION=""; HELM_VERSION=""; VOLCANO_REPO=""
+FORMAT=""; K8S_VERSION=""; KIND_VERSION=""; HELM_VERSION=""; JQ_VERSION=""
+GO_TOOLCHAIN=""; GINKGO_VERSION=""; VOLCANO_REPO=""
 VOLCANO_REF=""; VOLCANO_COMMIT=""; MODE=""; E2E_TYPE=""; BENCHMARK_SCENARIO=""
 BENCHMARK_PROFILE=""; BENCHMARK_ROUNDS=""
 IMAGE_KEYS=(); IMAGE_PULL_REFS=(); IMAGE_SAVE_REFS=(); IMAGE_IDS=()
+TOOL_KEYS=(); TOOL_VERSIONS=(); TOOL_PATHS=(); TOOL_SHA256S=()
 while IFS='=' read -r name value; do
   [[ -n "$name" ]] || continue
   case "$name" in
@@ -187,6 +187,9 @@ while IFS='=' read -r name value; do
     K8S_VERSION) K8S_VERSION="$value" ;;
     KIND_VERSION) KIND_VERSION="$value" ;;
     HELM_VERSION) HELM_VERSION="$value" ;;
+    JQ_VERSION) JQ_VERSION="$value" ;;
+    GO_TOOLCHAIN) GO_TOOLCHAIN="$value" ;;
+    GINKGO_VERSION) GINKGO_VERSION="$value" ;;
     VOLCANO_REPO) VOLCANO_REPO="$value" ;;
     VOLCANO_REF) VOLCANO_REF="$value" ;;
     VOLCANO_COMMIT) VOLCANO_COMMIT="$value" ;;
@@ -200,6 +203,11 @@ while IFS='=' read -r name value; do
       IMAGE_KEYS+=("$image_key"); IMAGE_PULL_REFS+=("$pull_ref")
       IMAGE_SAVE_REFS+=("$save_ref"); IMAGE_IDS+=("$image_id")
       ;;
+    TOOL)
+      IFS='|' read -r tool_key tool_version tool_path tool_sha <<< "$value"
+      TOOL_KEYS+=("$tool_key"); TOOL_VERSIONS+=("$tool_version")
+      TOOL_PATHS+=("$tool_path"); TOOL_SHA256S+=("$tool_sha")
+      ;;
   esac
 done < "$BUNDLE_ROOT/bundle.meta"
 
@@ -207,9 +215,13 @@ done < "$BUNDLE_ROOT/bundle.meta"
 valid_semver "$K8S_VERSION" || die "invalid K8S version in bundle"
 valid_semver "$KIND_VERSION" || die "invalid Kind version in bundle"
 valid_semver "$HELM_VERSION" || die "invalid Helm version in bundle"
+[[ "$JQ_VERSION" =~ ^jq-[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid jq version in bundle"
+[[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid Go version in bundle"
+[[ "$GINKGO_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "invalid Ginkgo version in bundle"
 [[ "$VOLCANO_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "invalid Volcano commit in bundle"
 valid_mode "$MODE" || die "invalid mode in bundle"
 [[ ${#IMAGE_KEYS[@]} -gt 0 ]] || die "bundle has no images"
+[[ ${#TOOL_KEYS[@]} -eq 6 ]] || die "bundle must define six packaged tools"
 PACKAGED_MODE="$MODE"
 [[ -z "$MODE_OVERRIDE" ]] || MODE="$MODE_OVERRIDE"
 [[ -z "$E2E_TYPE_OVERRIDE" ]] || E2E_TYPE="$E2E_TYPE_OVERRIDE"
@@ -248,42 +260,66 @@ done
 TOOLS_DIR="$WORK_DIR/tools"
 BIN_DIR="$TOOLS_DIR/bin"
 mkdir -p "$BIN_DIR"
-download_verified() {
-  local url="$1" checksum_url="$2" destination="$3" expected actual
-  expected="$(curl --fail --location --retry 3 --silent --show-error "$checksum_url" | awk 'NR==1 {print $1}')"
-  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid upstream checksum: $checksum_url"
-  curl --fail --location --retry 3 --connect-timeout 30 -o "${destination}.part" "$url"
-  actual="$(sha256sum "${destination}.part" | awk '{print $1}')"
-  [[ "${actual,,}" == "${expected,,}" ]] || die "download hash mismatch: $url"
-  mv "${destination}.part" "$destination"
-}
+log "extracting exact tools from bundle"
+safe_extract_bundle "$BUNDLE_ROOT/tools.tar.gz" "$TOOLS_DIR"
+for ((index=0; index<${#TOOL_KEYS[@]}; index++)); do
+  tool_key="${TOOL_KEYS[$index]}"
+  tool_path="${TOOL_PATHS[$index]}"
+  expected_sha="${TOOL_SHA256S[$index]}"
+  [[ "$tool_key" =~ ^[a-z0-9-]+$ ]] || die "invalid packaged tool key: $tool_key"
+  [[ -n "$tool_path" && "$tool_path" != /* && "$tool_path" != ../* && "$tool_path" != *'/../'* ]] || \
+    die "unsafe packaged tool path: $tool_path"
+  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || die "invalid packaged tool checksum: $tool_key"
+  [[ -f "$TOOLS_DIR/$tool_path" ]] || die "packaged tool is missing: $tool_path"
+  actual_sha="$(sha256sum "$TOOLS_DIR/$tool_path" | awk '{print $1}')"
+  [[ "$actual_sha" == "$expected_sha" ]] || die "packaged tool hash mismatch: $tool_key"
+done
 
-log "downloading exact Kind, kubectl, Helm and jq into work directory"
-download_verified \
-  "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \
-  "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" \
-  "$BIN_DIR/kind"
-download_verified \
-  "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" \
-  "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl.sha256" \
-  "$BIN_DIR/kubectl"
-helm_archive="$TOOLS_DIR/helm.tar.gz"
-download_verified \
-  "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
-  "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz.sha256sum" \
-  "$helm_archive"
-tar -xzf "$helm_archive" -C "$TOOLS_DIR"
-mv "$TOOLS_DIR/linux-amd64/helm" "$BIN_DIR/helm"
-rm -rf -- "$TOOLS_DIR/linux-amd64" "$helm_archive"
-curl --fail --location --retry 3 --connect-timeout 30 -o "$BIN_DIR/jq.part" \
-  "https://github.com/jqlang/jq/releases/download/${JQ_VERSION}/jq-linux-amd64"
-[[ "$(sha256sum "$BIN_DIR/jq.part" | awk '{print $1}')" == "$JQ_SHA256" ]] || die "jq hash mismatch"
-mv "$BIN_DIR/jq.part" "$BIN_DIR/jq"
-chmod 0755 "$BIN_DIR/kind" "$BIN_DIR/kubectl" "$BIN_DIR/helm" "$BIN_DIR/jq"
-export PATH="$BIN_DIR:$PATH"
+for required_tool in kind kubectl helm jq go ginkgo; do
+  tool_count=0
+  for tool_key in "${TOOL_KEYS[@]}"; do
+    [[ "$tool_key" != "$required_tool" ]] || tool_count=$((tool_count+1))
+  done
+  [[ "$tool_count" -eq 1 ]] || die "bundle must define packaged tool exactly once: $required_tool"
+done
+
+for ((index=0; index<${#TOOL_KEYS[@]}; index++)); do
+  case "${TOOL_KEYS[$index]}" in
+    kind) expected_version="$KIND_VERSION"; expected_path="bin/kind" ;;
+    kubectl) expected_version="$K8S_VERSION"; expected_path="bin/kubectl" ;;
+    helm) expected_version="$HELM_VERSION"; expected_path="bin/helm" ;;
+    jq) expected_version="$JQ_VERSION"; expected_path="bin/jq" ;;
+    go) expected_version="$GO_TOOLCHAIN"; expected_path="go/bin/go" ;;
+    ginkgo) expected_version="$GINKGO_VERSION"; expected_path="bin/ginkgo" ;;
+    *) die "unknown packaged tool: ${TOOL_KEYS[$index]}" ;;
+  esac
+  [[ "${TOOL_VERSIONS[$index]}" == "$expected_version" ]] || die "packaged tool version metadata mismatch: ${TOOL_KEYS[$index]}"
+  [[ "${TOOL_PATHS[$index]}" == "$expected_path" ]] || die "packaged tool path metadata mismatch: ${TOOL_KEYS[$index]}"
+done
+
+chmod 0755 "$BIN_DIR/kind" "$BIN_DIR/kubectl" "$BIN_DIR/helm" "$BIN_DIR/jq" \
+  "$BIN_DIR/ginkgo" "$TOOLS_DIR/go/bin/go"
+export GOROOT="$TOOLS_DIR/go"
+export GOTOOLCHAIN=local
+export GOPROXY="$GOPROXY_VALUE"
+export GOSUMDB="$GOSUMDB_VALUE"
+export GOPATH="$WORK_DIR/gopath"
+export GOMODCACHE="$WORK_DIR/go-mod-cache"
+export GOCACHE="$WORK_DIR/go-build-cache"
+export PATH="$GOROOT/bin:$BIN_DIR:$PATH"
+
 kind version | tee "$OUTPUT_DIR/kind-version.log"
+kind version | grep -F "$KIND_VERSION" >/dev/null || die "packaged Kind version mismatch"
 kubectl version --client -o json > "$OUTPUT_DIR/kubectl-version.json"
+[[ "$(jq -r '.clientVersion.gitVersion' "$OUTPUT_DIR/kubectl-version.json")" == "$K8S_VERSION" ]] || die "packaged kubectl version mismatch"
 helm version --short | tee "$OUTPUT_DIR/helm-version.log"
+helm version --short | grep -F "$HELM_VERSION" >/dev/null || die "packaged Helm version mismatch"
+[[ "$(jq --version)" == "$JQ_VERSION" ]] || die "packaged jq version mismatch"
+go version | tee "$OUTPUT_DIR/go-version.log"
+go version | grep -F " $GO_TOOLCHAIN " >/dev/null || die "packaged Go version mismatch"
+ginkgo version | tee "$OUTPUT_DIR/ginkgo-version.log"
+ginkgo version | grep -F "${GINKGO_VERSION#v}" >/dev/null || die "packaged Ginkgo version mismatch"
+go env GOPROXY GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
 
 CHECKOUT="$WORK_DIR/volcano"
 log "fetching exact Volcano commit $VOLCANO_COMMIT"
@@ -296,57 +332,16 @@ git -C "$CHECKOUT" submodule update --init --recursive --depth 1
 git -C "$CHECKOUT" status --short > "$OUTPUT_DIR/candidate-status.txt"
 printf '%s\n' "$VOLCANO_COMMIT" > "$OUTPUT_DIR/candidate-commit.txt"
 
-GO_DIRECTIVE="$(awk '$1=="go" && NF==2 {print $2; exit}' "$CHECKOUT/go.mod")"
-GO_TOOLCHAIN="$(awk '$1=="toolchain" && NF==2 {print $2; exit}' "$CHECKOUT/go.mod")"
-if [[ -z "$GO_TOOLCHAIN" ]]; then GO_TOOLCHAIN="go${GO_DIRECTIVE}"; fi
-[[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "Candidate has no usable Go version"
-if [[ ! "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
-    if [[ "${IMAGE_KEYS[$index]}" == "go-builder" && "${IMAGE_SAVE_REFS[$index]}" =~ golang:([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-      builder_go="${BASH_REMATCH[1]}"
-      if [[ "$builder_go" == "${GO_TOOLCHAIN#go}."* ]]; then GO_TOOLCHAIN="go${builder_go}"; fi
-    fi
-  done
+CANDIDATE_GO_DIRECTIVE="$(awk '$1=="go" && NF==2 {print $2; exit}' "$CHECKOUT/go.mod")"
+CANDIDATE_GO_TOOLCHAIN="$(awk '$1=="toolchain" && NF==2 {print $2; exit}' "$CHECKOUT/go.mod")"
+if [[ -n "$CANDIDATE_GO_TOOLCHAIN" ]]; then
+  [[ "$CANDIDATE_GO_TOOLCHAIN" == "$GO_TOOLCHAIN" ]] || die "Candidate Go toolchain changed after packaging"
+else
+  [[ "$GO_TOOLCHAIN" == "go${CANDIDATE_GO_DIRECTIVE}" || "$GO_TOOLCHAIN" == "go${CANDIDATE_GO_DIRECTIVE}."* ]] || \
+    die "packaged Go does not match Candidate go directive"
 fi
-[[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
-  die "Candidate Go version has no patch component; repack with an exact go-builder image"
-go_archive="$TOOLS_DIR/${GO_TOOLCHAIN}.linux-amd64.tar.gz"
-log "downloading Candidate Go toolchain $GO_TOOLCHAIN"
-go_filename="${GO_TOOLCHAIN}.linux-amd64.tar.gz"
-go_release_index="$TOOLS_DIR/go-releases.json"
-curl --fail --location --retry 3 --connect-timeout 30 \
-  -o "$go_release_index" 'https://go.dev/dl/?mode=json&include=all'
-# The dollar-prefixed names below are jq variables, not shell expansions.
-# shellcheck disable=SC2016
-go_expected_sha="$("$BIN_DIR/jq" -r --arg version "$GO_TOOLCHAIN" --arg filename "$go_filename" '
-  .[] | select(.version == $version) | .files[] |
-  select(.filename == $filename and .os == "linux" and .arch == "amd64" and .kind == "archive") |
-  .sha256
-' "$go_release_index" | head -n 1)"
-[[ "$go_expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] || die "Go release is absent from the official download index: $GO_TOOLCHAIN"
-curl --fail --location --retry 3 --connect-timeout 30 \
-  -o "${go_archive}.part" "https://go.dev/dl/${go_filename}"
-go_actual_sha="$(sha256sum "${go_archive}.part" | awk '{print $1}')"
-[[ "${go_actual_sha,,}" == "${go_expected_sha,,}" ]] || die "Go toolchain hash mismatch: $GO_TOOLCHAIN"
-mv "${go_archive}.part" "$go_archive"
-tar -xzf "$go_archive" -C "$TOOLS_DIR"
-rm -f "$go_archive" "$go_release_index"
-export GOROOT="$TOOLS_DIR/go"
-export GOTOOLCHAIN=local
-export GOPROXY="$GOPROXY_VALUE"
-export GOSUMDB="$GOSUMDB_VALUE"
-export GOPATH="$WORK_DIR/gopath"
-export GOMODCACHE="$WORK_DIR/go-mod-cache"
-export GOCACHE="$WORK_DIR/go-build-cache"
-export PATH="$GOROOT/bin:$BIN_DIR:$PATH"
-go version | tee "$OUTPUT_DIR/go-version.log"
-go env GOPROXY GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
-
-GINKGO_VERSION="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2; exit} $1=="require" && $2=="github.com/onsi/ginkgo/v2" {print $3; exit}' "$CHECKOUT/go.mod")"
-[[ "$GINKGO_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "Candidate does not lock Ginkgo v2"
-log "installing Candidate-defined Ginkgo $GINKGO_VERSION"
-GOBIN="$BIN_DIR" go install "github.com/onsi/ginkgo/v2/ginkgo@${GINKGO_VERSION}"
-ginkgo version | tee "$OUTPUT_DIR/ginkgo-version.log"
+CANDIDATE_GINKGO_VERSION="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2; exit} $1=="require" && $2=="github.com/onsi/ginkgo/v2" {print $3; exit}' "$CHECKOUT/go.mod")"
+[[ "$CANDIDATE_GINKGO_VERSION" == "$GINKGO_VERSION" ]] || die "Candidate Ginkgo version changed after packaging"
 
 # Local docker-driver builds reuse the images imported above. A separate
 # docker-container BuildKit would not share this local image store.
