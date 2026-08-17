@@ -218,7 +218,7 @@ pod Benchmark 默认沿用 Candidate 的 `agent-scheduler` 语义；`benchmark:p
 | 用途 | 拉取引用 | 内网本地引用 |
 |---|---|---|
 | E2E busybox 默认别名 | `busybox:1.36` | `busybox:latest` |
-| Admission busybox | `busybox:1.24` | `busybox:1.24` |
+| Admission busybox compatibility tag | `busybox:1.36` | `busybox:1.24` |
 | E2E nginx | `nginx:1.29.3-alpine` | 同名，并额外标记 `nginx:latest` |
 | Kubernetes E2E nginx | `registry.k8s.io/e2e-test-images/nginx:1.14-4` | 同名 |
 | KWOK | `registry.k8s.io/kwok/kwok:v0.7.0` | 同名 |
@@ -233,6 +233,8 @@ pod Benchmark 默认沿用 Candidate 的 `agent-scheduler` 语义；`benchmark:p
 | kube-state-metrics | `docker.io/volcanosh/kube-state-metrics:v2.0.0-beta` | 同名 |
 
 打包脚本还会读取 Candidate 的 scheduler、controller-manager、webhook-manager Dockerfile；需要 AgentScheduler 或 Monitoring 时，再读取相应 AgentScheduler / audit-exporter Dockerfile，并把其中的基础镜像追加到包中。这是有限的已知路径检查，不是通用 Dockerfile 解析器。
+
+Volcano 的部分 Admission E2E YAML 仍引用 `busybox:1.24`，但该历史镜像使用 Docker manifest schema 1，Docker 29/containerd 2.1 已拒绝拉取。Profile 因此下载现代格式的 `busybox:1.36`，在外网 Docker 中额外标记为 `busybox:1.24` 后保存；内网和 Candidate 仍看到原始期望标签，不需要修改测试源码。
 
 预览 Profile 的配置镜像而不启动 Docker：
 

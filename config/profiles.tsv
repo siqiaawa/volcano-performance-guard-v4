@@ -30,7 +30,8 @@ PROFILE|full|both|FULL|e2e-common,e2e-jobseq,e2e-dra,benchmark-common,benchmark-
 
 # IMAGE|GROUP|KEY|PULL_REFERENCE|LOCAL_REFERENCE
 IMAGE|e2e-common|busybox-default|busybox:1.36|busybox:latest
-IMAGE|e2e-common|busybox-1-24|busybox:1.24|busybox:1.24
+# busybox:1.24 is schema-1 and rejected by Docker 29/containerd 2.1.
+IMAGE|e2e-common|busybox-1-24|busybox:1.36|busybox:1.24
 IMAGE|e2e-common|nginx-default|nginx:1.29.3-alpine|nginx:1.29.3-alpine
 IMAGE|e2e-common|nginx-latest|nginx:1.29.3-alpine|nginx:latest
 IMAGE|e2e-common|k8s-e2e-nginx|registry.k8s.io/e2e-test-images/nginx:1.14-4|registry.k8s.io/e2e-test-images/nginx:1.14-4
