@@ -403,7 +403,8 @@ for name in "${DOCKERFILES[@]}"; do
   while IFS= read -r base; do
     [[ "$base" != *'${'* ]] || die "unresolved Candidate base in $path: $base"
     docker image inspect "${base%@*}" >/dev/null 2>&1 || die "Candidate base is not bundled: $base; repack for this Candidate"
-  done < <(awk 'toupper($1)=="FROM" {for(i=2;i<=NF;i++) if($i!~/^--/){print $i;break}}' "$path" | sort -u)
+  # Keep the inner preflight identical to the packager for CRLF Dockerfiles.
+  done < <(awk 'toupper($1)=="FROM" {for(i=2;i<=NF;i++) if($i!~/^--/){gsub(/\r/,"",$i);print $i;break}}' "$path" | sort -u)
 done
 
 BUILD_TARGETS=(vc-scheduler-image vc-controller-manager-image vc-webhook-manager-image)

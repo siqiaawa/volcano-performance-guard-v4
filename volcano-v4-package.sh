@@ -172,8 +172,8 @@ RESOURCE_KEYS=(); RESOURCE_URLS=(); RESOURCE_PATHS=()
 set_image() {
   local key="$1" pull_ref="$2" save_ref="$3" index
   [[ "$key" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "invalid image key: $key"
-  valid_text "$pull_ref" || die "invalid image reference: $key"
-  valid_text "$save_ref" || die "invalid local image reference: $key"
+  valid_text "$pull_ref" || die "invalid image reference for $key: $(printf '%q' "$pull_ref")"
+  valid_text "$save_ref" || die "invalid local image reference for $key: $(printf '%q' "$save_ref")"
   for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
     if [[ "${IMAGE_KEYS[$index]}" == "$key" ]]; then
       IMAGE_PULL_REFS[index]="$pull_ref"; IMAGE_SAVE_REFS[index]="$save_ref"; return
@@ -315,7 +315,8 @@ for name in "${dockerfiles[@]}"; do
     if [[ "$duplicate" != true ]]; then
       base_number=$((base_number+1)); set_image "candidate-base-$base_number" "$base" "${base%@*}"
     fi
-  done < <(awk 'toupper($1)=="FROM" {for(i=2;i<=NF;i++) if($i !~ /^--/) {print $i; break}}' "$file" | sort -u)
+  # Some upstream Dockerfiles use CRLF (for example agent-scheduler v1.15.0).
+  done < <(awk 'toupper($1)=="FROM" {for(i=2;i<=NF;i++) if($i !~ /^--/) {gsub(/\r/,"",$i); print $i; break}}' "$file" | sort -u)
 done
 
 download_verified() {
