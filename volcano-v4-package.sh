@@ -270,11 +270,13 @@ for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
   pull_ref="${IMAGE_REFS[$index]}"
   log "pulling [$key] $pull_ref"
   pull_once "$pull_ref"
-  inspect="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}|{{join .RepoDigests ","}}' "$pull_ref")"
+  # Older Docker releases expose RepoDigests as []interface{} instead of
+  # []string, which makes the Go-template join helper fail. RepoDigests are
+  # not used for restore validation, so keep the portable platform and image
+  # ID fields and leave the reserved metadata field unset.
+  inspect="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "$pull_ref")"
   platform="${inspect%%|*}"
-  remainder="${inspect#*|}"
-  image_id="${remainder%%|*}"
-  repo_digests="${remainder#*|}"
+  image_id="${inspect#*|}"
   [[ "$platform" == "linux/amd64" ]] || die "image platform mismatch for $pull_ref: $platform"
   [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid image ID for $pull_ref"
   save_ref="${pull_ref%@*}"
@@ -283,7 +285,7 @@ for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
   fi
   docker image inspect "$save_ref" >/dev/null 2>&1 || die "image has no saveable local tag: $save_ref"
   append_unique "$save_ref"
-  printf 'IMAGE=%s|%s|%s|%s|%s\n' "$key" "$pull_ref" "$save_ref" "$image_id" "$repo_digests" >> "$META"
+  printf 'IMAGE=%s|%s|%s|%s|-\n' "$key" "$pull_ref" "$save_ref" "$image_id" >> "$META"
 done
 
 log "saving ${#SAVE_REFS[@]} local images"
