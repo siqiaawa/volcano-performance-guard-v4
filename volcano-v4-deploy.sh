@@ -3,7 +3,7 @@
 # Candidate, build it locally and invoke the Candidate's own E2E/Benchmark code.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.2.1"
+SCRIPT_VERSION="v4.2.0"
 DEFAULT_GOPROXY="https://proxy.golang.org,direct"
 DEFAULT_GOSUMDB="sum.golang.org"
 
