@@ -491,18 +491,25 @@ if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]] && has_image_key prometheus; then 
 
 patch_candidate_build_network() {
   local makefile="$CHECKOUT/Makefile" dockerignore="$CHECKOUT/.dockerignore"
-  local tmp="$WORK_DIR/patch.tmp" name rel path use_ca=false use_modules=false add_args
+  local webhook_dockerfile="$CHECKOUT/installer/dockerfile/webhook-manager/Dockerfile"
+  local webhook_script="$CHECKOUT/installer/dockerfile/webhook-manager/gen-admission-secret.sh"
+  local tmp="$WORK_DIR/patch.tmp" name rel path runtime_base runtime_ref
+  local use_ca=false use_modules=false add_args
   local -a patched=(Makefile)
   [[ -f "$makefile" ]] || die "Candidate Makefile is missing"
+  [[ -f "$webhook_dockerfile" && -f "$webhook_script" ]] || die "Candidate webhook runtime files are missing"
   [[ -z "$VPG_HOST_CA_BUNDLE" ]] || use_ca=true
   [[ -z "$VPG_GO_PROXY_DIR" ]] || use_modules=true
+  cp -- "$BIN_DIR/kubectl" "$CHECKOUT/.vpg4-kubectl"
+  chmod 0755 "$CHECKOUT/.vpg4-kubectl"
+  printf '\n!.vpg4-kubectl\n' >> "$dockerignore"
+  patched+=(.dockerignore installer/dockerfile/webhook-manager/gen-admission-secret.sh)
   if [[ "$use_modules" == true ]]; then
     # Older Dockerfile frontends (common on CentOS 7) do not implement named
     # build contexts. Put the already-verified compressed module proxy in the
     # ordinary context and unpack it only for go mod download instead.
     cp -- "$VPG_GO_MODULE_ARCHIVE" "$CHECKOUT/.vpg4-go-modules.tar.gz"
-    printf '\n!.vpg4-go-modules.tar.gz\n' >> "$dockerignore"
-    patched+=(.dockerignore)
+    printf '!.vpg4-go-modules.tar.gz\n' >> "$dockerignore"
   fi
   awk -v use_ca="$use_ca" -v use_modules="$use_modules" '
     BEGIN {inserted=0}
@@ -568,6 +575,50 @@ patch_candidate_build_network() {
     ' "$path" > "$tmp" || die "cannot add Go proxy arguments to Candidate Dockerfile: $rel"
     mv "$tmp" "$path"
   done
+
+  if grep -q 'https://dl.k8s.io/' "$webhook_dockerfile" || grep -Eq '^[[:space:]]*apk[[:space:]]+add|&&[[:space:]]*apk[[:space:]]+add' "$webhook_dockerfile"; then
+    runtime_base="$(awk 'toupper($1)=="FROM" {print $2;exit}' "$webhook_dockerfile")"
+    [[ -n "$runtime_base" && "$runtime_base" != *'${'* ]] || die "cannot resolve Candidate webhook builder base"
+    runtime_ref="${runtime_base%@*}"
+    docker image inspect "$runtime_ref" >/dev/null 2>&1 || die "Candidate webhook offline runtime base is not bundled: $runtime_base"
+    docker run --rm --entrypoint /bin/sh "$runtime_ref" -ec \
+      'test -x /bin/bash && command -v openssl >/dev/null && test -f /etc/ssl/certs/ca-certificates.crt && command -v base64 >/dev/null && command -v tr >/dev/null' \
+      || die "Candidate webhook builder base lacks Bash, OpenSSL, CA certificates or core tools"
+    log "replacing Candidate webhook APK and kubectl downloads with packaged runtime inputs"
+    awk -v runtime_base="$runtime_base" '
+      BEGIN {stage=0; replaced_from=0; removed_network=0; inserted_kubectl=0; skip=0}
+      {
+        upper=toupper($1)
+        if (upper=="FROM") {
+          stage++
+          if (stage==2) {print "FROM " runtime_base; replaced_from++; next}
+        }
+        if (stage==2 && $1=="ARG" && ($2 ~ /^KUBE_VERSION([=]|$)/ || $2=="TARGETARCH" || $2=="APK_MIRROR")) next
+        if (stage==2 && !skip && $0 ~ /^[[:space:]]*RUN[[:space:]]+if[[:space:]]+\[\[/) {
+          skip=1; removed_network++
+          if ($0 !~ /\\[[:space:]]*$/) skip=0
+          next
+        }
+        if (skip) {
+          if ($0 !~ /\\[[:space:]]*$/) skip=0
+          next
+        }
+        if (stage==2 && !inserted_kubectl && $0 ~ /^[[:space:]]*COPY[[:space:]]+--from=builder/) {
+          print "COPY .vpg4-kubectl /usr/local/bin/kubectl"
+          inserted_kubectl++
+        }
+        print
+      }
+      END {
+        if (stage<2 || replaced_from!=1 || removed_network!=1 || inserted_kubectl!=1 || skip) exit 47
+      }
+    ' "$webhook_dockerfile" > "$tmp" || die "cannot make Candidate webhook runtime offline"
+    mv "$tmp" "$webhook_dockerfile"
+    grep -q '^#!/bin/sh$' "$webhook_script" || die "unexpected Candidate admission helper shell"
+    sed -i '1s|^#!/bin/sh$|#!/bin/bash|' "$webhook_script"
+  fi
+  grep -q 'https://dl.k8s.io/' "$webhook_dockerfile" && die "Candidate webhook still downloads kubectl"
+  grep -Eq '^[[:space:]]*apk[[:space:]]+add|&&[[:space:]]*apk[[:space:]]+add' "$webhook_dockerfile" && die "Candidate webhook still downloads APK packages"
   git -C "$CHECKOUT" diff -- "${patched[@]}" > "$OUTPUT_DIR/candidate-build-network.patch"
   [[ -s "$OUTPUT_DIR/candidate-build-network.patch" ]] || die "Candidate build network patch is empty"
 }
