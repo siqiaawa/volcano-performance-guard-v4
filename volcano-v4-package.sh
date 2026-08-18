@@ -3,7 +3,7 @@
 # images and small network resources, then create a transport bundle.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.2.0"
+SCRIPT_VERSION="v4.2.1"
 DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
 DEFAULT_GOPROXY="https://proxy.golang.org,direct"
 DEFAULT_GOSUMDB="sum.golang.org"

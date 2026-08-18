@@ -3,7 +3,7 @@
 # Candidate, build it locally and invoke the Candidate's own E2E/Benchmark code.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.2.0"
+SCRIPT_VERSION="v4.2.1"
 DEFAULT_GOPROXY="https://proxy.golang.org,direct"
 DEFAULT_GOSUMDB="sum.golang.org"
 
@@ -244,7 +244,9 @@ if [[ "$PACKAGED_MODE" != both && "$MODE" != "$PACKAGED_MODE" ]]; then die "requ
 [[ "$MODE" == e2e || ${#BENCHMARK_CAP_SCENARIOS[@]} -gt 0 ]] || die "bundle has no Benchmark capability"
 
 printf 'profile=%s\nmode=%s\ndefault_run=%s\n' "$PROFILE" "$PACKAGED_MODE" "$DEFAULT_RUN"
-for value in "${E2E_CAPS[@]}"; do printf 'e2e=%s\n' "$value"; done
+if [[ ${#E2E_CAPS[@]} -gt 0 ]]; then
+  for value in "${E2E_CAPS[@]}"; do printf 'e2e=%s\n' "$value"; done
+fi
 for ((index=0; index<${#BENCHMARK_CAP_SCENARIOS[@]}; index++)); do
   printf 'benchmark=%s|%s\n' "${BENCHMARK_CAP_SCENARIOS[$index]}" "${BENCHMARK_CAP_CONFIGS[$index]}"
 done
@@ -391,8 +393,12 @@ driver="$(docker buildx inspect default | awk -F': ' '/^Driver:/ {print $2;exit}
 docker buildx use default; export BUILDX_BUILDER=default
 
 BUILD_AGENT=false
-for value in "${E2E_RUNS[@]}"; do [[ "$value" != AGENTSCHEDULER_* ]] || BUILD_AGENT=true; done
-for value in "${BENCHMARK_RUN_SCENARIOS[@]}"; do [[ "$value" != pod ]] || BUILD_AGENT=true; done
+if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
+  for value in "${E2E_RUNS[@]}"; do [[ "$value" != AGENTSCHEDULER_* ]] || BUILD_AGENT=true; done
+fi
+if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]]; then
+  for value in "${BENCHMARK_RUN_SCENARIOS[@]}"; do [[ "$value" != pod ]] || BUILD_AGENT=true; done
+fi
 DOCKERFILES=(scheduler controller-manager webhook-manager)
 [[ "$BUILD_AGENT" != true ]] || DOCKERFILES+=(agent-scheduler)
 if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]] && has_image_key prometheus; then DOCKERFILES+=(benchmark-audit-exporter); fi
