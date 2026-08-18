@@ -20,7 +20,7 @@ README.md                   使用与维护说明
 bash volcano-v4-package.sh --k8s-version v1.32.5 --volcano-ref v1.15.0 --profile full --output ./release-assets --split-size 1900M
 ```
 
-把生成的全部 `.part-NNN` 和 `.parts.sha256` 放到内网 CentOS 7 服务器的同一目录，然后执行一条命令：
+把生成的全部 `.part-NNN` 和 `.parts.sha256` 以及独立的 `volcano-v4-deploy.sh` 放到内网 CentOS 7 服务器，然后执行一条命令：
 
 ```bash
 bash volcano-v4-deploy.sh --bundle ./release-assets/volcano-v4-1.32.5-*-full.tar.gz.part-000 --output ./results
@@ -35,6 +35,8 @@ bash volcano-v4-package.sh --k8s-version v1.32.5 --volcano-ref v1.15.0 --profile
 # 内网
 bash volcano-v4-deploy.sh --bundle ./release-assets/volcano-v4-1.32.5-*-e2e-basic.tar.gz --output ./results
 ```
+
+依赖包与部署脚本独立维护。镜像、工具或 Profile 依赖没有变化时，只需要更新几十 KB 的 `volcano-v4-deploy.sh`，不需要重新制作、下载或传输大包。早期依赖包中可能带有生成时的脚本快照；显式执行外部最新脚本并通过 `--bundle` 指向该包时，使用的是外部脚本，包内快照不会被执行。
 
 正常情况下不需要手工填写 `HTTP_PROXY`、`HTTPS_PROXY`、`GOPROXY` 或 `GOSUMDB`。部署脚本会把宿主机的 Go Module 配置和已有的 HTTP 代理环境传入 Candidate 的 BuildKit 构建，并使用宿主网络完成 `go mod download`。只有内网服务器必须使用单位提供的 Go Module 地址时，才在部署命令后增加例如：
 
@@ -251,16 +253,17 @@ bash volcano-v4-package.sh --k8s-version v1.32.5 --volcano-ref v1.15.0 --profile
 
 ## Bundle 内容与校验
 
-每个包只有：
+每个新生成的依赖包只有：
 
 ```text
-volcano-v4-deploy.sh
 bundle.meta
 images.tar.gz
 tools.tar.gz
 resources.tar.gz
 SHA256SUMS
 ```
+
+`volcano-v4-deploy.sh` 作为独立 Release 资产发布，不属于依赖包内容。部署脚本保持向后兼容：旧包即使仍包含脚本快照，也可以由最新的外部脚本读取和验证。
 
 `resources.tar.gz` 当前只保存固定版本的 KWOK `kwok.yaml` 和 `stage-fast.yaml`，用于避免内网访问 KWOK Helm Repository。`bundle.meta` 是严格逐项解析的数据文件，不会被 `source` 执行。外层包、内层文件、工具、资源和镜像身份都会校验。镜像身份同时兼容旧 Docker 的 config ID 与 Docker 29 containerd image store 的 OCI descriptor ID，但两者都必须来自已校验的 `images.tar.gz`。
 

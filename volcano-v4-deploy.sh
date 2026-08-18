@@ -171,7 +171,7 @@ else
   BUNDLE_ROOT="${roots[0]}"
 fi
 
-for required in bundle.meta images.tar.gz tools.tar.gz resources.tar.gz SHA256SUMS volcano-v4-deploy.sh; do
+for required in bundle.meta images.tar.gz tools.tar.gz resources.tar.gz SHA256SUMS; do
   [[ -f "$BUNDLE_ROOT/$required" ]] || die "bundle is missing $required"
 done
 (cd "$BUNDLE_ROOT" && sha256sum -c SHA256SUMS)

@@ -48,8 +48,8 @@ Inspection/output:
   -h, --help
 
 The maintained project inputs are this script, volcano-v4-deploy.sh and the
-two TSV files under config/. The bundle never contains Volcano source,
-Candidate E2E/Benchmark source, Go module cache or final Volcano images.
+two TSV files under config/. The dependency bundle does not embed deploy.sh,
+Volcano source, Candidate test source, Go module cache or final Volcano images.
 EOF
 }
 
@@ -268,8 +268,6 @@ RESOURCES_STAGE="$WORK_DIR/resources"; META_CHECKOUT="$WORK_DIR/meta-source"
 mkdir -p "$STAGE" "$TOOLS_BIN" "$RESOURCES_STAGE"
 cleanup() { status=$?; if [[ "$KEEP_WORK_DIR" == true ]]; then log "kept work directory: $WORK_DIR"; else rm -rf -- "$WORK_DIR"; fi; exit "$status"; }
 trap cleanup EXIT
-cp "$SCRIPT_DIR/volcano-v4-deploy.sh" "$STAGE/volcano-v4-deploy.sh"
-
 github_raw_base=""
 if [[ "$VOLCANO_REPO" =~ ^https://github\.com/([^/]+)/([^/]+)(\.git)?$ ]]; then
   github_owner="${BASH_REMATCH[1]}"; github_repo="${BASH_REMATCH[2]%.git}"
@@ -420,7 +418,7 @@ log "saving ${#SAVE_REFS[@]} unique local image tags"
 docker image save "${SAVE_REFS[@]}" | gzip -1 -n > "$STAGE/images.tar.gz"
 (
   cd "$STAGE"
-  sha256sum bundle.meta images.tar.gz tools.tar.gz resources.tar.gz volcano-v4-deploy.sh > SHA256SUMS
+  sha256sum bundle.meta images.tar.gz tools.tar.gz resources.tar.gz > SHA256SUMS
 )
 tar -C "$WORK_DIR" -czf "$BUNDLE_PATH" "$BUNDLE_NAME"
 (cd "$OUTPUT_DIR" && sha256sum "$(basename "$BUNDLE_PATH")" > "$(basename "$BUNDLE_PATH").sha256")
