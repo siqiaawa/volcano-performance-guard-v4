@@ -53,10 +53,11 @@ Run selection (must be covered by the bundle profile):
 
 The server itself only needs Bash, curl, git, Docker, tar, gzip, sha256sum,
 make and basic POSIX tools. Exact Kind, kubectl, Helm, jq and Go come from the
-bundle. Ginkgo is installed at the version selected by Candidate go.mod; a
-Candidate's complete Go module graph is downloaded through the inner-server Go
-proxy. The generic bundle contains no Volcano source or Go modules. Nothing is
-installed system-wide.
+bundle. The Candidate's complete Go module graph and selected Ginkgo are first
+downloaded on the inner host through its approved Go proxy. Docker builders
+then consume a temporary file proxy and never contact that HTTPS proxy. The
+generic bundle contains no Volcano source or Go modules. Nothing is installed
+system-wide.
 EOF
 }
 
@@ -393,6 +394,26 @@ printf '%s\n' "$CANDIDATE_COMMIT" > "$OUTPUT_DIR/candidate-commit.txt"
 CANDIDATE_GO="$(awk '$1=="toolchain"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
 [[ -n "$CANDIDATE_GO" ]] || CANDIDATE_GO="go$(awk '$1=="go"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
 [[ "$CANDIDATE_GO" == "$GO_TOOLCHAIN" ]] || die "Candidate needs $CANDIDATE_GO but generic bundle contains $GO_TOOLCHAIN; create a new generic bundle with --go-version $CANDIDATE_GO"
+
+# Resolve the complete Candidate module graph on the inner host, where the
+# approved corporate proxy and CA trust have already been verified. The
+# standard cache/download tree is itself a GOPROXY file proxy, so Docker
+# builders can consume it without contacting the HTTPS proxy or trusting its
+# corporate CA.
+VPG_INNER_GO_MODULE_ARCHIVE="$WORK_DIR/inner-go-modules.tar.gz"
+log "downloading the Candidate Go module graph on the inner host through GOPROXY"
+(
+  cd "$CHECKOUT"
+  go mod download all
+) 2>&1 | tee "$OUTPUT_DIR/go-mod-download.log"
+[[ -d "$GOMODCACHE/cache/download" ]] || die "inner-host Go module proxy cache was not created"
+tar -C "$GOMODCACHE/cache/download" --exclude='*.lock' --exclude='*.tmp' \
+  -czf "$VPG_INNER_GO_MODULE_ARCHIVE" .
+[[ -s "$VPG_INNER_GO_MODULE_ARCHIVE" ]] || die "inner-host Go module proxy archive is empty"
+sha256sum "$VPG_INNER_GO_MODULE_ARCHIVE" | awk '{print $1 "  inner-go-modules.tar.gz"}' \
+  > "$OUTPUT_DIR/inner-go-modules.sha256"
+log "prepared the inner-host Go module file proxy for Candidate Docker builds"
+
 if [[ "$MODE" != benchmark ]]; then
   GINKGO_VERSION="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2;exit} $1=="require"&&$2=="github.com/onsi/ginkgo/v2" {print $3;exit}' "$CHECKOUT/go.mod")"
   [[ "$GINKGO_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "cannot resolve Candidate Ginkgo version"
@@ -469,8 +490,9 @@ patch_candidate_build_network() {
   [[ -f "$makefile" ]] || die "Candidate Makefile is missing"
   [[ -f "$webhook_dockerfile" && -f "$webhook_script" ]] || die "Candidate webhook runtime files are missing"
   cp -- "$BIN_DIR/kubectl" "$CHECKOUT/.vpg4-kubectl"
+  cp -- "$VPG_INNER_GO_MODULE_ARCHIVE" "$CHECKOUT/.vpg4-inner-go-modules.tar.gz"
   chmod 0755 "$CHECKOUT/.vpg4-kubectl"
-  printf '\n!.vpg4-kubectl\n' >> "$dockerignore"
+  printf '\n!.vpg4-kubectl\n!.vpg4-inner-go-modules.tar.gz\n' >> "$dockerignore"
   patched+=(.dockerignore installer/dockerfile/webhook-manager/gen-admission-secret.sh)
   awk '
     BEGIN {inserted=0}
@@ -502,9 +524,20 @@ patch_candidate_build_network() {
     grep -Eq '^[[:space:]]*ARG[[:space:]]+GONOSUMDB([[:space:]=]|$)' "$path" && need_gonosumdb=false
     grep -Eq '^[[:space:]]*ARG[[:space:]]+GOSUMDB([[:space:]=]|$)' "$path" && need_gosumdb=false
     awk -v need_gp="$need_goproxy" -v need_gn="$need_gonosumdb" -v need_gs="$need_gosumdb" '
-      BEGIN {inserted=0}
+      BEGIN {inserted=0; replaced=0}
       {
         upper=toupper($0)
+        if ($0 ~ /^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download/) {
+          command=$0
+          sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
+          print "COPY .vpg4-inner-go-modules.tar.gz /tmp/vpg4-inner-go-modules.tar.gz"
+          print "RUN mkdir -p /tmp/vpg4-goproxy \\"
+          print "    && tar -xzf /tmp/vpg4-inner-go-modules.tar.gz -C /tmp/vpg4-goproxy \\"
+          print "    && GOPROXY=file:///tmp/vpg4-goproxy GONOSUMDB=* GOSUMDB=off " command " \\"
+          print "    && rm -rf /tmp/vpg4-goproxy /tmp/vpg4-inner-go-modules.tar.gz"
+          replaced++
+          next
+        }
         print
         if (!inserted && upper ~ /^[[:space:]]*FROM[[:space:]].*[[:space:]]AS[[:space:]]+BUILDER([[:space:]]|$)/) {
           if (need_gp=="true") print "ARG GOPROXY"
@@ -513,7 +546,7 @@ patch_candidate_build_network() {
           inserted=1
         }
       }
-      END {if(inserted!=1) exit 45}
+      END {if(inserted!=1 || replaced!=1) exit 45}
     ' "$path" > "$tmp" || die "cannot add Go proxy arguments to Candidate Dockerfile: $rel"
     mv "$tmp" "$path"
   done
@@ -534,7 +567,7 @@ patch_candidate_build_network() {
         upper=toupper($1)
         if (upper=="FROM") {
           stage++
-          if (stage==2) {print "FROM " runtime_base; replaced_from++; next}
+          if (stage==2) {print "FROM " runtime_base; print "WORKDIR /"; replaced_from++; next}
         }
         if (stage==2 && $1=="ARG" && ($2 ~ /^KUBE_VERSION([=]|$)/ || $2=="TARGETARCH" || $2=="APK_MIRROR")) next
         if (stage==2 && !skip && $0 ~ /^[[:space:]]*RUN[[:space:]]+if[[:space:]]+\[\[/) {
@@ -584,6 +617,10 @@ BUILD_TARGETS=(vc-scheduler-image vc-controller-manager-image vc-webhook-manager
 log "building Candidate images at $CANDIDATE_COMMIT"
 (
   cd "$CHECKOUT"
+  # Every Dockerfile receives the verified inner-host file proxy for its
+  # explicit go mod download. Disable all later Go network fallback so an
+  # incomplete prefetch fails closed instead of contacting HTTPS from Docker.
+  export GOPROXY=off GONOSUMDB='*' GOSUMDB=off
   make "${BUILD_TARGETS[@]}" "TAG=$CANDIDATE_COMMIT" IMAGE_PREFIX=volcanosh FORCE_REBUILD=true \
     BUILDX_OUTPUT_TYPE=docker DOCKER_PLATFORMS=linux/amd64
 ) 2>&1 | tee "$OUTPUT_DIR/candidate-build.log"
@@ -852,6 +889,7 @@ benchmark_rounds=$BENCHMARK_ROUNDS
 go_proxy=$GOPROXY_VALUE
 go_nosumdb=$GONOSUMDB_VALUE
 go_sumdb=$GOSUMDB_VALUE
+go_module_delivery=inner-host-file-proxy
 finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 log "completed successfully; results: $OUTPUT_DIR"

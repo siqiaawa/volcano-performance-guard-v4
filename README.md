@@ -91,8 +91,9 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.32.5-e2e-basic.tar.gz --volcan
 内网 deploy（每次选择 Volcano Candidate）
   ├─ 校验并加载外网包
   ├─ git fetch 指定的 Volcano tag/branch/commit
-  ├─ 从公司 Go Proxy 下载完整 Go modules 和 Candidate 选择的 Ginkgo
-  ├─ 使用 Candidate 自己的 Dockerfile 构建组件镜像
+  ├─ 在宿主机从公司 Go Proxy 下载完整 Go modules 和 Candidate 选择的 Ginkgo
+  ├─ 将宿主 module cache 临时转换成 Docker 可读的 file proxy
+  ├─ 使用 Candidate 自己的 Dockerfile、通过 file proxy 构建组件镜像
   ├─ 使用 Candidate 自己的 E2E/Benchmark 入口
   └─ 保存日志、测试产物、临时兼容补丁和 summary.txt
 ```
@@ -303,7 +304,15 @@ Volcano v1.15.0 的 Kind 配置包含 Kubernetes v1.34 才提供的 `DRAConsumab
 
 终端已经 `export HTTP_PROXY/HTTPS_PROXY` 时，脚本会传入 Candidate 的 Docker build。没有这些环境变量时，脚本会读取对 GitHub 生效的 Git `http.proxy`。
 
-Go 模块下载发生在两个位置：宿主环境安装 Ginkgo，以及 Candidate Dockerfile 的 `go mod download`。部署脚本会把相同的 `GOPROXY/GONOSUMDB/GOSUMDB` 传给两者。
+Go 模块的 HTTPS 下载只发生在内网宿主机。部署脚本拉取 Candidate 后先使用包内 Go toolchain 和相同的 `GOPROXY/GONOSUMDB/GOSUMDB` 执行 `go mod download all`，再把 `$GOMODCACHE/cache/download` 转成临时标准 Go file proxy。Candidate Dockerfile 中的 `go mod download` 会被临时改为：
+
+```bash
+GOPROXY=file:///tmp/vpg4-goproxy GONOSUMDB='*' GOSUMDB=off go mod download
+```
+
+因此 Docker builder 不再访问公司 HTTPS Go Proxy，也不需要继承宿主机的公司 CA。宿主预下载日志保存在 `go-mod-download.log`，临时 file proxy 的校验值保存在 `inner-go-modules.sha256`；临时归档默认随工作目录清理，不进入外网包和最终 Candidate 镜像。
+
+Webhook 离线运行时使用包内已有的 Go builder 基础镜像代替会执行 `apk add` 和下载 kubectl 的 Alpine 阶段；脚本会显式把最终阶段的 `WORKDIR` 设为 `/`，保证 Helm admission-init 的 `./gen-admission-secret.sh` 与上游运行方式一致。
 
 ## 旧版 Docker 的 `image save` 兼容
 
