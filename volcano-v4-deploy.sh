@@ -3,9 +3,11 @@
 # Candidate, build it locally and invoke the Candidate's own E2E/Benchmark code.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.2.0"
-DEFAULT_GOPROXY="https://proxy.golang.org,direct"
-DEFAULT_GOSUMDB="sum.golang.org"
+SCRIPT_VERSION="v4.3.0"
+DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
+DEFAULT_GOPROXY="https://cmc.centralrepo.rnd.huawei.com/cbu-go,direct"
+DEFAULT_GONOSUMDB="*"
+DEFAULT_GOSUMDB="off"
 
 log() { printf '[vpg4-deploy] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -31,11 +33,11 @@ Input/output:
   --keep-cluster              Keep the only/last Kind cluster
 
 Candidate selection:
-  --volcano-repo URL          Override the repository recorded in the bundle
-  --volcano-ref REF           Override the branch/tag/commit recorded in bundle
-  --goproxy VALUE             Inner-server Go module proxy
-  --gosumdb VALUE             Inner-server Go checksum database
-  --ca-bundle PATH            Host CA bundle for Candidate builds; auto-detected
+  --volcano-ref REF           Required branch, tag or commit to test
+  --volcano-repo URL          Default: official Volcano repository
+  --goproxy VALUE             Default: approved inner-server proxy
+  --gonosumdb VALUE           Default: *
+  --gosumdb VALUE             Default: off
 
 Run selection (must be covered by the bundle profile):
   --mode e2e|benchmark|both
@@ -52,8 +54,9 @@ Run selection (must be covered by the bundle profile):
 The server itself only needs Bash, curl, git, Docker, tar, gzip, sha256sum,
 make and basic POSIX tools. Exact Kind, kubectl, Helm, jq and Go come from the
 bundle. Ginkgo is installed at the version selected by Candidate go.mod; a
-bundle containing go-modules.tar.gz supplies it and Candidate builds without a
-Go network connection. Nothing is installed system-wide.
+Candidate's complete Go module graph is downloaded through the inner-server Go
+proxy. The generic bundle contains no Volcano source or Go modules. Nothing is
+installed system-wide.
 EOF
 }
 
@@ -62,9 +65,9 @@ KEEP_WORK_DIR=false; KEEP_CLUSTER=false; LIST_CAPABILITIES=false
 MODE_OVERRIDE=""; E2E_TYPE_OVERRIDE=""; BENCHMARK_SCENARIO_OVERRIDE=""
 BENCHMARK_CONFIG_OVERRIDE=""; BENCHMARK_ROUNDS=1; PODS=1000
 SCHEDULER_NAME="agent-scheduler"; CLUSTER_PREFIX="volcano-v4"
-VOLCANO_REPO_OVERRIDE=""; VOLCANO_REF_OVERRIDE=""
-CA_BUNDLE_OVERRIDE=""
+VOLCANO_REPO="$DEFAULT_VOLCANO_REPO"; VOLCANO_REF=""
 GOPROXY_VALUE="${GOPROXY:-$DEFAULT_GOPROXY}"
+GONOSUMDB_VALUE="${GONOSUMDB:-$DEFAULT_GONOSUMDB}"
 GOSUMDB_VALUE="${GOSUMDB:-$DEFAULT_GOSUMDB}"
 
 while [[ $# -gt 0 ]]; do
@@ -75,8 +78,8 @@ while [[ $# -gt 0 ]]; do
     --work-dir) WORK_DIR="${2:-}"; shift 2 ;;
     --keep-work-dir) KEEP_WORK_DIR=true; shift ;;
     --keep-cluster) KEEP_CLUSTER=true; shift ;;
-    --volcano-repo) VOLCANO_REPO_OVERRIDE="${2:-}"; shift 2 ;;
-    --volcano-ref) VOLCANO_REF_OVERRIDE="${2:-}"; shift 2 ;;
+    --volcano-repo) VOLCANO_REPO="${2:-}"; shift 2 ;;
+    --volcano-ref) VOLCANO_REF="${2:-}"; shift 2 ;;
     --mode) MODE_OVERRIDE="${2:-}"; shift 2 ;;
     --e2e-type) E2E_TYPE_OVERRIDE="${2:-}"; shift 2 ;;
     --benchmark-scenario) BENCHMARK_SCENARIO_OVERRIDE="${2:-}"; shift 2 ;;
@@ -86,8 +89,8 @@ while [[ $# -gt 0 ]]; do
     --scheduler-name) SCHEDULER_NAME="${2:-}"; shift 2 ;;
     --cluster-prefix) CLUSTER_PREFIX="${2:-}"; shift 2 ;;
     --goproxy) GOPROXY_VALUE="${2:-}"; shift 2 ;;
+    --gonosumdb) GONOSUMDB_VALUE="${2:-}"; shift 2 ;;
     --gosumdb) GOSUMDB_VALUE="${2:-}"; shift 2 ;;
-    --ca-bundle) CA_BUNDLE_OVERRIDE="${2:-}"; shift 2 ;;
     --list-capabilities) LIST_CAPABILITIES=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (use --help)" ;;
@@ -100,7 +103,10 @@ done
 [[ "$PODS" =~ ^[1-9][0-9]*$ ]] || die "--pods must be positive"
 [[ "$SCHEDULER_NAME" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die "invalid --scheduler-name"
 valid_text "$GOPROXY_VALUE" || die "invalid --goproxy"
+valid_text "$GONOSUMDB_VALUE" || die "invalid --gonosumdb"
 valid_text "$GOSUMDB_VALUE" || die "invalid --gosumdb"
+valid_text "$VOLCANO_REPO" || die "invalid --volcano-repo"
+valid_text "$VOLCANO_REF" || die "--volcano-ref is required"
 [[ -z "$MODE_OVERRIDE" ]] || valid_mode "$MODE_OVERRIDE" || die "invalid --mode"
 
 for command in curl git tar gzip sha256sum awk sed grep sort mktemp; do need "$command"; done
@@ -134,22 +140,6 @@ configure_build_proxy() {
   fi
 }
 configure_build_proxy
-
-VPG_HOST_CA_BUNDLE=""
-if [[ -n "$CA_BUNDLE_OVERRIDE" ]]; then
-  [[ "$CA_BUNDLE_OVERRIDE" == /* && -r "$CA_BUNDLE_OVERRIDE" && ! "$CA_BUNDLE_OVERRIDE" =~ [[:space:]] ]] || \
-    die "--ca-bundle must be a readable absolute path without whitespace"
-  VPG_HOST_CA_BUNDLE="$CA_BUNDLE_OVERRIDE"
-else
-  for path in /etc/pki/tls/certs/ca-bundle.crt \
-              /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-              /etc/ssl/certs/ca-certificates.crt; do
-    if [[ -r "$path" ]]; then VPG_HOST_CA_BUNDLE="$path"; break; fi
-  done
-fi
-export VPG_HOST_CA_BUNDLE
-if [[ -n "$VPG_HOST_CA_BUNDLE" ]]; then log "using host CA bundle for Candidate builds: $VPG_HOST_CA_BUNDLE"
-else log "host CA bundle was not found; Candidate builds will use the base image trust store"; fi
 
 if [[ -z "$OUTPUT_DIR" ]]; then OUTPUT_DIR="./volcano-v4-results-$(date -u +%Y%m%d-%H%M%S)"; fi
 [[ ! -e "$OUTPUT_DIR" ]] || die "output already exists: $OUTPUT_DIR"
@@ -230,10 +220,8 @@ for required in bundle.meta images.tar.gz tools.tar.gz resources.tar.gz SHA256SU
 done
 (cd "$BUNDLE_ROOT" && sha256sum -c SHA256SUMS)
 
-FORMAT=""; BUNDLE_SCRIPT_VERSION=""; PLATFORM=""; PROFILE=""; PACKAGED_MODE=""; DEFAULT_RUN=""
+FORMAT=""; BUNDLE_SCRIPT_VERSION=""; BUNDLE_SCOPE=""; PLATFORM=""; PROFILE=""; PACKAGED_MODE=""; DEFAULT_RUN=""
 K8S_VERSION=""; KIND_VERSION=""; HELM_VERSION=""; JQ_VERSION=""; KWOK_VERSION=""; GO_TOOLCHAIN=""
-GO_MODULES_INCLUDED=false
-VOLCANO_REPO=""; BUNDLED_VOLCANO_REF=""; BUNDLED_VOLCANO_COMMIT=""
 IMAGE_KEYS=(); IMAGE_PULL_REFS=(); IMAGE_SAVE_REFS=(); IMAGE_IDS=()
 TOOL_KEYS=(); TOOL_VERSIONS=(); TOOL_PATHS=(); TOOL_SHA256S=()
 RESOURCE_KEYS=(); RESOURCE_PATHS=(); RESOURCE_SHA256S=()
@@ -243,21 +231,18 @@ while IFS='=' read -r name value; do
   case "$name" in
     FORMAT) FORMAT="$value" ;;
     SCRIPT_VERSION) BUNDLE_SCRIPT_VERSION="$value" ;;
+    BUNDLE_SCOPE) BUNDLE_SCOPE="$value" ;;
     CREATED_AT) ;;
     PLATFORM) PLATFORM="$value" ;;
     PROFILE) PROFILE="$value" ;;
     MODE) PACKAGED_MODE="$value" ;;
     DEFAULT_RUN) DEFAULT_RUN="$value" ;;
-    GO_MODULES_INCLUDED) GO_MODULES_INCLUDED="$value" ;;
     K8S_VERSION) K8S_VERSION="$value" ;;
     KIND_VERSION) KIND_VERSION="$value" ;;
     HELM_VERSION) HELM_VERSION="$value" ;;
     JQ_VERSION) JQ_VERSION="$value" ;;
     KWOK_VERSION) KWOK_VERSION="$value" ;;
     GO_TOOLCHAIN) GO_TOOLCHAIN="$value" ;;
-    VOLCANO_REPO) VOLCANO_REPO="$value" ;;
-    VOLCANO_REF) BUNDLED_VOLCANO_REF="$value" ;;
-    VOLCANO_COMMIT) BUNDLED_VOLCANO_COMMIT="$value" ;;
     IMAGE)
       IFS='|' read -r a b c d e extra <<< "$value"; [[ -z "$extra" ]] || die "invalid IMAGE metadata"
       IMAGE_KEYS+=("$a"); IMAGE_PULL_REFS+=("$b"); IMAGE_SAVE_REFS+=("$c"); IMAGE_IDS+=("$d")
@@ -281,6 +266,7 @@ done < "$BUNDLE_ROOT/bundle.meta"
 
 [[ "$FORMAT" == volcano-performance-guard-v4 ]] || die "unsupported bundle format"
 [[ "$BUNDLE_SCRIPT_VERSION" == "$SCRIPT_VERSION" ]] || die "bundle/script version mismatch"
+[[ "$BUNDLE_SCOPE" == generic ]] || die "bundle is not a generic v4 dependency bundle"
 [[ "$PLATFORM" == linux/amd64 ]] || die "unsupported bundle platform: $PLATFORM"
 valid_text "$PROFILE" || die "invalid profile metadata"
 valid_mode "$PACKAGED_MODE" || die "invalid mode metadata"
@@ -290,11 +276,6 @@ valid_semver "$HELM_VERSION" || die "invalid Helm version metadata"
 valid_semver "$KWOK_VERSION" || die "invalid KWOK version metadata"
 [[ "$JQ_VERSION" =~ ^jq-[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid jq version metadata"
 [[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid Go version metadata"
-[[ "$GO_MODULES_INCLUDED" == true || "$GO_MODULES_INCLUDED" == false ]] || die "invalid Go module metadata"
-if [[ "$GO_MODULES_INCLUDED" == true ]]; then
-  [[ -f "$BUNDLE_ROOT/go-modules.tar.gz" ]] || die "bundle is missing go-modules.tar.gz"
-fi
-[[ "$BUNDLED_VOLCANO_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "invalid Candidate commit metadata"
 [[ "$K8S_VERSION" =~ ^v[0-9]+\.([0-9]+)\.[0-9]+$ ]] || die "invalid Kubernetes version metadata: $K8S_VERSION"
 K8S_MINOR="${BASH_REMATCH[1]}"
 [[ ${#IMAGE_KEYS[@]} -gt 0 ]] || die "bundle contains no images"
@@ -305,8 +286,8 @@ if [[ "$PACKAGED_MODE" != both && "$MODE" != "$PACKAGED_MODE" ]]; then die "requ
 [[ "$MODE" == benchmark || ${#E2E_CAPS[@]} -gt 0 ]] || die "bundle has no E2E capability"
 [[ "$MODE" == e2e || ${#BENCHMARK_CAP_SCENARIOS[@]} -gt 0 ]] || die "bundle has no Benchmark capability"
 
-printf 'profile=%s\nmode=%s\ndefault_run=%s\ngo_modules_included=%s\n' \
-  "$PROFILE" "$PACKAGED_MODE" "$DEFAULT_RUN" "$GO_MODULES_INCLUDED"
+printf 'bundle_scope=%s\nprofile=%s\nmode=%s\ndefault_run=%s\n' \
+  "$BUNDLE_SCOPE" "$PROFILE" "$PACKAGED_MODE" "$DEFAULT_RUN"
 if [[ ${#E2E_CAPS[@]} -gt 0 ]]; then
   for value in "${E2E_CAPS[@]}"; do printf 'e2e=%s\n' "$value"; done
 fi
@@ -319,7 +300,7 @@ status=capabilities-listed
 script_version=$SCRIPT_VERSION
 profile=$PROFILE
 packaged_mode=$PACKAGED_MODE
-go_modules_included=$GO_MODULES_INCLUDED
+bundle_scope=$BUNDLE_SCOPE
 EOF
   log "capabilities verified; no Docker operation was performed"
   exit 0
@@ -331,17 +312,6 @@ docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
 TOOLS_DIR="$WORK_DIR/tools"; BIN_DIR="$TOOLS_DIR/bin"; RESOURCES_DIR="$WORK_DIR/resources"
 safe_extract "$BUNDLE_ROOT/tools.tar.gz" "$TOOLS_DIR"
 safe_extract "$BUNDLE_ROOT/resources.tar.gz" "$RESOURCES_DIR"
-VPG_GO_PROXY_DIR=""; VPG_GO_MODULE_ARCHIVE=""
-if [[ "$GO_MODULES_INCLUDED" == true ]]; then
-  VPG_GO_MODULE_ARCHIVE="$BUNDLE_ROOT/go-modules.tar.gz"
-  VPG_GO_PROXY_DIR="$WORK_DIR/go-module-proxy"
-  safe_extract "$VPG_GO_MODULE_ARCHIVE" "$VPG_GO_PROXY_DIR"
-  [[ -d "$VPG_GO_PROXY_DIR/github.com" || -d "$VPG_GO_PROXY_DIR/golang.org" || -d "$VPG_GO_PROXY_DIR/k8s.io" ]] || \
-    die "packaged Go module proxy is empty"
-  GOPROXY_VALUE="file://$VPG_GO_PROXY_DIR"; GOSUMDB_VALUE=off
-  log "using the packaged Candidate Go module proxy"
-fi
-export VPG_GO_PROXY_DIR VPG_GO_MODULE_ARCHIVE
 for ((index=0; index<${#TOOL_KEYS[@]}; index++)); do
   key="${TOOL_KEYS[$index]}"; path="${TOOL_PATHS[$index]}"; expected="${TOOL_SHA256S[$index]}"
   [[ "$key" =~ ^[a-z0-9-]+$ ]] || die "invalid tool key: $key"
@@ -364,7 +334,7 @@ done
 chmod 0755 "$BIN_DIR/kind" "$BIN_DIR/kubectl" "$BIN_DIR/helm" "$BIN_DIR/jq" "$TOOLS_DIR/go/bin/go"
 export GOROOT="$TOOLS_DIR/go" GOTOOLCHAIN=local GOPATH="$WORK_DIR/gopath"
 export GOMODCACHE="$WORK_DIR/go-mod-cache" GOCACHE="$WORK_DIR/go-build-cache"
-export GOPROXY="$GOPROXY_VALUE" GOSUMDB="$GOSUMDB_VALUE"
+export GOPROXY="$GOPROXY_VALUE" GONOSUMDB="$GONOSUMDB_VALUE" GOSUMDB="$GOSUMDB_VALUE"
 export PATH="$GOROOT/bin:$GOPATH/bin:$BIN_DIR:$PATH"
 
 kind version | tee "$OUTPUT_DIR/kind-version.log"
@@ -376,7 +346,7 @@ helm version --short | grep -F "$HELM_VERSION" >/dev/null || die "Helm version m
 [[ "$(jq --version)" == "$JQ_VERSION" ]] || die "jq version mismatch"
 go version | tee "$OUTPUT_DIR/go-version.log"
 go version | grep -F " $GO_TOOLCHAIN " >/dev/null || die "Go version mismatch"
-go env GOPROXY GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
+go env GOPROXY GONOSUMDB GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
 
 # Docker 29 may report the OCI descriptor ID while older stores report the
 # docker-save config ID. Both are accepted only after images.tar.gz is hashed.
@@ -400,29 +370,29 @@ done
 [[ -n "$NODE_IMAGE" ]] || die "bundle does not contain kind-node"
 
 has_image_key() { local wanted="$1" x; for x in "${IMAGE_KEYS[@]}"; do [[ "$x" == "$wanted" ]] && return 0; done; return 1; }
+bundle_has_image_ref() {
+  local wanted="${1%@*}" i
+  for ((i=0; i<${#IMAGE_SAVE_REFS[@]}; i++)); do
+    [[ "${IMAGE_SAVE_REFS[$i]%@*}" != "$wanted" ]] || return 0
+  done
+  return 1
+}
 resource_for_key() { local wanted="$1" i; for ((i=0;i<${#RESOURCE_KEYS[@]};i++)); do [[ "${RESOURCE_KEYS[$i]}" != "$wanted" ]] || { printf '%s\n' "$RESOURCES_DIR/${RESOURCE_PATHS[$i]}"; return; }; done; return 1; }
 
-VOLCANO_REPO="${VOLCANO_REPO_OVERRIDE:-$VOLCANO_REPO}"
-REQUESTED_VOLCANO_REF="${VOLCANO_REF_OVERRIDE:-$BUNDLED_VOLCANO_COMMIT}"
-valid_text "$VOLCANO_REPO" || die "invalid selected Volcano repository"
-valid_text "$REQUESTED_VOLCANO_REF" || die "invalid selected Volcano ref"
 CHECKOUT="$WORK_DIR/volcano"
 git init "$CHECKOUT" >/dev/null; git -C "$CHECKOUT" remote add origin "$VOLCANO_REPO"
-log "fetching Volcano Candidate: $REQUESTED_VOLCANO_REF"
-git -C "$CHECKOUT" fetch --depth 1 origin "$REQUESTED_VOLCANO_REF"
+log "fetching Volcano Candidate: $VOLCANO_REF"
+git -C "$CHECKOUT" fetch --depth 1 origin "$VOLCANO_REF"
 git -C "$CHECKOUT" checkout --detach FETCH_HEAD
 CANDIDATE_COMMIT="$(git -C "$CHECKOUT" rev-parse HEAD)"
 [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "cannot resolve selected Candidate"
-if [[ "$GO_MODULES_INCLUDED" == true && "$CANDIDATE_COMMIT" != "$BUNDLED_VOLCANO_COMMIT" ]]; then
-  die "packaged Go modules belong to $BUNDLED_VOLCANO_COMMIT, not selected Candidate $CANDIDATE_COMMIT; repack for this Candidate"
-fi
 if [[ -f "$CHECKOUT/.gitmodules" ]]; then git -C "$CHECKOUT" submodule update --init --recursive --depth 1; fi
 git -C "$CHECKOUT" status --short > "$OUTPUT_DIR/candidate-status-before-environment-patch.txt"
 printf '%s\n' "$CANDIDATE_COMMIT" > "$OUTPUT_DIR/candidate-commit.txt"
 
 CANDIDATE_GO="$(awk '$1=="toolchain"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
 [[ -n "$CANDIDATE_GO" ]] || CANDIDATE_GO="go$(awk '$1=="go"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
-[[ "$CANDIDATE_GO" == "$GO_TOOLCHAIN" ]] || die "Candidate needs $CANDIDATE_GO but bundle contains $GO_TOOLCHAIN; repack for this Candidate"
+[[ "$CANDIDATE_GO" == "$GO_TOOLCHAIN" ]] || die "Candidate needs $CANDIDATE_GO but generic bundle contains $GO_TOOLCHAIN; create a new generic bundle with --go-version $CANDIDATE_GO"
 if [[ "$MODE" != benchmark ]]; then
   GINKGO_VERSION="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2;exit} $1=="require"&&$2=="github.com/onsi/ginkgo/v2" {print $3;exit}' "$CHECKOUT/go.mod")"
   [[ "$GINKGO_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "cannot resolve Candidate Ginkgo version"
@@ -494,31 +464,22 @@ patch_candidate_build_network() {
   local webhook_dockerfile="$CHECKOUT/installer/dockerfile/webhook-manager/Dockerfile"
   local webhook_script="$CHECKOUT/installer/dockerfile/webhook-manager/gen-admission-secret.sh"
   local tmp="$WORK_DIR/patch.tmp" name rel path runtime_base runtime_ref
-  local use_ca=false use_modules=false add_args
+  local need_goproxy need_gonosumdb need_gosumdb
   local -a patched=(Makefile)
   [[ -f "$makefile" ]] || die "Candidate Makefile is missing"
   [[ -f "$webhook_dockerfile" && -f "$webhook_script" ]] || die "Candidate webhook runtime files are missing"
-  [[ -z "$VPG_HOST_CA_BUNDLE" ]] || use_ca=true
-  [[ -z "$VPG_GO_PROXY_DIR" ]] || use_modules=true
   cp -- "$BIN_DIR/kubectl" "$CHECKOUT/.vpg4-kubectl"
   chmod 0755 "$CHECKOUT/.vpg4-kubectl"
   printf '\n!.vpg4-kubectl\n' >> "$dockerignore"
   patched+=(.dockerignore installer/dockerfile/webhook-manager/gen-admission-secret.sh)
-  if [[ "$use_modules" == true ]]; then
-    # Older Dockerfile frontends (common on CentOS 7) do not implement named
-    # build contexts. Put the already-verified compressed module proxy in the
-    # ordinary context and unpack it only for go mod download instead.
-    cp -- "$VPG_GO_MODULE_ARCHIVE" "$CHECKOUT/.vpg4-go-modules.tar.gz"
-    printf '!.vpg4-go-modules.tar.gz\n' >> "$dockerignore"
-  fi
-  awk -v use_ca="$use_ca" -v use_modules="$use_modules" '
+  awk '
     BEGIN {inserted=0}
     {
       print
       if ($0 ~ /--platform[[:space:]]+/ && $0 ~ /DOCKER_PLATFORMS/) {
         print "\t\t\t--build-arg GOPROXY \\"
+        print "\t\t\t--build-arg GONOSUMDB \\"
         print "\t\t\t--build-arg GOSUMDB \\"
-        if (use_modules!="true" && use_ca=="true") print "\t\t\t--secret id=vpg_host_ca,src=${VPG_HOST_CA_BUNDLE} \\"
         print "\t\t\t--build-arg HTTP_PROXY \\"
         print "\t\t\t--build-arg HTTPS_PROXY \\"
         print "\t\t\t--build-arg NO_PROXY \\"
@@ -536,50 +497,32 @@ patch_candidate_build_network() {
     path="$CHECKOUT/$rel"; patched+=("$rel")
     [[ -f "$path" ]] || die "Candidate Dockerfile missing: $path"
     grep -Eq '^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download' "$path" || continue
-    add_args=true
-    if grep -Eq '^[[:space:]]*ARG[[:space:]]+GOPROXY([[:space:]=]|$)' "$path"; then
-      grep -Eq '^[[:space:]]*ARG[[:space:]]+GOSUMDB([[:space:]=]|$)' "$path" || die "Candidate Dockerfile has incomplete Go proxy arguments: $rel"
-      add_args=false
-    fi
-    awk -v use_ca="$use_ca" -v use_modules="$use_modules" -v add_args="$add_args" '
-      BEGIN {inserted=(add_args=="true" ? 0 : 1); replaced=0}
+    need_goproxy=true; need_gonosumdb=true; need_gosumdb=true
+    grep -Eq '^[[:space:]]*ARG[[:space:]]+GOPROXY([[:space:]=]|$)' "$path" && need_goproxy=false
+    grep -Eq '^[[:space:]]*ARG[[:space:]]+GONOSUMDB([[:space:]=]|$)' "$path" && need_gonosumdb=false
+    grep -Eq '^[[:space:]]*ARG[[:space:]]+GOSUMDB([[:space:]=]|$)' "$path" && need_gosumdb=false
+    awk -v need_gp="$need_goproxy" -v need_gn="$need_gonosumdb" -v need_gs="$need_gosumdb" '
+      BEGIN {inserted=0}
       {
         upper=toupper($0)
-        if (use_modules=="true" && $0 ~ /^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download/) {
-          command=$0
-          sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
-          print "COPY .vpg4-go-modules.tar.gz /tmp/vpg4-go-modules.tar.gz"
-          print "RUN mkdir -p /tmp/vpg4-goproxy \\"
-          print "    && tar -xzf /tmp/vpg4-go-modules.tar.gz -C /tmp/vpg4-goproxy \\"
-          print "    && GOPROXY=file:///tmp/vpg4-goproxy GOSUMDB=off " command " \\"
-          print "    && rm -rf /tmp/vpg4-goproxy /tmp/vpg4-go-modules.tar.gz"
-          replaced++
-          next
-        }
-        if (use_ca=="true" && $0 ~ /^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download/) {
-          command=$0
-          sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
-          print "RUN --mount=type=secret,id=vpg_host_ca,required=true \\"
-          print "    SSL_CERT_FILE=/run/secrets/vpg_host_ca GIT_SSL_CAINFO=/run/secrets/vpg_host_ca " command
-          replaced++
-          next
-        }
         print
-        if (add_args=="true" && !inserted && upper ~ /^[[:space:]]*FROM[[:space:]].*[[:space:]]AS[[:space:]]+BUILDER([[:space:]]|$)/) {
-          print "ARG GOPROXY"
-          print "ARG GOSUMDB"
+        if (!inserted && upper ~ /^[[:space:]]*FROM[[:space:]].*[[:space:]]AS[[:space:]]+BUILDER([[:space:]]|$)/) {
+          if (need_gp=="true") print "ARG GOPROXY"
+          if (need_gn=="true") print "ARG GONOSUMDB"
+          if (need_gs=="true") print "ARG GOSUMDB"
           inserted=1
         }
       }
-      END {if(inserted!=1) exit 45; if((use_ca=="true" || use_modules=="true") && replaced<1) exit 46}
+      END {if(inserted!=1) exit 45}
     ' "$path" > "$tmp" || die "cannot add Go proxy arguments to Candidate Dockerfile: $rel"
     mv "$tmp" "$path"
   done
 
   if grep -q 'https://dl.k8s.io/' "$webhook_dockerfile" || grep -Eq '^[[:space:]]*apk[[:space:]]+add|&&[[:space:]]*apk[[:space:]]+add' "$webhook_dockerfile"; then
-    runtime_base="$(awk 'toupper($1)=="FROM" {print $2;exit}' "$webhook_dockerfile")"
+    runtime_base="$(awk 'toupper($1)=="FROM" {for(i=2;i<=NF;i++) if($i!~/^--/){gsub(/\r/,"",$i);print $i;exit}}' "$webhook_dockerfile")"
     [[ -n "$runtime_base" && "$runtime_base" != *'${'* ]] || die "cannot resolve Candidate webhook builder base"
     runtime_ref="${runtime_base%@*}"
+    bundle_has_image_ref "$runtime_base" || die "Candidate webhook offline runtime base is not bundled: $runtime_base"
     docker image inspect "$runtime_ref" >/dev/null 2>&1 || die "Candidate webhook offline runtime base is not bundled: $runtime_base"
     docker run --rm --entrypoint /bin/sh "$runtime_ref" -ec \
       'test -x /bin/bash && command -v openssl >/dev/null && test -f /etc/ssl/certs/ca-certificates.crt && command -v base64 >/dev/null && command -v tr >/dev/null' \
@@ -630,6 +573,7 @@ for name in "${DOCKERFILES[@]}"; do
   [[ -f "$path" ]] || die "Candidate Dockerfile missing: $path"
   while IFS= read -r base; do
     [[ "$base" != *'${'* ]] || die "unresolved Candidate base in $path: $base"
+    bundle_has_image_ref "$base" || die "Candidate base is not declared by this generic bundle: $base; add it to config/profiles.tsv or use --add-image when packaging"
     docker image inspect "${base%@*}" >/dev/null 2>&1 || die "Candidate base is not bundled: $base; repack for this Candidate"
   # Keep the inner preflight identical to the packager for CRLF Dockerfiles.
   done < <(awk 'toupper($1)=="FROM" {for(i=2;i<=NF;i++) if($i!~/^--/){gsub(/\r/,"",$i);print $i;break}}' "$path" | sort -u)
@@ -640,7 +584,6 @@ BUILD_TARGETS=(vc-scheduler-image vc-controller-manager-image vc-webhook-manager
 log "building Candidate images at $CANDIDATE_COMMIT"
 (
   cd "$CHECKOUT"
-  if [[ "$GO_MODULES_INCLUDED" == true ]]; then export GOPROXY=off GOSUMDB=off; fi
   make "${BUILD_TARGETS[@]}" "TAG=$CANDIDATE_COMMIT" IMAGE_PREFIX=volcanosh FORCE_REBUILD=true \
     BUILDX_OUTPUT_TYPE=docker DOCKER_PLATFORMS=linux/amd64
 ) 2>&1 | tee "$OUTPUT_DIR/candidate-build.log"
@@ -669,13 +612,28 @@ delete_cluster() {
   if cluster_exists "$CURRENT_CLUSTER"; then kind delete cluster --name "$CURRENT_CLUSTER" 2>&1 | tee "$OUTPUT_DIR/kind-delete-${purpose}.log"; fi
   CLUSTER_CREATED=false; CURRENT_CLUSTER=""
 }
+docker_save_archive() {
+  local archive="$1" image
+  shift
+  [[ $# -gt 0 ]] || die "cannot save an empty image list"
+  for image in "$@"; do
+    [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" == linux/amd64 ]] || \
+      die "image platform mismatch before save: $image"
+  done
+  if docker image save --help 2>&1 | grep -q -- '--platform'; then
+    docker image save --platform=linux/amd64 -o "$archive" "$@"
+  else
+    log "Docker image save has no --platform flag; using the validated linux/amd64 compatibility path"
+    docker image save -o "$archive" "$@"
+  fi
+}
 load_image_list() {
   local name="$1" file="$2" archive image
   local -a images=()
   archive="$WORK_DIR/kind-images-$name.tar"
   while IFS= read -r image; do [[ -z "$image" ]] || images+=("$image"); done < "$file"
   [[ ${#images[@]} -gt 0 ]] || die "runtime image list is empty: $file"
-  docker image save --platform=linux/amd64 -o "$archive" "${images[@]}"
+  docker_save_archive "$archive" "${images[@]}"
   kind load image-archive "$archive" --name "$name"
 }
 write_runtime_images() {
@@ -684,7 +642,7 @@ write_runtime_images() {
   for ((i=0;i<${#IMAGE_KEYS[@]};i++)); do
     key="${IMAGE_KEYS[$i]}"; ref="${IMAGE_SAVE_REFS[$i]}"
     case "$key" in
-      kind-node|candidate-base-*) ;;
+      kind-node|candidate-*) ;;
       extra-*) printf '%s\n' "$ref" >> "$output" ;;
       busybox-default|busybox-1-24|nginx-default|nginx-latest|k8s-e2e-nginx|kwok)
         [[ "$purpose" == e2e* ]] && printf '%s\n' "$ref" >> "$output" ;;
@@ -760,7 +718,7 @@ run_e2e_one() {
   write_runtime_images "e2e-$type" "$runtime"
   mapfile -t runtime_images < "$runtime"
   [[ ${#runtime_images[@]} -gt 0 ]] || die "runtime image list is empty: $runtime"
-  docker image save --platform=linux/amd64 -o "$runtime_archive" "${runtime_images[@]}"
+  docker_save_archive "$runtime_archive" "${runtime_images[@]}"
   cluster_exists "$name" && die "project cluster already exists: $name"
   CURRENT_CLUSTER="$name"; CLUSTER_CREATED=true
   [[ "$KEEP_CLUSTER" != true ]] || cleanup_value=0
@@ -880,19 +838,20 @@ done
 cat > "$OUTPUT_DIR/summary.txt" <<EOF
 status=passed
 script_version=$SCRIPT_VERSION
+bundle_scope=$BUNDLE_SCOPE
 profile=$PROFILE
 mode=$MODE
 kubernetes_version=$K8S_VERSION
 kind_version=$KIND_VERSION
-bundle_volcano_ref=$BUNDLED_VOLCANO_REF
-bundle_volcano_commit=$BUNDLED_VOLCANO_COMMIT
 candidate_repository=$VOLCANO_REPO
-candidate_requested_ref=$REQUESTED_VOLCANO_REF
+candidate_requested_ref=$VOLCANO_REF
 candidate_commit=$CANDIDATE_COMMIT
 e2e_selection=$E2E_SELECTION
 benchmark_selection=$BENCHMARK_SELECTION
 benchmark_rounds=$BENCHMARK_ROUNDS
-go_modules_included=$GO_MODULES_INCLUDED
+go_proxy=$GOPROXY_VALUE
+go_nosumdb=$GONOSUMDB_VALUE
+go_sumdb=$GOSUMDB_VALUE
 finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 log "completed successfully; results: $OUTPUT_DIR"

@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# External entrypoint: resolve one dependency profile, download exact tools,
-# images and small network resources, then create a transport bundle.
+# External entrypoint: download a Volcano-independent dependency profile and
+# create one reusable transport bundle. Candidate source and Go modules are
+# deliberately resolved only by the inner deployment script.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.2.0"
-DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
-DEFAULT_GOPROXY="https://proxy.golang.org,direct"
-DEFAULT_GOSUMDB="sum.golang.org"
+SCRIPT_VERSION="v4.3.0"
 
 log() { printf '[vpg4-package] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -17,71 +15,60 @@ valid_text() { [[ -n "$1" && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *'|'*
 usage() {
   cat <<'EOF'
 Usage:
-  bash volcano-v4-package.sh --k8s-version vX.Y.Z --volcano-ref REF \
-    --profile PROFILE --output DIR [options]
+  bash volcano-v4-package.sh --k8s-version vX.Y.Z --profile PROFILE \
+    --output DIR [options]
 
 Required:
   --k8s-version VERSION       Exact Kubernetes version
-  --volcano-ref REF           Volcano branch, tag or 40-character commit
   --profile PROFILE           Dependency profile from config/profiles.tsv
   --output DIR                Output directory
 
 Overrides:
-  --volcano-repo URL          Default: official Volcano repository
   --config-dir DIR            Default: config beside this script
   --kind-version VERSION      Required with --node-image for an unlisted K8s
   --node-image IMAGE          Exact kindest/node reference, preferably digest-pinned
   --helm-version VERSION      Override configured Helm version
-  --go-version VERSION        Override Candidate Go toolchain, e.g. go1.25.0
-  --goproxy VALUE             Go module source used for Candidate metadata fallback
-  --gosumdb VALUE             Go checksum database
-  --include-go-modules        Bundle the selected Candidate's Go module file proxy
-  --set-image KEY=IMAGE       Replace a selected configured image
-  --add-image IMAGE           Add an exact Candidate-specific image
+  --go-version VERSION        Generic inner Go toolchain, e.g. go1.25.0
+  --go-sha256 SHA256          Required together with --go-version
+  --set-image KEY=IMAGE       Pull a selected image from an accessible mirror
+  --add-image IMAGE           Add one exact Candidate-specific dependency image
 
 Inspection/output:
   --list-profiles             Print maintained profiles and exit
-  --list-images               Resolve and print configured images without pulling
+  --list-images               Resolve configured images without pulling
   --split-size SIZE           Optional split(1) size, e.g. 1900M
   --publish OWNER/REPOSITORY  Upload generated assets with gh
   --release-tag TAG           Required with --publish
   --keep-work-dir             Keep temporary staging
   -h, --help
 
-The maintained project inputs are this script, volcano-v4-deploy.sh and the
-two TSV files under config/. The dependency bundle never embeds deploy.sh,
-Volcano source, Candidate test source or final Volcano images. Go modules are
-included only when --include-go-modules is selected.
+This command never accepts a Volcano ref, checks out Volcano source, downloads
+Go modules, or builds final Candidate images. The same bundle is reusable for
+different Candidate commits while its configured tools, bases and test images
+still cover those commits.
 EOF
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 CONFIG_DIR="$SCRIPT_DIR/config"
-VOLCANO_REPO="$DEFAULT_VOLCANO_REPO"
-VOLCANO_REF=""; K8S_VERSION=""; PROFILE=""; OUTPUT_DIR=""
+K8S_VERSION=""; PROFILE=""; OUTPUT_DIR=""
 KIND_OVERRIDE=""; NODE_OVERRIDE=""; HELM_OVERRIDE=""; GO_OVERRIDE=""
-GOPROXY_VALUE="${GOPROXY:-$DEFAULT_GOPROXY}"
-GOSUMDB_VALUE="${GOSUMDB:-$DEFAULT_GOSUMDB}"
+GO_SHA_OVERRIDE=""
 LIST_PROFILES=false; LIST_IMAGES=false; KEEP_WORK_DIR=false
-INCLUDE_GO_MODULES=false
 SPLIT_SIZE=""; PUBLISH_REPO=""; RELEASE_TAG=""
 OVERRIDES=(); ADDITIONS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --k8s-version) K8S_VERSION="${2:-}"; shift 2 ;;
-    --volcano-ref) VOLCANO_REF="${2:-}"; shift 2 ;;
     --profile) PROFILE="${2:-}"; shift 2 ;;
     --output) OUTPUT_DIR="${2:-}"; shift 2 ;;
-    --volcano-repo) VOLCANO_REPO="${2:-}"; shift 2 ;;
     --config-dir) CONFIG_DIR="${2:-}"; shift 2 ;;
     --kind-version) KIND_OVERRIDE="${2:-}"; shift 2 ;;
     --node-image) NODE_OVERRIDE="${2:-}"; shift 2 ;;
     --helm-version) HELM_OVERRIDE="${2:-}"; shift 2 ;;
     --go-version) GO_OVERRIDE="${2:-}"; shift 2 ;;
-    --goproxy) GOPROXY_VALUE="${2:-}"; shift 2 ;;
-    --gosumdb) GOSUMDB_VALUE="${2:-}"; shift 2 ;;
-    --include-go-modules) INCLUDE_GO_MODULES=true; shift ;;
+    --go-sha256) GO_SHA_OVERRIDE="${2:-}"; shift 2 ;;
     --set-image) OVERRIDES+=("${2:-}"); shift 2 ;;
     --add-image) ADDITIONS+=("${2:-}"); shift 2 ;;
     --list-profiles) LIST_PROFILES=true; shift ;;
@@ -106,18 +93,13 @@ if [[ "$LIST_PROFILES" == true ]]; then
 fi
 
 [[ -n "$K8S_VERSION" ]] || die "--k8s-version is required"
-[[ -n "$VOLCANO_REF" ]] || die "--volcano-ref is required"
 [[ -n "$PROFILE" ]] || die "--profile is required"
 [[ -n "$OUTPUT_DIR" || "$LIST_IMAGES" == true ]] || die "--output is required"
 valid_semver "$K8S_VERSION" || die "--k8s-version must be exact vMAJOR.MINOR.PATCH"
-valid_text "$VOLCANO_REPO" || die "invalid --volcano-repo"
-valid_text "$VOLCANO_REF" || die "invalid --volcano-ref"
 valid_text "$PROFILE" || die "invalid --profile"
-valid_text "$GOPROXY_VALUE" || die "invalid --goproxy"
-valid_text "$GOSUMDB_VALUE" || die "invalid --gosumdb"
 [[ -z "$PUBLISH_REPO" || -n "$RELEASE_TAG" ]] || die "--release-tag is required with --publish"
 
-HELM_VERSION=""; JQ_VERSION=""; JQ_SHA256=""; KWOK_VERSION=""
+HELM_VERSION=""; JQ_VERSION=""; JQ_SHA256=""; KWOK_VERSION=""; GO_TOOLCHAIN=""; GO_SHA256=""
 KIND_VERSION=""; NODE_IMAGE=""
 while IFS='|' read -r type a b c extra; do
   [[ -n "$type" && "$type" != \#* ]] || continue
@@ -127,6 +109,8 @@ while IFS='|' read -r type a b c extra; do
         helm) HELM_VERSION="$b" ;;
         jq) JQ_VERSION="$b"; JQ_SHA256="$c" ;;
         kwok) KWOK_VERSION="$b" ;;
+        go) GO_TOOLCHAIN="$b"; GO_SHA256="$c" ;;
+        *) die "unknown DEFAULT key in versions.tsv: $a" ;;
       esac
       ;;
     K8S)
@@ -138,6 +122,10 @@ done < "$VERSIONS_CONFIG"
 [[ -z "$HELM_OVERRIDE" ]] || HELM_VERSION="$HELM_OVERRIDE"
 [[ -z "$KIND_OVERRIDE" ]] || KIND_VERSION="$KIND_OVERRIDE"
 [[ -z "$NODE_OVERRIDE" ]] || NODE_IMAGE="$NODE_OVERRIDE"
+[[ -z "$GO_OVERRIDE" && -z "$GO_SHA_OVERRIDE" ]] || {
+  [[ -n "$GO_OVERRIDE" && -n "$GO_SHA_OVERRIDE" ]] || die "--go-version and --go-sha256 must be used together"
+  GO_TOOLCHAIN="$GO_OVERRIDE"; GO_SHA256="$GO_SHA_OVERRIDE"
+}
 if [[ -z "$KIND_VERSION" || -z "$NODE_IMAGE" ]]; then
   die "Kubernetes $K8S_VERSION is not fully configured; pass --kind-version and --node-image together"
 fi
@@ -146,26 +134,27 @@ valid_semver "$HELM_VERSION" || die "invalid Helm version: $HELM_VERSION"
 [[ "$JQ_VERSION" =~ ^jq-[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid jq version in config"
 [[ "$JQ_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "invalid jq checksum in config"
 valid_semver "$KWOK_VERSION" || die "invalid KWOK version in config"
+[[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Go toolchain must be exact goMAJOR.MINOR.PATCH"
+[[ "$GO_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "Go toolchain SHA256 must contain 64 lowercase hex characters"
 
 PROFILE_MODE=""; DEFAULT_RUN=""; PROFILE_GROUPS=""
 E2E_FULL_TYPES=(); BENCHMARK_FULL_SCENARIOS=(); BENCHMARK_FULL_CONFIGS=()
 while IFS='|' read -r type a b c d extra; do
   [[ -n "$type" && "$type" != \#* ]] || continue
   case "$type" in
-    PROFILE)
-      if [[ "$a" == "$PROFILE" ]]; then PROFILE_MODE="$b"; DEFAULT_RUN="$c"; PROFILE_GROUPS="$d"; fi
-      ;;
+    PROFILE) [[ "$a" != "$PROFILE" ]] || { PROFILE_MODE="$b"; DEFAULT_RUN="$c"; PROFILE_GROUPS="$d"; } ;;
     E2E_FULL) E2E_FULL_TYPES+=("$a") ;;
     BENCHMARK_FULL) BENCHMARK_FULL_SCENARIOS+=("$a"); BENCHMARK_FULL_CONFIGS+=("$b") ;;
     IMAGE|RESOURCE) ;;
     *) die "unknown record in profiles.tsv: $type" ;;
   esac
 done < "$PROFILES_CONFIG"
-[[ "$PROFILE_MODE" == "e2e" || "$PROFILE_MODE" == "benchmark" || "$PROFILE_MODE" == "both" ]] || \
+[[ "$PROFILE_MODE" == e2e || "$PROFILE_MODE" == benchmark || "$PROFILE_MODE" == both ]] || \
   die "unknown profile: $PROFILE (use --list-profiles)"
 
 group_selected() {
   local wanted="$1" item
+  [[ "$wanted" == candidate-build ]] && return 0
   IFS=',' read -ra selected_groups <<< "$PROFILE_GROUPS"
   for item in "${selected_groups[@]}"; do [[ "$item" == "$wanted" ]] && return 0; done
   return 1
@@ -211,11 +200,7 @@ for override in "${OVERRIDES[@]}"; do
   [[ "$override" == *=* ]] || die "--set-image expects KEY=IMAGE: $override"
   key="${override%%=*}"; ref="${override#*=}"; found=false
   for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
-    if [[ "${IMAGE_KEYS[$index]}" == "$key" ]]; then
-      # Pulling may use an accessible mirror, but the local tag must remain the
-      # exact reference used by Candidate YAML/Dockerfiles.
-      IMAGE_PULL_REFS[index]="$ref"; found=true
-    fi
+    if [[ "${IMAGE_KEYS[$index]}" == "$key" ]]; then IMAGE_PULL_REFS[index]="$ref"; found=true; fi
   done
   [[ "$found" == true ]] || die "--set-image key is not selected: $key"
 done
@@ -223,52 +208,28 @@ for ((index=0; index<${#ADDITIONS[@]}; index++)); do
   set_image "extra-$((index+1))" "${ADDITIONS[$index]}" "${ADDITIONS[$index]%@*}"
 done
 
-for command in git awk mktemp; do need "$command"; done
-
-resolve_commit() {
-  local repo="$1" ref="$2" line commit="" verify_dir
-  if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
-    verify_dir="$(mktemp -d /tmp/volcano-v4-resolve.XXXXXX)"
-    git -C "$verify_dir" init >/dev/null
-    if git -C "$verify_dir" fetch --quiet --depth 1 "$repo" "$ref"; then
-      commit="$(git -C "$verify_dir" rev-parse FETCH_HEAD)"
-    fi
-    rm -rf -- "$verify_dir"
-  else
-    while read -r line; do
-      [[ -n "$line" ]] || continue
-      if [[ "${line#*$'\t'}" == "refs/tags/$ref^{}" ]]; then commit="${line%%$'\t'*}"; break; fi
-      [[ -n "$commit" ]] || commit="${line%%$'\t'*}"
-    done < <(git ls-remote "$repo" "refs/heads/$ref" "refs/tags/$ref" "refs/tags/$ref^{}")
-  fi
-  [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || return 1
-  printf '%s\n' "${commit,,}"
-}
-
-VOLCANO_COMMIT="$(resolve_commit "$VOLCANO_REPO" "$VOLCANO_REF")" || die "cannot resolve Volcano ref: $VOLCANO_REF"
 if [[ "$LIST_IMAGES" == true ]]; then
-  printf 'profile=%s\nmode=%s\nkubernetes=%s\nkind=%s\nnode=%s\nvolcano=%s\n' \
-    "$PROFILE" "$PROFILE_MODE" "$K8S_VERSION" "$KIND_VERSION" "$NODE_IMAGE" "$VOLCANO_COMMIT"
+  printf 'profile=%s\nmode=%s\nkubernetes=%s\nkind=%s\nnode=%s\ngo=%s\n' \
+    "$PROFILE" "$PROFILE_MODE" "$K8S_VERSION" "$KIND_VERSION" "$NODE_IMAGE" "$GO_TOOLCHAIN"
   for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
     printf '%s=%s -> %s\n' "${IMAGE_KEYS[$index]}" "${IMAGE_PULL_REFS[$index]}" "${IMAGE_SAVE_REFS[$index]}"
   done
-  printf 'Candidate Dockerfile bases are checked and appended during a real package run.\n'
   exit 0
 fi
 
-for command in curl docker tar gzip sha256sum sed grep sort; do need "$command"; done
+for command in curl docker tar gzip sha256sum awk sed grep sort mktemp; do need "$command"; done
 docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die "packaging requires Linux x86_64"
 
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
 safe_k8s="${K8S_VERSION#v}"; safe_profile="${PROFILE//[^a-zA-Z0-9._-]/-}"
-BUNDLE_NAME="volcano-v4-${safe_k8s}-${VOLCANO_COMMIT:0:12}-${safe_profile}"
+BUNDLE_NAME="volcano-v4-${safe_k8s}-${safe_profile}"
 BUNDLE_PATH="$OUTPUT_DIR/${BUNDLE_NAME}.tar.gz"
 [[ ! -e "$BUNDLE_PATH" ]] || die "output already exists: $BUNDLE_PATH"
 WORK_DIR="$(mktemp -d /tmp/volcano-v4-package.XXXXXX)"
 STAGE="$WORK_DIR/$BUNDLE_NAME"; TOOLS_STAGE="$WORK_DIR/tools"; TOOLS_BIN="$TOOLS_STAGE/bin"
-RESOURCES_STAGE="$WORK_DIR/resources"; META_CHECKOUT="$WORK_DIR/meta-source"
+RESOURCES_STAGE="$WORK_DIR/resources"
 mkdir -p "$STAGE" "$TOOLS_BIN" "$RESOURCES_STAGE"
 cleanup() {
   status=$?
@@ -278,58 +239,6 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-github_raw_base=""
-if [[ "$VOLCANO_REPO" =~ ^https://github\.com/([^/]+)/([^/]+)(\.git)?$ ]]; then
-  github_owner="${BASH_REMATCH[1]}"; github_repo="${BASH_REMATCH[2]%.git}"
-  github_raw_base="https://raw.githubusercontent.com/$github_owner/$github_repo/$VOLCANO_COMMIT"
-fi
-meta_checkout_ready=false
-ensure_meta_checkout() {
-  if [[ "$meta_checkout_ready" != true ]]; then
-    git init "$META_CHECKOUT" >/dev/null
-    git -C "$META_CHECKOUT" remote add origin "$VOLCANO_REPO"
-    git -C "$META_CHECKOUT" fetch --depth 1 origin "$VOLCANO_COMMIT" >/dev/null
-    git -C "$META_CHECKOUT" checkout --detach FETCH_HEAD >/dev/null
-    meta_checkout_ready=true
-  fi
-}
-candidate_file() {
-  local path="$1" destination="$2"
-  if [[ -n "$github_raw_base" ]] && curl --fail --location --silent --show-error \
-      --retry 2 -o "$destination" "$github_raw_base/$path"; then return 0; fi
-  ensure_meta_checkout
-  git -C "$META_CHECKOUT" show "HEAD:$path" > "$destination"
-}
-
-CANDIDATE_GO_MOD="$WORK_DIR/candidate.go.mod"
-candidate_file go.mod "$CANDIDATE_GO_MOD" || die "cannot read Candidate go.mod"
-GO_DIRECTIVE="$(awk '$1=="go" && NF==2 {print $2; exit}' "$CANDIDATE_GO_MOD")"
-GO_TOOLCHAIN="$(awk '$1=="toolchain" && NF==2 {print $2; exit}' "$CANDIDATE_GO_MOD")"
-[[ -n "$GO_TOOLCHAIN" ]] || GO_TOOLCHAIN="go$GO_DIRECTIVE"
-[[ -z "$GO_OVERRIDE" ]] || GO_TOOLCHAIN="$GO_OVERRIDE"
-[[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Candidate Go version is not exact: $GO_TOOLCHAIN"
-
-dockerfiles=(scheduler controller-manager webhook-manager)
-if [[ "$DEFAULT_RUN" == FULL || "$DEFAULT_RUN" == pod || "$DEFAULT_RUN" == AGENTSCHEDULER* ]]; then
-  dockerfiles+=(agent-scheduler)
-fi
-if group_selected benchmark-monitoring; then dockerfiles+=(benchmark-audit-exporter); fi
-base_number=0
-for name in "${dockerfiles[@]}"; do
-  if [[ "$name" == benchmark-audit-exporter ]]; then path="benchmark/manifests/audit-exporter/Dockerfile"
-  else path="installer/dockerfile/$name/Dockerfile"; fi
-  file="$WORK_DIR/${name}.Dockerfile"
-  candidate_file "$path" "$file" || die "Candidate Dockerfile is missing: $path"
-  while IFS= read -r base; do
-    [[ "$base" != *'${'* ]] || die "unresolved Candidate base image in $path: $base"
-    duplicate=false
-    for ref in "${IMAGE_SAVE_REFS[@]}"; do [[ "$ref" == "${base%@*}" ]] && duplicate=true; done
-    if [[ "$duplicate" != true ]]; then
-      base_number=$((base_number+1)); set_image "candidate-base-$base_number" "$base" "${base%@*}"
-    fi
-  # Some upstream Dockerfiles use CRLF (for example agent-scheduler v1.15.0).
-  done < <(awk 'toupper($1)=="FROM" {for(i=2;i<=NF;i++) if($i !~ /^--/) {gsub(/\r/,"",$i); print $i; break}}' "$file" | sort -u)
-done
 
 download_verified() {
   local url="$1" checksum_url="$2" output="$3" expected actual
@@ -341,7 +250,7 @@ download_verified() {
   mv "$output.part" "$output"
 }
 
-log "downloading exact tools"
+log "downloading exact generic tools"
 download_verified \
   "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \
   "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" \
@@ -363,43 +272,20 @@ curl --fail --location --retry 3 --connect-timeout 30 -o "$TOOLS_BIN/jq" \
 chmod 0755 "$TOOLS_BIN/kind" "$TOOLS_BIN/kubectl" "$TOOLS_BIN/helm" "$TOOLS_BIN/jq"
 
 go_filename="${GO_TOOLCHAIN}.linux-amd64.tar.gz"; go_archive="$WORK_DIR/$go_filename"
-go_index="$WORK_DIR/go-releases.json"
-curl --fail --location --retry 3 --connect-timeout 30 -o "$go_index" 'https://go.dev/dl/?mode=json&include=all'
-go_sha="$("$TOOLS_BIN/jq" -r --arg v "$GO_TOOLCHAIN" --arg f "$go_filename" \
-  '.[]|select(.version==$v)|.files[]|select(.filename==$f and .os=="linux" and .arch=="amd64")|.sha256' "$go_index" | head -n1)"
-[[ "$go_sha" =~ ^[0-9a-f]{64}$ ]] || die "Go archive is absent from official index: $GO_TOOLCHAIN"
-curl --fail --location --retry 3 --connect-timeout 30 -o "$go_archive" "https://go.dev/dl/$go_filename"
-[[ "$(sha256sum "$go_archive" | awk '{print $1}')" == "$go_sha" ]] || die "Go checksum mismatch"
+if ! curl --fail --location --retry 3 --connect-timeout 30 -o "$go_archive.part" "https://go.dev/dl/$go_filename"; then
+  log "go.dev archive endpoint failed; retrying the official download host"
+  curl --fail --location --retry 3 --connect-timeout 30 -o "$go_archive.part" "https://dl.google.com/go/$go_filename"
+fi
+mv "$go_archive.part" "$go_archive"
+[[ "$(sha256sum "$go_archive" | awk '{print $1}')" == "$GO_SHA256" ]] || die "Go checksum mismatch"
 tar -xzf "$go_archive" -C "$TOOLS_STAGE"
 tar -C "$TOOLS_STAGE" -czf "$STAGE/tools.tar.gz" .
-
-if [[ "$INCLUDE_GO_MODULES" == true ]]; then
-  ensure_meta_checkout
-  module_cache="$WORK_DIR/go-module-download-cache"
-  module_gopath="$WORK_DIR/go-module-gopath"
-  mkdir -p "$module_cache" "$module_gopath"
-  ginkgo_version="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2;exit} $1=="require"&&$2=="github.com/onsi/ginkgo/v2" {print $3;exit}' "$META_CHECKOUT/go.mod")"
-  [[ "$ginkgo_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "cannot resolve Candidate Ginkgo version"
-  log "downloading Candidate Go module graph and Ginkgo $ginkgo_version"
-  (
-    cd "$META_CHECKOUT"
-    export GOROOT="$TOOLS_STAGE/go" GOTOOLCHAIN=local GOPATH="$module_gopath"
-    export GOMODCACHE="$module_cache" GOCACHE="$WORK_DIR/go-module-build-cache"
-    export GOPROXY="$GOPROXY_VALUE" GOSUMDB="$GOSUMDB_VALUE"
-    export PATH="$GOROOT/bin:$PATH"
-    go mod download all
-    GOBIN="$WORK_DIR/go-module-bin" go install "github.com/onsi/ginkgo/v2/ginkgo@$ginkgo_version"
-  )
-  [[ -d "$module_cache/cache/download" ]] || die "Go module download cache was not created"
-  tar -C "$module_cache/cache/download" --exclude='*.lock' --exclude='*.tmp' \
-    -czf "$STAGE/go-modules.tar.gz" .
-  [[ -s "$STAGE/go-modules.tar.gz" ]] || die "Go module archive is empty"
-fi
 
 log "downloading ${#RESOURCE_KEYS[@]} small resources"
 RESOURCE_SHAS=()
 for ((index=0; index<${#RESOURCE_KEYS[@]}; index++)); do
-  path="${RESOURCE_PATHS[$index]}"; [[ "$path" != /* && "$path" != *'..'* ]] || die "unsafe resource path: $path"
+  path="${RESOURCE_PATHS[$index]}"
+  [[ "$path" != /* && "$path" != *'..'* ]] || die "unsafe resource path: $path"
   mkdir -p "$RESOURCES_STAGE/$(dirname "$path")"
   curl --fail --location --retry 3 --connect-timeout 30 -o "$RESOURCES_STAGE/$path" "${RESOURCE_URLS[$index]}"
   RESOURCE_SHAS+=("$(sha256sum "$RESOURCES_STAGE/$path" | awk '{print $1}')")
@@ -409,12 +295,10 @@ tar -C "$RESOURCES_STAGE" -czf "$STAGE/resources.tar.gz" .
 META="$STAGE/bundle.meta"
 {
   printf 'FORMAT=volcano-performance-guard-v4\nSCRIPT_VERSION=%s\n' "$SCRIPT_VERSION"
-  printf 'CREATED_AT=%s\nPLATFORM=linux/amd64\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'BUNDLE_SCOPE=generic\nCREATED_AT=%s\nPLATFORM=linux/amd64\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'PROFILE=%s\nMODE=%s\nDEFAULT_RUN=%s\n' "$PROFILE" "$PROFILE_MODE" "$DEFAULT_RUN"
-  printf 'GO_MODULES_INCLUDED=%s\n' "$INCLUDE_GO_MODULES"
   printf 'K8S_VERSION=%s\nKIND_VERSION=%s\nHELM_VERSION=%s\nJQ_VERSION=%s\nKWOK_VERSION=%s\nGO_TOOLCHAIN=%s\n' \
     "$K8S_VERSION" "$KIND_VERSION" "$HELM_VERSION" "$JQ_VERSION" "$KWOK_VERSION" "$GO_TOOLCHAIN"
-  printf 'VOLCANO_REPO=%s\nVOLCANO_REF=%s\nVOLCANO_COMMIT=%s\n' "$VOLCANO_REPO" "$VOLCANO_REF" "$VOLCANO_COMMIT"
   printf 'TOOL=kind|%s|bin/kind|%s\n' "$KIND_VERSION" "$(sha256sum "$TOOLS_BIN/kind"|awk '{print $1}')"
   printf 'TOOL=kubectl|%s|bin/kubectl|%s\n' "$K8S_VERSION" "$(sha256sum "$TOOLS_BIN/kubectl"|awk '{print $1}')"
   printf 'TOOL=helm|%s|bin/helm|%s\n' "$HELM_VERSION" "$(sha256sum "$TOOLS_BIN/helm"|awk '{print $1}')"
@@ -456,9 +340,7 @@ log "saving ${#SAVE_REFS[@]} unique local image tags"
 docker image save "${SAVE_REFS[@]}" | gzip -1 -n > "$STAGE/images.tar.gz"
 (
   cd "$STAGE"
-  checksum_files=(bundle.meta images.tar.gz tools.tar.gz resources.tar.gz)
-  [[ "$INCLUDE_GO_MODULES" != true ]] || checksum_files+=(go-modules.tar.gz)
-  sha256sum "${checksum_files[@]}" > SHA256SUMS
+  sha256sum bundle.meta images.tar.gz tools.tar.gz resources.tar.gz > SHA256SUMS
 )
 tar -C "$WORK_DIR" -czf "$BUNDLE_PATH" "$BUNDLE_NAME"
 (cd "$OUTPUT_DIR" && sha256sum "$(basename "$BUNDLE_PATH")" > "$(basename "$BUNDLE_PATH").sha256")
@@ -475,6 +357,6 @@ fi
 if [[ -n "$PUBLISH_REPO" ]]; then
   need gh
   gh release view "$RELEASE_TAG" --repo "$PUBLISH_REPO" >/dev/null 2>&1 || \
-    gh release create "$RELEASE_TAG" --repo "$PUBLISH_REPO" --title "$RELEASE_TAG" --notes "Volcano dependency bundle $SCRIPT_VERSION"
+    gh release create "$RELEASE_TAG" --repo "$PUBLISH_REPO" --title "$RELEASE_TAG" --notes "Generic Volcano dependency bundle $SCRIPT_VERSION"
   gh release upload "$RELEASE_TAG" "${UPLOAD_ASSETS[@]}" --repo "$PUBLISH_REPO" --clobber
 fi
