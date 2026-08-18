@@ -36,7 +36,7 @@ bash volcano-v4-package.sh --k8s-version v1.32.5 --volcano-ref v1.15.0 --profile
 bash volcano-v4-deploy.sh --bundle ./release-assets/volcano-v4-1.32.5-*-e2e-basic.tar.gz --output ./results
 ```
 
-正常情况下不需要手工填写 `HTTP_PROXY`、`HTTPS_PROXY`、`GOPROXY` 或 `GOSUMDB`。只有内网服务器访问 Go Module 必须经过单位内部代理时，才在部署命令后增加例如：
+正常情况下不需要手工填写 `HTTP_PROXY`、`HTTPS_PROXY`、`GOPROXY` 或 `GOSUMDB`。部署脚本会把宿主机的 Go Module 配置和已有的 HTTP 代理环境传入 Candidate 的 BuildKit 构建，并使用宿主网络完成 `go mod download`。只有内网服务器必须使用单位提供的 Go Module 地址时，才在部署命令后增加例如：
 
 ```bash
 --goproxy https://单位提供的Go代理,direct --gosumdb sum.golang.org

@@ -402,6 +402,58 @@ fi
 DOCKERFILES=(scheduler controller-manager webhook-manager)
 [[ "$BUILD_AGENT" != true ]] || DOCKERFILES+=(agent-scheduler)
 if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]] && has_image_key prometheus; then DOCKERFILES+=(benchmark-audit-exporter); fi
+
+patch_candidate_build_network() {
+  local makefile="$CHECKOUT/Makefile" tmp="$WORK_DIR/patch.tmp" name rel path
+  local -a patched=(Makefile)
+  [[ -f "$makefile" ]] || die "Candidate Makefile is missing"
+  awk '
+    BEGIN {inserted=0}
+    {
+      print
+      if ($0 ~ /--platform[[:space:]]+/ && $0 ~ /DOCKER_PLATFORMS/) {
+        print "\t\t\t--build-arg GOPROXY \\"
+        print "\t\t\t--build-arg GOSUMDB \\"
+        print "\t\t\t--build-arg HTTP_PROXY \\"
+        print "\t\t\t--build-arg HTTPS_PROXY \\"
+        print "\t\t\t--build-arg NO_PROXY \\"
+        print "\t\t\t--network host \\"
+        inserted++
+      }
+    }
+    END {if(inserted<1) exit 44}
+  ' "$makefile" > "$tmp" || die "cannot add Candidate BuildKit network settings"
+  mv "$tmp" "$makefile"
+
+  for name in "${DOCKERFILES[@]}"; do
+    if [[ "$name" == benchmark-audit-exporter ]]; then rel="benchmark/manifests/audit-exporter/Dockerfile"
+    else rel="installer/dockerfile/$name/Dockerfile"; fi
+    path="$CHECKOUT/$rel"; patched+=("$rel")
+    grep -Eq '^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download' "$path" || continue
+    if grep -Eq '^[[:space:]]*ARG[[:space:]]+GOPROXY([[:space:]=]|$)' "$path"; then
+      grep -Eq '^[[:space:]]*ARG[[:space:]]+GOSUMDB([[:space:]=]|$)' "$path" || die "Candidate Dockerfile has incomplete Go proxy arguments: $rel"
+      continue
+    fi
+    awk '
+      BEGIN {inserted=0}
+      {
+        print
+        upper=toupper($0)
+        if (!inserted && upper ~ /^[[:space:]]*FROM[[:space:]].*[[:space:]]AS[[:space:]]+BUILDER([[:space:]]|$)/) {
+          print "ARG GOPROXY"
+          print "ARG GOSUMDB"
+          inserted=1
+        }
+      }
+      END {if(inserted!=1) exit 45}
+    ' "$path" > "$tmp" || die "cannot add Go proxy arguments to Candidate Dockerfile: $rel"
+    mv "$tmp" "$path"
+  done
+  git -C "$CHECKOUT" diff -- "${patched[@]}" > "$OUTPUT_DIR/candidate-build-network.patch"
+  [[ -s "$OUTPUT_DIR/candidate-build-network.patch" ]] || die "Candidate build network patch is empty"
+}
+
+patch_candidate_build_network
 for name in "${DOCKERFILES[@]}"; do
   if [[ "$name" == benchmark-audit-exporter ]]; then path="$CHECKOUT/benchmark/manifests/audit-exporter/Dockerfile"
   else path="$CHECKOUT/installer/dockerfile/$name/Dockerfile"; fi
