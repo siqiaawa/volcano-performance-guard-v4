@@ -497,7 +497,7 @@ patch_candidate_build_network() {
           command=$0
           sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
           print "RUN --mount=type=secret,id=vpg_host_ca,required=true \\"
-          print "    SSL_CERT_FILE=/run/secrets/vpg_host_ca " command
+          print "    SSL_CERT_FILE=/run/secrets/vpg_host_ca GIT_SSL_CAINFO=/run/secrets/vpg_host_ca " command
           replaced++
           next
         }
