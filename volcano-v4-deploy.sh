@@ -331,16 +331,17 @@ docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
 TOOLS_DIR="$WORK_DIR/tools"; BIN_DIR="$TOOLS_DIR/bin"; RESOURCES_DIR="$WORK_DIR/resources"
 safe_extract "$BUNDLE_ROOT/tools.tar.gz" "$TOOLS_DIR"
 safe_extract "$BUNDLE_ROOT/resources.tar.gz" "$RESOURCES_DIR"
-VPG_GO_PROXY_DIR=""
+VPG_GO_PROXY_DIR=""; VPG_GO_MODULE_ARCHIVE=""
 if [[ "$GO_MODULES_INCLUDED" == true ]]; then
+  VPG_GO_MODULE_ARCHIVE="$BUNDLE_ROOT/go-modules.tar.gz"
   VPG_GO_PROXY_DIR="$WORK_DIR/go-module-proxy"
-  safe_extract "$BUNDLE_ROOT/go-modules.tar.gz" "$VPG_GO_PROXY_DIR"
+  safe_extract "$VPG_GO_MODULE_ARCHIVE" "$VPG_GO_PROXY_DIR"
   [[ -d "$VPG_GO_PROXY_DIR/github.com" || -d "$VPG_GO_PROXY_DIR/golang.org" || -d "$VPG_GO_PROXY_DIR/k8s.io" ]] || \
     die "packaged Go module proxy is empty"
   GOPROXY_VALUE="file://$VPG_GO_PROXY_DIR"; GOSUMDB_VALUE=off
   log "using the packaged Candidate Go module proxy"
 fi
-export VPG_GO_PROXY_DIR
+export VPG_GO_PROXY_DIR VPG_GO_MODULE_ARCHIVE
 for ((index=0; index<${#TOOL_KEYS[@]}; index++)); do
   key="${TOOL_KEYS[$index]}"; path="${TOOL_PATHS[$index]}"; expected="${TOOL_SHA256S[$index]}"
   [[ "$key" =~ ^[a-z0-9-]+$ ]] || die "invalid tool key: $key"
@@ -489,11 +490,20 @@ DOCKERFILES=(scheduler controller-manager webhook-manager)
 if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]] && has_image_key prometheus; then DOCKERFILES+=(benchmark-audit-exporter); fi
 
 patch_candidate_build_network() {
-  local makefile="$CHECKOUT/Makefile" tmp="$WORK_DIR/patch.tmp" name rel path use_ca=false use_modules=false add_args
+  local makefile="$CHECKOUT/Makefile" dockerignore="$CHECKOUT/.dockerignore"
+  local tmp="$WORK_DIR/patch.tmp" name rel path use_ca=false use_modules=false add_args
   local -a patched=(Makefile)
   [[ -f "$makefile" ]] || die "Candidate Makefile is missing"
   [[ -z "$VPG_HOST_CA_BUNDLE" ]] || use_ca=true
   [[ -z "$VPG_GO_PROXY_DIR" ]] || use_modules=true
+  if [[ "$use_modules" == true ]]; then
+    # Older Dockerfile frontends (common on CentOS 7) do not implement named
+    # build contexts. Put the already-verified compressed module proxy in the
+    # ordinary context and unpack it only for go mod download instead.
+    cp -- "$VPG_GO_MODULE_ARCHIVE" "$CHECKOUT/.vpg4-go-modules.tar.gz"
+    printf '\n!.vpg4-go-modules.tar.gz\n' >> "$dockerignore"
+    patched+=(.dockerignore)
+  fi
   awk -v use_ca="$use_ca" -v use_modules="$use_modules" '
     BEGIN {inserted=0}
     {
@@ -501,8 +511,7 @@ patch_candidate_build_network() {
       if ($0 ~ /--platform[[:space:]]+/ && $0 ~ /DOCKER_PLATFORMS/) {
         print "\t\t\t--build-arg GOPROXY \\"
         print "\t\t\t--build-arg GOSUMDB \\"
-        if (use_modules=="true") print "\t\t\t--build-context vpg4gomod=${VPG_GO_PROXY_DIR} \\"
-        else if (use_ca=="true") print "\t\t\t--secret id=vpg_host_ca,src=${VPG_HOST_CA_BUNDLE} \\"
+        if (use_modules!="true" && use_ca=="true") print "\t\t\t--secret id=vpg_host_ca,src=${VPG_HOST_CA_BUNDLE} \\"
         print "\t\t\t--build-arg HTTP_PROXY \\"
         print "\t\t\t--build-arg HTTPS_PROXY \\"
         print "\t\t\t--build-arg NO_PROXY \\"
@@ -532,8 +541,11 @@ patch_candidate_build_network() {
         if (use_modules=="true" && $0 ~ /^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download/) {
           command=$0
           sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
-          print "RUN --mount=type=bind,from=vpg4gomod,target=/vpg4-goproxy,ro \\"
-          print "    GOPROXY=file:///vpg4-goproxy GOSUMDB=off " command
+          print "COPY .vpg4-go-modules.tar.gz /tmp/vpg4-go-modules.tar.gz"
+          print "RUN mkdir -p /tmp/vpg4-goproxy \\"
+          print "    && tar -xzf /tmp/vpg4-go-modules.tar.gz -C /tmp/vpg4-goproxy \\"
+          print "    && GOPROXY=file:///tmp/vpg4-goproxy GOSUMDB=off " command " \\"
+          print "    && rm -rf /tmp/vpg4-goproxy /tmp/vpg4-go-modules.tar.gz"
           replaced++
           next
         }
