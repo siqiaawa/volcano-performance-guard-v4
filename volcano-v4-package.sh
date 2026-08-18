@@ -35,6 +35,7 @@ Overrides:
   --go-version VERSION        Override Candidate Go toolchain, e.g. go1.25.0
   --goproxy VALUE             Go module source used for Candidate metadata fallback
   --gosumdb VALUE             Go checksum database
+  --include-go-modules        Bundle the selected Candidate's Go module file proxy
   --set-image KEY=IMAGE       Replace a selected configured image
   --add-image IMAGE           Add an exact Candidate-specific image
 
@@ -48,8 +49,9 @@ Inspection/output:
   -h, --help
 
 The maintained project inputs are this script, volcano-v4-deploy.sh and the
-two TSV files under config/. The dependency bundle does not embed deploy.sh,
-Volcano source, Candidate test source, Go module cache or final Volcano images.
+two TSV files under config/. The dependency bundle never embeds deploy.sh,
+Volcano source, Candidate test source or final Volcano images. Go modules are
+included only when --include-go-modules is selected.
 EOF
 }
 
@@ -61,6 +63,7 @@ KIND_OVERRIDE=""; NODE_OVERRIDE=""; HELM_OVERRIDE=""; GO_OVERRIDE=""
 GOPROXY_VALUE="${GOPROXY:-$DEFAULT_GOPROXY}"
 GOSUMDB_VALUE="${GOSUMDB:-$DEFAULT_GOSUMDB}"
 LIST_PROFILES=false; LIST_IMAGES=false; KEEP_WORK_DIR=false
+INCLUDE_GO_MODULES=false
 SPLIT_SIZE=""; PUBLISH_REPO=""; RELEASE_TAG=""
 OVERRIDES=(); ADDITIONS=()
 
@@ -78,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --go-version) GO_OVERRIDE="${2:-}"; shift 2 ;;
     --goproxy) GOPROXY_VALUE="${2:-}"; shift 2 ;;
     --gosumdb) GOSUMDB_VALUE="${2:-}"; shift 2 ;;
+    --include-go-modules) INCLUDE_GO_MODULES=true; shift ;;
     --set-image) OVERRIDES+=("${2:-}"); shift 2 ;;
     --add-image) ADDITIONS+=("${2:-}"); shift 2 ;;
     --list-profiles) LIST_PROFILES=true; shift ;;
@@ -266,7 +270,13 @@ WORK_DIR="$(mktemp -d /tmp/volcano-v4-package.XXXXXX)"
 STAGE="$WORK_DIR/$BUNDLE_NAME"; TOOLS_STAGE="$WORK_DIR/tools"; TOOLS_BIN="$TOOLS_STAGE/bin"
 RESOURCES_STAGE="$WORK_DIR/resources"; META_CHECKOUT="$WORK_DIR/meta-source"
 mkdir -p "$STAGE" "$TOOLS_BIN" "$RESOURCES_STAGE"
-cleanup() { status=$?; if [[ "$KEEP_WORK_DIR" == true ]]; then log "kept work directory: $WORK_DIR"; else rm -rf -- "$WORK_DIR"; fi; exit "$status"; }
+cleanup() {
+  status=$?
+  if [[ "$KEEP_WORK_DIR" == true ]]; then log "kept work directory: $WORK_DIR"
+  else chmod -R u+w "$WORK_DIR" 2>/dev/null || true; rm -rf -- "$WORK_DIR"
+  fi
+  exit "$status"
+}
 trap cleanup EXIT
 github_raw_base=""
 if [[ "$VOLCANO_REPO" =~ ^https://github\.com/([^/]+)/([^/]+)(\.git)?$ ]]; then
@@ -274,17 +284,21 @@ if [[ "$VOLCANO_REPO" =~ ^https://github\.com/([^/]+)/([^/]+)(\.git)?$ ]]; then
   github_raw_base="https://raw.githubusercontent.com/$github_owner/$github_repo/$VOLCANO_COMMIT"
 fi
 meta_checkout_ready=false
-candidate_file() {
-  local path="$1" destination="$2"
-  if [[ -n "$github_raw_base" ]] && curl --fail --location --silent --show-error \
-      --retry 2 -o "$destination" "$github_raw_base/$path"; then return 0; fi
+ensure_meta_checkout() {
   if [[ "$meta_checkout_ready" != true ]]; then
     git init "$META_CHECKOUT" >/dev/null
     git -C "$META_CHECKOUT" remote add origin "$VOLCANO_REPO"
     git -C "$META_CHECKOUT" fetch --depth 1 origin "$VOLCANO_COMMIT" >/dev/null
+    git -C "$META_CHECKOUT" checkout --detach FETCH_HEAD >/dev/null
     meta_checkout_ready=true
   fi
-  git -C "$META_CHECKOUT" show "FETCH_HEAD:$path" > "$destination"
+}
+candidate_file() {
+  local path="$1" destination="$2"
+  if [[ -n "$github_raw_base" ]] && curl --fail --location --silent --show-error \
+      --retry 2 -o "$destination" "$github_raw_base/$path"; then return 0; fi
+  ensure_meta_checkout
+  git -C "$META_CHECKOUT" show "HEAD:$path" > "$destination"
 }
 
 CANDIDATE_GO_MOD="$WORK_DIR/candidate.go.mod"
@@ -320,7 +334,7 @@ done
 download_verified() {
   local url="$1" checksum_url="$2" output="$3" expected actual
   curl --fail --location --retry 3 --connect-timeout 30 -o "$output.part" "$url"
-  expected="$(curl --fail --location --retry 3 --connect-timeout 30 "$checksum_url" | awk 'match($0,/[0-9a-fA-F]{64}/){print tolower(substr($0,RSTART,RLENGTH)); exit}')"
+  expected="$(curl --fail --location --retry 3 --connect-timeout 30 "$checksum_url" | awk 'match($0,/[0-9a-fA-F]{64}/) && !found {print tolower(substr($0,RSTART,RLENGTH)); found=1}')"
   [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "cannot read checksum: $checksum_url"
   actual="$(sha256sum "$output.part" | awk '{print $1}')"
   [[ "$actual" == "$expected" ]] || die "download checksum mismatch: $url"
@@ -359,6 +373,29 @@ curl --fail --location --retry 3 --connect-timeout 30 -o "$go_archive" "https://
 tar -xzf "$go_archive" -C "$TOOLS_STAGE"
 tar -C "$TOOLS_STAGE" -czf "$STAGE/tools.tar.gz" .
 
+if [[ "$INCLUDE_GO_MODULES" == true ]]; then
+  ensure_meta_checkout
+  module_cache="$WORK_DIR/go-module-download-cache"
+  module_gopath="$WORK_DIR/go-module-gopath"
+  mkdir -p "$module_cache" "$module_gopath"
+  ginkgo_version="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2;exit} $1=="require"&&$2=="github.com/onsi/ginkgo/v2" {print $3;exit}' "$META_CHECKOUT/go.mod")"
+  [[ "$ginkgo_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "cannot resolve Candidate Ginkgo version"
+  log "downloading Candidate Go module graph and Ginkgo $ginkgo_version"
+  (
+    cd "$META_CHECKOUT"
+    export GOROOT="$TOOLS_STAGE/go" GOTOOLCHAIN=local GOPATH="$module_gopath"
+    export GOMODCACHE="$module_cache" GOCACHE="$WORK_DIR/go-module-build-cache"
+    export GOPROXY="$GOPROXY_VALUE" GOSUMDB="$GOSUMDB_VALUE"
+    export PATH="$GOROOT/bin:$PATH"
+    go mod download all
+    GOBIN="$WORK_DIR/go-module-bin" go install "github.com/onsi/ginkgo/v2/ginkgo@$ginkgo_version"
+  )
+  [[ -d "$module_cache/cache/download" ]] || die "Go module download cache was not created"
+  tar -C "$module_cache/cache/download" --exclude='*.lock' --exclude='*.tmp' \
+    -czf "$STAGE/go-modules.tar.gz" .
+  [[ -s "$STAGE/go-modules.tar.gz" ]] || die "Go module archive is empty"
+fi
+
 log "downloading ${#RESOURCE_KEYS[@]} small resources"
 RESOURCE_SHAS=()
 for ((index=0; index<${#RESOURCE_KEYS[@]}; index++)); do
@@ -374,6 +411,7 @@ META="$STAGE/bundle.meta"
   printf 'FORMAT=volcano-performance-guard-v4\nSCRIPT_VERSION=%s\n' "$SCRIPT_VERSION"
   printf 'CREATED_AT=%s\nPLATFORM=linux/amd64\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'PROFILE=%s\nMODE=%s\nDEFAULT_RUN=%s\n' "$PROFILE" "$PROFILE_MODE" "$DEFAULT_RUN"
+  printf 'GO_MODULES_INCLUDED=%s\n' "$INCLUDE_GO_MODULES"
   printf 'K8S_VERSION=%s\nKIND_VERSION=%s\nHELM_VERSION=%s\nJQ_VERSION=%s\nKWOK_VERSION=%s\nGO_TOOLCHAIN=%s\n' \
     "$K8S_VERSION" "$KIND_VERSION" "$HELM_VERSION" "$JQ_VERSION" "$KWOK_VERSION" "$GO_TOOLCHAIN"
   printf 'VOLCANO_REPO=%s\nVOLCANO_REF=%s\nVOLCANO_COMMIT=%s\n' "$VOLCANO_REPO" "$VOLCANO_REF" "$VOLCANO_COMMIT"
@@ -418,7 +456,9 @@ log "saving ${#SAVE_REFS[@]} unique local image tags"
 docker image save "${SAVE_REFS[@]}" | gzip -1 -n > "$STAGE/images.tar.gz"
 (
   cd "$STAGE"
-  sha256sum bundle.meta images.tar.gz tools.tar.gz resources.tar.gz > SHA256SUMS
+  checksum_files=(bundle.meta images.tar.gz tools.tar.gz resources.tar.gz)
+  [[ "$INCLUDE_GO_MODULES" != true ]] || checksum_files+=(go-modules.tar.gz)
+  sha256sum "${checksum_files[@]}" > SHA256SUMS
 )
 tar -C "$WORK_DIR" -czf "$BUNDLE_PATH" "$BUNDLE_NAME"
 (cd "$OUTPUT_DIR" && sha256sum "$(basename "$BUNDLE_PATH")" > "$(basename "$BUNDLE_PATH").sha256")

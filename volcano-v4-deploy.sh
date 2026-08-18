@@ -51,8 +51,9 @@ Run selection (must be covered by the bundle profile):
 
 The server itself only needs Bash, curl, git, Docker, tar, gzip, sha256sum,
 make and basic POSIX tools. Exact Kind, kubectl, Helm, jq and Go come from the
-bundle. Ginkgo is installed at the version selected by Candidate go.mod through
-the inner Go module channel; nothing is installed system-wide.
+bundle. Ginkgo is installed at the version selected by Candidate go.mod; a
+bundle containing go-modules.tar.gz supplies it and Candidate builds without a
+Go network connection. Nothing is installed system-wide.
 EOF
 }
 
@@ -172,7 +173,9 @@ cleanup() {
     log "deleting project cluster after interruption: $CURRENT_CLUSTER"
     kind delete cluster --name "$CURRENT_CLUSTER" >"$OUTPUT_DIR/kind-delete-trap.log" 2>&1 || true
   fi
-  if [[ "$AUTO_WORK" == true && "$KEEP_WORK_DIR" != true ]]; then rm -rf -- "$WORK_DIR"
+  if [[ "$AUTO_WORK" == true && "$KEEP_WORK_DIR" != true ]]; then
+    chmod -R u+w "$WORK_DIR" 2>/dev/null || true
+    rm -rf -- "$WORK_DIR" || log "could not completely remove work directory: $WORK_DIR"
   else log "kept work directory: $WORK_DIR"; fi
   if [[ "$status" -ne 0 && ! -f "$OUTPUT_DIR/summary.txt" ]]; then
     printf 'status=failed\nscript_version=%s\nprofile=%s\nmode=%s\nfinished_at=%s\n' \
@@ -229,6 +232,7 @@ done
 
 FORMAT=""; BUNDLE_SCRIPT_VERSION=""; PLATFORM=""; PROFILE=""; PACKAGED_MODE=""; DEFAULT_RUN=""
 K8S_VERSION=""; KIND_VERSION=""; HELM_VERSION=""; JQ_VERSION=""; KWOK_VERSION=""; GO_TOOLCHAIN=""
+GO_MODULES_INCLUDED=false
 VOLCANO_REPO=""; BUNDLED_VOLCANO_REF=""; BUNDLED_VOLCANO_COMMIT=""
 IMAGE_KEYS=(); IMAGE_PULL_REFS=(); IMAGE_SAVE_REFS=(); IMAGE_IDS=()
 TOOL_KEYS=(); TOOL_VERSIONS=(); TOOL_PATHS=(); TOOL_SHA256S=()
@@ -244,6 +248,7 @@ while IFS='=' read -r name value; do
     PROFILE) PROFILE="$value" ;;
     MODE) PACKAGED_MODE="$value" ;;
     DEFAULT_RUN) DEFAULT_RUN="$value" ;;
+    GO_MODULES_INCLUDED) GO_MODULES_INCLUDED="$value" ;;
     K8S_VERSION) K8S_VERSION="$value" ;;
     KIND_VERSION) KIND_VERSION="$value" ;;
     HELM_VERSION) HELM_VERSION="$value" ;;
@@ -285,7 +290,13 @@ valid_semver "$HELM_VERSION" || die "invalid Helm version metadata"
 valid_semver "$KWOK_VERSION" || die "invalid KWOK version metadata"
 [[ "$JQ_VERSION" =~ ^jq-[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid jq version metadata"
 [[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid Go version metadata"
+[[ "$GO_MODULES_INCLUDED" == true || "$GO_MODULES_INCLUDED" == false ]] || die "invalid Go module metadata"
+if [[ "$GO_MODULES_INCLUDED" == true ]]; then
+  [[ -f "$BUNDLE_ROOT/go-modules.tar.gz" ]] || die "bundle is missing go-modules.tar.gz"
+fi
 [[ "$BUNDLED_VOLCANO_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "invalid Candidate commit metadata"
+[[ "$K8S_VERSION" =~ ^v[0-9]+\.([0-9]+)\.[0-9]+$ ]] || die "invalid Kubernetes version metadata: $K8S_VERSION"
+K8S_MINOR="${BASH_REMATCH[1]}"
 [[ ${#IMAGE_KEYS[@]} -gt 0 ]] || die "bundle contains no images"
 [[ ${#TOOL_KEYS[@]} -eq 5 ]] || die "bundle must contain exactly five tools"
 
@@ -294,7 +305,8 @@ if [[ "$PACKAGED_MODE" != both && "$MODE" != "$PACKAGED_MODE" ]]; then die "requ
 [[ "$MODE" == benchmark || ${#E2E_CAPS[@]} -gt 0 ]] || die "bundle has no E2E capability"
 [[ "$MODE" == e2e || ${#BENCHMARK_CAP_SCENARIOS[@]} -gt 0 ]] || die "bundle has no Benchmark capability"
 
-printf 'profile=%s\nmode=%s\ndefault_run=%s\n' "$PROFILE" "$PACKAGED_MODE" "$DEFAULT_RUN"
+printf 'profile=%s\nmode=%s\ndefault_run=%s\ngo_modules_included=%s\n' \
+  "$PROFILE" "$PACKAGED_MODE" "$DEFAULT_RUN" "$GO_MODULES_INCLUDED"
 if [[ ${#E2E_CAPS[@]} -gt 0 ]]; then
   for value in "${E2E_CAPS[@]}"; do printf 'e2e=%s\n' "$value"; done
 fi
@@ -307,6 +319,7 @@ status=capabilities-listed
 script_version=$SCRIPT_VERSION
 profile=$PROFILE
 packaged_mode=$PACKAGED_MODE
+go_modules_included=$GO_MODULES_INCLUDED
 EOF
   log "capabilities verified; no Docker operation was performed"
   exit 0
@@ -318,6 +331,16 @@ docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
 TOOLS_DIR="$WORK_DIR/tools"; BIN_DIR="$TOOLS_DIR/bin"; RESOURCES_DIR="$WORK_DIR/resources"
 safe_extract "$BUNDLE_ROOT/tools.tar.gz" "$TOOLS_DIR"
 safe_extract "$BUNDLE_ROOT/resources.tar.gz" "$RESOURCES_DIR"
+VPG_GO_PROXY_DIR=""
+if [[ "$GO_MODULES_INCLUDED" == true ]]; then
+  VPG_GO_PROXY_DIR="$WORK_DIR/go-module-proxy"
+  safe_extract "$BUNDLE_ROOT/go-modules.tar.gz" "$VPG_GO_PROXY_DIR"
+  [[ -d "$VPG_GO_PROXY_DIR/github.com" || -d "$VPG_GO_PROXY_DIR/golang.org" || -d "$VPG_GO_PROXY_DIR/k8s.io" ]] || \
+    die "packaged Go module proxy is empty"
+  GOPROXY_VALUE="file://$VPG_GO_PROXY_DIR"; GOSUMDB_VALUE=off
+  log "using the packaged Candidate Go module proxy"
+fi
+export VPG_GO_PROXY_DIR
 for ((index=0; index<${#TOOL_KEYS[@]}; index++)); do
   key="${TOOL_KEYS[$index]}"; path="${TOOL_PATHS[$index]}"; expected="${TOOL_SHA256S[$index]}"
   [[ "$key" =~ ^[a-z0-9-]+$ ]] || die "invalid tool key: $key"
@@ -389,6 +412,9 @@ git -C "$CHECKOUT" fetch --depth 1 origin "$REQUESTED_VOLCANO_REF"
 git -C "$CHECKOUT" checkout --detach FETCH_HEAD
 CANDIDATE_COMMIT="$(git -C "$CHECKOUT" rev-parse HEAD)"
 [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "cannot resolve selected Candidate"
+if [[ "$GO_MODULES_INCLUDED" == true && "$CANDIDATE_COMMIT" != "$BUNDLED_VOLCANO_COMMIT" ]]; then
+  die "packaged Go modules belong to $BUNDLED_VOLCANO_COMMIT, not selected Candidate $CANDIDATE_COMMIT; repack for this Candidate"
+fi
 if [[ -f "$CHECKOUT/.gitmodules" ]]; then git -C "$CHECKOUT" submodule update --init --recursive --depth 1; fi
 git -C "$CHECKOUT" status --short > "$OUTPUT_DIR/candidate-status-before-environment-patch.txt"
 printf '%s\n' "$CANDIDATE_COMMIT" > "$OUTPUT_DIR/candidate-commit.txt"
@@ -419,6 +445,14 @@ if [[ "$MODE" != benchmark ]]; then
   fi
 else E2E_RUNS=(); fi
 
+if (( K8S_MINOR < 34 && ${#E2E_RUNS[@]} > 0 )); then
+  for value in "${E2E_RUNS[@]}"; do
+    case "$value" in
+      ALL|DRA) die "E2E $value requires Kubernetes v1.34+ because Candidate enables DRAConsumableCapacity" ;;
+    esac
+  done
+fi
+
 BENCHMARK_RUN_SCENARIOS=(); BENCHMARK_RUN_CONFIGS=()
 if [[ "$MODE" != e2e ]]; then
   if [[ "$BENCHMARK_SELECTION" == FULL ]]; then
@@ -439,7 +473,7 @@ else BENCHMARK_RUN_SCENARIOS=(); fi
 # Local image reuse requires the Docker buildx driver; docker-container cannot
 # see the imported bases without a registry.
 docker buildx inspect default >/dev/null 2>&1 || die "Docker default buildx builder is unavailable"
-driver="$(docker buildx inspect default | awk -F': ' '/^Driver:/ {print $2;exit}' | tr -d '[:space:]')"
+driver="$(docker buildx inspect default | awk -F': ' '/^Driver:/ && !found {print $2;found=1}' | tr -d '[:space:]')"
 [[ "$driver" == docker ]] || die "offline build requires the default Docker buildx driver, got ${driver:-unknown}"
 docker buildx use default; export BUILDX_BUILDER=default
 
@@ -455,18 +489,20 @@ DOCKERFILES=(scheduler controller-manager webhook-manager)
 if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]] && has_image_key prometheus; then DOCKERFILES+=(benchmark-audit-exporter); fi
 
 patch_candidate_build_network() {
-  local makefile="$CHECKOUT/Makefile" tmp="$WORK_DIR/patch.tmp" name rel path use_ca=false add_args
+  local makefile="$CHECKOUT/Makefile" tmp="$WORK_DIR/patch.tmp" name rel path use_ca=false use_modules=false add_args
   local -a patched=(Makefile)
   [[ -f "$makefile" ]] || die "Candidate Makefile is missing"
   [[ -z "$VPG_HOST_CA_BUNDLE" ]] || use_ca=true
-  awk -v use_ca="$use_ca" '
+  [[ -z "$VPG_GO_PROXY_DIR" ]] || use_modules=true
+  awk -v use_ca="$use_ca" -v use_modules="$use_modules" '
     BEGIN {inserted=0}
     {
       print
       if ($0 ~ /--platform[[:space:]]+/ && $0 ~ /DOCKER_PLATFORMS/) {
         print "\t\t\t--build-arg GOPROXY \\"
         print "\t\t\t--build-arg GOSUMDB \\"
-        if (use_ca=="true") print "\t\t\t--secret id=vpg_host_ca,src=${VPG_HOST_CA_BUNDLE} \\"
+        if (use_modules=="true") print "\t\t\t--build-context vpg4gomod=${VPG_GO_PROXY_DIR} \\"
+        else if (use_ca=="true") print "\t\t\t--secret id=vpg_host_ca,src=${VPG_HOST_CA_BUNDLE} \\"
         print "\t\t\t--build-arg HTTP_PROXY \\"
         print "\t\t\t--build-arg HTTPS_PROXY \\"
         print "\t\t\t--build-arg NO_PROXY \\"
@@ -489,10 +525,18 @@ patch_candidate_build_network() {
       grep -Eq '^[[:space:]]*ARG[[:space:]]+GOSUMDB([[:space:]=]|$)' "$path" || die "Candidate Dockerfile has incomplete Go proxy arguments: $rel"
       add_args=false
     fi
-    awk -v use_ca="$use_ca" -v add_args="$add_args" '
+    awk -v use_ca="$use_ca" -v use_modules="$use_modules" -v add_args="$add_args" '
       BEGIN {inserted=(add_args=="true" ? 0 : 1); replaced=0}
       {
         upper=toupper($0)
+        if (use_modules=="true" && $0 ~ /^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download/) {
+          command=$0
+          sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
+          print "RUN --mount=type=bind,from=vpg4gomod,target=/vpg4-goproxy,ro \\"
+          print "    GOPROXY=file:///vpg4-goproxy GOSUMDB=off " command
+          replaced++
+          next
+        }
         if (use_ca=="true" && $0 ~ /^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download/) {
           command=$0
           sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
@@ -508,7 +552,7 @@ patch_candidate_build_network() {
           inserted=1
         }
       }
-      END {if(inserted!=1) exit 45; if(use_ca=="true" && replaced<1) exit 46}
+      END {if(inserted!=1) exit 45; if((use_ca=="true" || use_modules=="true") && replaced<1) exit 46}
     ' "$path" > "$tmp" || die "cannot add Go proxy arguments to Candidate Dockerfile: $rel"
     mv "$tmp" "$path"
   done
@@ -533,6 +577,7 @@ BUILD_TARGETS=(vc-scheduler-image vc-controller-manager-image vc-webhook-manager
 log "building Candidate images at $CANDIDATE_COMMIT"
 (
   cd "$CHECKOUT"
+  if [[ "$GO_MODULES_INCLUDED" == true ]]; then export GOPROXY=off GOSUMDB=off; fi
   make "${BUILD_TARGETS[@]}" "TAG=$CANDIDATE_COMMIT" IMAGE_PREFIX=volcanosh FORCE_REBUILD=true \
     BUILDX_OUTPUT_TYPE=docker DOCKER_PLATFORMS=linux/amd64
 ) 2>&1 | tee "$OUTPUT_DIR/candidate-build.log"
@@ -542,7 +587,18 @@ for image in "${CANDIDATE_IMAGES[@]}"; do
   [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" == linux/amd64 ]] || die "Candidate image platform mismatch: $image"
 done
 
-cluster_name() { local purpose="$1" index="$2" name="${CLUSTER_PREFIX}-${CANDIDATE_COMMIT:0:8}-${purpose}-${index}"; name="${name:0:63}"; printf '%s\n' "${name%-}"; }
+cluster_name() {
+  local purpose="$1" index="$2" name suffix max_base
+  # Volcano uses the Helm release name in the admission certificate CN. Keep
+  # "<release>-admission-service.volcano-system.svc" within OpenSSL's 64-byte
+  # commonName limit while preserving the per-run index.
+  suffix="-$index"
+  max_base=$((27 - ${#suffix}))
+  name="${CLUSTER_PREFIX}-${CANDIDATE_COMMIT:0:8}-${purpose}-${index}"
+  name="${name%$suffix}"
+  name="${name:0:max_base}${suffix}"
+  printf '%s\n' "${name%-}"
+}
 cluster_exists() { kind get clusters 2>/dev/null | grep -Fxq "$1"; }
 delete_cluster() {
   local purpose="$1"
@@ -551,8 +607,13 @@ delete_cluster() {
   CLUSTER_CREATED=false; CURRENT_CLUSTER=""
 }
 load_image_list() {
-  local name="$1" file="$2" image
-  while IFS= read -r image; do [[ -z "$image" ]] || kind load docker-image "$image" --name "$name"; done < "$file"
+  local name="$1" file="$2" archive image
+  local -a images=()
+  archive="$WORK_DIR/kind-images-$name.tar"
+  while IFS= read -r image; do [[ -z "$image" ]] || images+=("$image"); done < "$file"
+  [[ ${#images[@]} -gt 0 ]] || die "runtime image list is empty: $file"
+  docker image save --platform=linux/amd64 -o "$archive" "${images[@]}"
+  kind load image-archive "$archive" --name "$name"
 }
 write_runtime_images() {
   local purpose="$1" output="$2" i key ref
@@ -578,8 +639,9 @@ write_runtime_images() {
 }
 
 patch_e2e_environment() {
-  local install="$CHECKOUT/hack/lib/install.sh" runner="$CHECKOUT/hack/run-e2e-kind.sh" tmp="$WORK_DIR/patch.tmp"
-  [[ -f "$install" && -f "$runner" ]] || die "Candidate E2E entrypoints are missing"
+  local install="$CHECKOUT/hack/lib/install.sh" runner="$CHECKOUT/hack/run-e2e-kind.sh"
+  local kind_config="$CHECKOUT/hack/e2e-kind-config.yaml" tmp="$WORK_DIR/patch.tmp"
+  [[ -f "$install" && -f "$runner" && -f "$kind_config" ]] || die "Candidate E2E entrypoints are missing"
   awk '
     BEGIN{inside=0; replaced=0}
     /^[[:space:]]*(function[[:space:]]+)?install-kwok-with-helm([[:space:]]*\(\))?[[:space:]]*\{/ {
@@ -603,10 +665,8 @@ patch_e2e_environment() {
       print
       if($0 ~ /^[[:space:]]*kind[[:space:]]+create[[:space:]]+cluster/) pending=1
       if(pending && $0 !~ /\\[[:space:]]*$/) {
-        print "  if [[ -n \"${VPG_RUNTIME_IMAGE_FILE:-}\" ]]; then"
-        print "    while IFS= read -r vpg_image; do"
-        print "      [[ -z \"${vpg_image}\" ]] || kind load docker-image \"${vpg_image}\" --name \"${CLUSTER_NAME}\""
-        print "    done < \"${VPG_RUNTIME_IMAGE_FILE}\""
+        print "  if [[ -n \"${VPG_RUNTIME_IMAGE_ARCHIVE:-}\" ]]; then"
+        print "    kind load image-archive \"${VPG_RUNTIME_IMAGE_ARCHIVE}\" --name \"${CLUSTER_NAME}\""
         print "  fi"
         pending=0; inserted++
       }
@@ -614,17 +674,30 @@ patch_e2e_environment() {
     END{if(inserted!=1) exit 43}
   ' "$install" > "$tmp" || die "cannot add offline image loading to Candidate Kind helper"
   mv "$tmp" "$install"
-  git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh > "$OUTPUT_DIR/candidate-environment.patch"
+  if (( K8S_MINOR < 34 )) && grep -q 'DRAConsumableCapacity' "$kind_config"; then
+    log "adapting the Candidate feature gates and API versions for Kubernetes v1.$K8S_MINOR"
+    sed -i \
+      -e '/^[[:space:]]*DRAConsumableCapacity:[[:space:]]*true[[:space:]]*$/d' \
+      -e 's/,DRAConsumableCapacity=true//g' \
+      -e 's|admissionregistration.k8s.io/v1beta1|admissionregistration.k8s.io/v1alpha1=true,resource.k8s.io/v1beta1=true|g' \
+      "$kind_config"
+  fi
+  git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml > "$OUTPUT_DIR/candidate-environment.patch"
   [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "Candidate environment patch is empty"
 }
 
 if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then patch_e2e_environment; fi
 
 run_e2e_one() {
-  local type="$1" number="$2" name runtime artifacts cleanup_value=1
+  local type="$1" number="$2" name runtime runtime_archive artifacts cleanup_value=1
+  local -a runtime_images=()
   name="$(cluster_name "e2e-${type,,}" "$number")"; runtime="$WORK_DIR/runtime-e2e-$number.txt"
+  runtime_archive="$WORK_DIR/runtime-e2e-$number.tar"
   artifacts="$OUTPUT_DIR/e2e-$number-$type"; mkdir -p "$artifacts"
   write_runtime_images "e2e-$type" "$runtime"
+  mapfile -t runtime_images < "$runtime"
+  [[ ${#runtime_images[@]} -gt 0 ]] || die "runtime image list is empty: $runtime"
+  docker image save --platform=linux/amd64 -o "$runtime_archive" "${runtime_images[@]}"
   cluster_exists "$name" && die "project cluster already exists: $name"
   CURRENT_CLUSTER="$name"; CLUSTER_CREATED=true
   [[ "$KEEP_CLUSTER" != true ]] || cleanup_value=0
@@ -634,7 +707,7 @@ run_e2e_one() {
     E2E_TYPE="$type" CLUSTER_NAME="$name" CLEANUP_CLUSTER="$cleanup_value" \
       KIND_OPT="--image $NODE_IMAGE --config $CHECKOUT/hack/e2e-kind-config.yaml" \
       IMAGE_PREFIX=volcanosh TAG="$CANDIDATE_COMMIT" OS=linux ARTIFACTS_PATH="$artifacts" \
-      VPG_RUNTIME_IMAGE_FILE="$runtime" VPG_KWOK_MANIFEST="$(resource_for_key kwok-manifest)" \
+      VPG_RUNTIME_IMAGE_ARCHIVE="$runtime_archive" VPG_KWOK_MANIFEST="$(resource_for_key kwok-manifest)" \
       VPG_KWOK_STAGE="$(resource_for_key kwok-stage)" bash hack/run-e2e-kind.sh
   ) 2>&1 | tee "$artifacts/run.log"
   if [[ "$KEEP_CLUSTER" != true ]]; then
@@ -644,7 +717,9 @@ run_e2e_one() {
 }
 
 create_benchmark_cluster() {
-  local name="$1" number="$2" config="$WORK_DIR/kind-benchmark-$number.yaml" runtime="$WORK_DIR/runtime-benchmark-$number.txt"
+  local name="$1" number="$2" config runtime
+  config="$WORK_DIR/kind-benchmark-$number.yaml"
+  runtime="$WORK_DIR/runtime-benchmark-$number.txt"
   [[ -f "$CHECKOUT/benchmark/config/kind-config.yaml" ]] || die "Candidate Benchmark Kind config is missing"
   sed "s|__VOLCANO_ROOT__|$CHECKOUT|g" "$CHECKOUT/benchmark/config/kind-config.yaml" > "$config"
   cluster_exists "$name" && die "project cluster already exists: $name"
@@ -754,6 +829,7 @@ candidate_commit=$CANDIDATE_COMMIT
 e2e_selection=$E2E_SELECTION
 benchmark_selection=$BENCHMARK_SELECTION
 benchmark_rounds=$BENCHMARK_ROUNDS
+go_modules_included=$GO_MODULES_INCLUDED
 finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 log "completed successfully; results: $OUTPUT_DIR"
