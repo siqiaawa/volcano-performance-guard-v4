@@ -35,6 +35,7 @@ Candidate selection:
   --volcano-ref REF           Override the branch/tag/commit recorded in bundle
   --goproxy VALUE             Inner-server Go module proxy
   --gosumdb VALUE             Inner-server Go checksum database
+  --ca-bundle PATH            Host CA bundle for Candidate builds; auto-detected
 
 Run selection (must be covered by the bundle profile):
   --mode e2e|benchmark|both
@@ -61,6 +62,7 @@ MODE_OVERRIDE=""; E2E_TYPE_OVERRIDE=""; BENCHMARK_SCENARIO_OVERRIDE=""
 BENCHMARK_CONFIG_OVERRIDE=""; BENCHMARK_ROUNDS=1; PODS=1000
 SCHEDULER_NAME="agent-scheduler"; CLUSTER_PREFIX="volcano-v4"
 VOLCANO_REPO_OVERRIDE=""; VOLCANO_REF_OVERRIDE=""
+CA_BUNDLE_OVERRIDE=""
 GOPROXY_VALUE="${GOPROXY:-$DEFAULT_GOPROXY}"
 GOSUMDB_VALUE="${GOSUMDB:-$DEFAULT_GOSUMDB}"
 
@@ -84,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --cluster-prefix) CLUSTER_PREFIX="${2:-}"; shift 2 ;;
     --goproxy) GOPROXY_VALUE="${2:-}"; shift 2 ;;
     --gosumdb) GOSUMDB_VALUE="${2:-}"; shift 2 ;;
+    --ca-bundle) CA_BUNDLE_OVERRIDE="${2:-}"; shift 2 ;;
     --list-capabilities) LIST_CAPABILITIES=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (use --help)" ;;
@@ -101,6 +104,22 @@ valid_text "$GOSUMDB_VALUE" || die "invalid --gosumdb"
 
 for command in curl git tar gzip sha256sum awk sed grep sort mktemp; do need "$command"; done
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die "deployment requires Linux x86_64"
+
+VPG_HOST_CA_BUNDLE=""
+if [[ -n "$CA_BUNDLE_OVERRIDE" ]]; then
+  [[ "$CA_BUNDLE_OVERRIDE" == /* && -r "$CA_BUNDLE_OVERRIDE" && ! "$CA_BUNDLE_OVERRIDE" =~ [[:space:]] ]] || \
+    die "--ca-bundle must be a readable absolute path without whitespace"
+  VPG_HOST_CA_BUNDLE="$CA_BUNDLE_OVERRIDE"
+else
+  for path in /etc/pki/tls/certs/ca-bundle.crt \
+              /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+              /etc/ssl/certs/ca-certificates.crt; do
+    if [[ -r "$path" ]]; then VPG_HOST_CA_BUNDLE="$path"; break; fi
+  done
+fi
+export VPG_HOST_CA_BUNDLE
+if [[ -n "$VPG_HOST_CA_BUNDLE" ]]; then log "using host CA bundle for Candidate builds: $VPG_HOST_CA_BUNDLE"
+else log "host CA bundle was not found; Candidate builds will use the base image trust store"; fi
 
 if [[ -z "$OUTPUT_DIR" ]]; then OUTPUT_DIR="./volcano-v4-results-$(date -u +%Y%m%d-%H%M%S)"; fi
 [[ ! -e "$OUTPUT_DIR" ]] || die "output already exists: $OUTPUT_DIR"
@@ -404,16 +423,18 @@ DOCKERFILES=(scheduler controller-manager webhook-manager)
 if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]] && has_image_key prometheus; then DOCKERFILES+=(benchmark-audit-exporter); fi
 
 patch_candidate_build_network() {
-  local makefile="$CHECKOUT/Makefile" tmp="$WORK_DIR/patch.tmp" name rel path
+  local makefile="$CHECKOUT/Makefile" tmp="$WORK_DIR/patch.tmp" name rel path use_ca=false add_args
   local -a patched=(Makefile)
   [[ -f "$makefile" ]] || die "Candidate Makefile is missing"
-  awk '
+  [[ -z "$VPG_HOST_CA_BUNDLE" ]] || use_ca=true
+  awk -v use_ca="$use_ca" '
     BEGIN {inserted=0}
     {
       print
       if ($0 ~ /--platform[[:space:]]+/ && $0 ~ /DOCKER_PLATFORMS/) {
         print "\t\t\t--build-arg GOPROXY \\"
         print "\t\t\t--build-arg GOSUMDB \\"
+        if (use_ca=="true") print "\t\t\t--secret id=vpg_host_ca,src=${VPG_HOST_CA_BUNDLE} \\"
         print "\t\t\t--build-arg HTTP_PROXY \\"
         print "\t\t\t--build-arg HTTPS_PROXY \\"
         print "\t\t\t--build-arg NO_PROXY \\"
@@ -429,23 +450,33 @@ patch_candidate_build_network() {
     if [[ "$name" == benchmark-audit-exporter ]]; then rel="benchmark/manifests/audit-exporter/Dockerfile"
     else rel="installer/dockerfile/$name/Dockerfile"; fi
     path="$CHECKOUT/$rel"; patched+=("$rel")
+    [[ -f "$path" ]] || die "Candidate Dockerfile missing: $path"
     grep -Eq '^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download' "$path" || continue
+    add_args=true
     if grep -Eq '^[[:space:]]*ARG[[:space:]]+GOPROXY([[:space:]=]|$)' "$path"; then
       grep -Eq '^[[:space:]]*ARG[[:space:]]+GOSUMDB([[:space:]=]|$)' "$path" || die "Candidate Dockerfile has incomplete Go proxy arguments: $rel"
-      continue
+      add_args=false
     fi
-    awk '
-      BEGIN {inserted=0}
+    awk -v use_ca="$use_ca" -v add_args="$add_args" '
+      BEGIN {inserted=(add_args=="true" ? 0 : 1); replaced=0}
       {
-        print
         upper=toupper($0)
-        if (!inserted && upper ~ /^[[:space:]]*FROM[[:space:]].*[[:space:]]AS[[:space:]]+BUILDER([[:space:]]|$)/) {
+        if (use_ca=="true" && $0 ~ /^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download/) {
+          command=$0
+          sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
+          print "RUN --mount=type=secret,id=vpg_host_ca,required=true \\"
+          print "    SSL_CERT_FILE=/run/secrets/vpg_host_ca " command
+          replaced++
+          next
+        }
+        print
+        if (add_args=="true" && !inserted && upper ~ /^[[:space:]]*FROM[[:space:]].*[[:space:]]AS[[:space:]]+BUILDER([[:space:]]|$)/) {
           print "ARG GOPROXY"
           print "ARG GOSUMDB"
           inserted=1
         }
       }
-      END {if(inserted!=1) exit 45}
+      END {if(inserted!=1) exit 45; if(use_ca=="true" && replaced<1) exit 46}
     ' "$path" > "$tmp" || die "cannot add Go proxy arguments to Candidate Dockerfile: $rel"
     mv "$tmp" "$path"
   done
