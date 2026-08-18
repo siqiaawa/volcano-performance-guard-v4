@@ -38,7 +38,7 @@ bash volcano-v4-deploy.sh --bundle ./release-assets/volcano-v4-1.32.5-*-e2e-basi
 
 依赖包与部署脚本独立维护。镜像、工具或 Profile 依赖没有变化时，只需要更新几十 KB 的 `volcano-v4-deploy.sh`，不需要重新制作、下载或传输大包。早期依赖包中可能带有生成时的脚本快照；显式执行外部最新脚本并通过 `--bundle` 指向该包时，使用的是外部脚本，包内快照不会被执行。
 
-正常情况下不需要手工填写 `HTTP_PROXY`、`HTTPS_PROXY`、`GOPROXY`、`GOSUMDB` 或 CA 路径。部署脚本会把宿主机的 Go Module 配置和已有的 HTTP 代理环境传入 Candidate 的 BuildKit 构建，并使用宿主网络完成 `go mod download`。对于使用内部 CA 的 HTTPS Go Proxy，脚本会自动从 CentOS/Debian 常见系统路径找到宿主 CA bundle，通过 BuildKit secret 临时挂载给下载步骤；CA 不会进入 Candidate 最终镜像。只有自动检测不到单位 CA bundle 时才指定例如 `--ca-bundle /etc/pki/tls/certs/ca-bundle.crt`。
+正常情况下不需要手工填写 `HTTP_PROXY`、`HTTPS_PROXY`、`GOPROXY`、`GOSUMDB` 或 CA 路径。部署脚本会优先使用已有的 HTTP 代理环境；如果环境变量未设置，则自动读取对 `https://github.com/` 生效的 Git `http.proxy`，并把代理传入 Candidate 的 BuildKit 构建。这样 Go Module 渠道回退到 `direct` 时，容器内的 Git 仍通过与宿主 `git clone` 相同的代理访问 GitHub。脚本同时使用宿主网络完成 `go mod download`。对于使用内部 CA 的 HTTPS Go Proxy，脚本会自动从 CentOS/Debian 常见系统路径找到宿主 CA bundle，通过 BuildKit secret 临时挂载给下载步骤；代理参数和 CA 都不会进入 Candidate 最终镜像。只有自动检测不到单位 CA bundle 时才指定例如 `--ca-bundle /etc/pki/tls/certs/ca-bundle.crt`。
 
 ```bash
 --goproxy https://单位提供的Go代理,direct --gosumdb sum.golang.org

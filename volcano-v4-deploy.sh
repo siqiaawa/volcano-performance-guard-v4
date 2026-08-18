@@ -105,6 +105,35 @@ valid_text "$GOSUMDB_VALUE" || die "invalid --gosumdb"
 for command in curl git tar gzip sha256sum awk sed grep sort mktemp; do need "$command"; done
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die "deployment requires Linux x86_64"
 
+configure_build_proxy() {
+  local git_proxy="" source="none"
+  VPG_HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-}}"
+  VPG_HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-}}"
+  VPG_NO_PROXY="${NO_PROXY:-${no_proxy:-}}"
+  if [[ -n "$VPG_HTTP_PROXY" || -n "$VPG_HTTPS_PROXY" ]]; then
+    source="environment"
+  else
+    git_proxy="$(git config --get-urlmatch http.proxy https://github.com/ 2>/dev/null || true)"
+    [[ -n "$git_proxy" ]] || git_proxy="$(git config --global --get http.proxy 2>/dev/null || true)"
+    if [[ -n "$git_proxy" ]]; then
+      valid_text "$git_proxy" && [[ ! "$git_proxy" =~ [[:space:]] ]] || die "invalid Git HTTP proxy configuration"
+      VPG_HTTP_PROXY="$git_proxy"; VPG_HTTPS_PROXY="$git_proxy"; source="git-config"
+    fi
+  fi
+  [[ -n "$VPG_HTTP_PROXY" ]] || VPG_HTTP_PROXY="$VPG_HTTPS_PROXY"
+  [[ -n "$VPG_HTTPS_PROXY" ]] || VPG_HTTPS_PROXY="$VPG_HTTP_PROXY"
+  export HTTP_PROXY="$VPG_HTTP_PROXY" HTTPS_PROXY="$VPG_HTTPS_PROXY" NO_PROXY="$VPG_NO_PROXY"
+  export VPG_BUILD_PROXY_SOURCE="$source"
+  if [[ "$source" == git-config ]]; then
+    log "forwarding the Git-configured GitHub proxy into Candidate builds"
+  elif [[ "$source" == environment ]]; then
+    log "forwarding the HTTP proxy environment into Candidate builds"
+  else
+    log "no host HTTP or Git proxy was detected for Candidate builds"
+  fi
+}
+configure_build_proxy
+
 VPG_HOST_CA_BUNDLE=""
 if [[ -n "$CA_BUNDLE_OVERRIDE" ]]; then
   [[ "$CA_BUNDLE_OVERRIDE" == /* && -r "$CA_BUNDLE_OVERRIDE" && ! "$CA_BUNDLE_OVERRIDE" =~ [[:space:]] ]] || \
@@ -125,6 +154,9 @@ if [[ -z "$OUTPUT_DIR" ]]; then OUTPUT_DIR="./volcano-v4-results-$(date -u +%Y%m
 [[ ! -e "$OUTPUT_DIR" ]] || die "output already exists: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
+printf 'source=%s\nhttp_configured=%s\nhttps_configured=%s\n' \
+  "$VPG_BUILD_PROXY_SOURCE" "$([[ -n "$HTTP_PROXY" ]] && printf true || printf false)" \
+  "$([[ -n "$HTTPS_PROXY" ]] && printf true || printf false)" > "$OUTPUT_DIR/build-proxy.txt"
 
 AUTO_WORK=false
 if [[ -z "$WORK_DIR" ]]; then
