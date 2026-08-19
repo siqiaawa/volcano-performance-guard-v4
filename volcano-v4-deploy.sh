@@ -349,9 +349,48 @@ go version | tee "$OUTPUT_DIR/go-version.log"
 go version | grep -F " $GO_TOOLCHAIN " >/dev/null || die "Go version mismatch"
 go env GOPROXY GONOSUMDB GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
 
-# Docker 29 may report the OCI descriptor ID while older stores report the
-# docker-save config ID. Both are accepted only after images.tar.gz is hashed.
+# Classic Docker stores report the image config digest as .Id. Docker 29 with
+# the containerd image store can instead report a host-local OCI descriptor
+# digest, which is not stable across save/load or hosts. The bundle hash and
+# config digest remain stable, so normalize only mismatched IDs by streaming
+# the loaded tags through docker save and comparing their config digests.
 IMAGE_ARCHIVE_MANIFEST="$WORK_DIR/image-manifest.json"
+LOADED_IMAGE_MANIFEST="$WORK_DIR/loaded-image-manifest.json"
+LOADED_IMAGE_MANIFEST_READY=false
+
+image_config_id_from_manifest() {
+  local manifest="$1" ref="$2" config_path config_hash
+  config_path="$(jq -er --arg ref "$ref" '[.[]|select((.RepoTags//[])|index($ref))|.Config]|unique|if length==1 then .[0] else error("missing") end' "$manifest")" || return 1
+  config_hash="${config_path##*/}"
+  config_hash="${config_hash%.json}"
+  [[ "$config_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf 'sha256:%s\n' "$config_hash"
+}
+
+write_loaded_image_manifest() {
+  local ref existing duplicate
+  local -a refs=()
+  [[ "$LOADED_IMAGE_MANIFEST_READY" != true ]] || return 0
+  for ref in "${IMAGE_SAVE_REFS[@]}"; do
+    duplicate=false
+    if [[ ${#refs[@]} -gt 0 ]]; then
+      for existing in "${refs[@]}"; do
+        if [[ "$existing" == "$ref" ]]; then duplicate=true; break; fi
+      done
+    fi
+    [[ "$duplicate" == true ]] || refs+=("$ref")
+  done
+  [[ ${#refs[@]} -gt 0 ]] || die "cannot normalize an empty loaded image list"
+  log "normalizing Docker containerd image identities through config digests"
+  if docker image save --help 2>&1 | grep -q -- '--platform'; then
+    docker image save --platform=linux/amd64 "${refs[@]}" | tar -xOf - manifest.json > "$LOADED_IMAGE_MANIFEST"
+  else
+    docker image save "${refs[@]}" | tar -xOf - manifest.json > "$LOADED_IMAGE_MANIFEST"
+  fi
+  jq -e 'type=="array" and length>0' "$LOADED_IMAGE_MANIFEST" >/dev/null || die "invalid loaded image manifest"
+  LOADED_IMAGE_MANIFEST_READY=true
+}
+
 gzip -dc "$BUNDLE_ROOT/images.tar.gz" | tar -xOf - manifest.json > "$IMAGE_ARCHIVE_MANIFEST"
 jq -e 'type=="array" and length>0' "$IMAGE_ARCHIVE_MANIFEST" >/dev/null || die "invalid image archive manifest"
 gzip -dc "$BUNDLE_ROOT/images.tar.gz" | docker image load | tee "$OUTPUT_DIR/docker-load.log"
@@ -359,13 +398,15 @@ NODE_IMAGE=""
 for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
   key="${IMAGE_KEYS[$index]}"; save_ref="${IMAGE_SAVE_REFS[$index]}"; expected_id="${IMAGE_IDS[$index]}"
   [[ "$key" =~ ^[a-z0-9][a-z0-9-]*$ && "$expected_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid image metadata"
-  config_path="$(jq -er --arg ref "$save_ref" '[.[]|select((.RepoTags//[])|index($ref))|.Config]|unique|if length==1 then .[0] else error("missing") end' "$IMAGE_ARCHIVE_MANIFEST")" || die "archive image identity missing: $save_ref"
-  config_hash="${config_path##*/}"; config_hash="${config_hash%.json}"; config_id="sha256:$config_hash"
-  [[ "$config_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid archive image identity: $save_ref"
+  config_id="$(image_config_id_from_manifest "$IMAGE_ARCHIVE_MANIFEST" "$save_ref")" || die "archive image identity missing: $save_ref"
   observed="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "$save_ref")"
   [[ "${observed%%|*}" == linux/amd64 ]] || die "image platform mismatch: $save_ref"
   observed_id="${observed#*|}"
-  [[ "$observed_id" == "$expected_id" || "$observed_id" == "$config_id" ]] || die "loaded image ID mismatch: $save_ref"
+  if [[ "$observed_id" != "$expected_id" && "$observed_id" != "$config_id" ]]; then
+    write_loaded_image_manifest
+    loaded_config_id="$(image_config_id_from_manifest "$LOADED_IMAGE_MANIFEST" "$save_ref")" || die "loaded image identity missing: $save_ref"
+    [[ "$loaded_config_id" == "$config_id" ]] || die "loaded image config mismatch: $save_ref"
+  fi
   [[ "$key" != kind-node ]] || NODE_IMAGE="$save_ref"
 done
 [[ -n "$NODE_IMAGE" ]] || die "bundle does not contain kind-node"
