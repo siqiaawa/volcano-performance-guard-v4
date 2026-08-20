@@ -31,6 +31,9 @@ PROFILE|full|both|FULL|e2e-common,e2e-jobseq,e2e-dra,benchmark-common,benchmark-
 # IMAGE|GROUP|KEY|PULL_REFERENCE|LOCAL_REFERENCE
 # Generic Candidate build bases. These are selected for every profile and are
 # maintained here instead of being discovered from one Volcano checkout.
+# The three Go builders cover the maintained stable Volcano v1.12-v1.15 lines.
+IMAGE|candidate-build|candidate-builder-go1-23|golang:1.23.7|golang:1.23.7
+IMAGE|candidate-build|candidate-builder-go1-24|golang:1.24.0|golang:1.24.0
 IMAGE|candidate-build|candidate-builder|golang:1.25.0|golang:1.25.0
 IMAGE|candidate-build|candidate-runtime|alpine:latest|alpine:latest
 IMAGE|e2e-common|busybox-default|busybox:1.36|busybox:latest
@@ -38,12 +41,24 @@ IMAGE|e2e-common|busybox-default|busybox:1.36|busybox:latest
 IMAGE|e2e-common|busybox-1-24|busybox:1.36|busybox:1.24
 IMAGE|e2e-common|nginx-default|nginx:1.29.3-alpine|nginx:1.29.3-alpine
 IMAGE|e2e-common|nginx-latest|nginx:1.29.3-alpine|nginx:latest
+# Transitive runtime images used by the imported Kubernetes E2E framework.
+# v1.32-v1.33 use 2.53/1.36.1-1, v1.34 uses 2.56/1.37.0-1, and v1.35
+# uses 2.59/1.37.0-1. Keep exact tags because the Candidate selects them.
+IMAGE|e2e-common|k8s-e2e-agnhost-2-53|registry.k8s.io/e2e-test-images/agnhost:2.53|registry.k8s.io/e2e-test-images/agnhost:2.53
+IMAGE|e2e-common|k8s-e2e-agnhost-2-56|registry.k8s.io/e2e-test-images/agnhost:2.56|registry.k8s.io/e2e-test-images/agnhost:2.56
+IMAGE|e2e-common|k8s-e2e-agnhost-2-59|registry.k8s.io/e2e-test-images/agnhost:2.59|registry.k8s.io/e2e-test-images/agnhost:2.59
+IMAGE|e2e-common|k8s-e2e-busybox-1-36|registry.k8s.io/e2e-test-images/busybox:1.36.1-1|registry.k8s.io/e2e-test-images/busybox:1.36.1-1
+IMAGE|e2e-common|k8s-e2e-busybox-1-37|registry.k8s.io/e2e-test-images/busybox:1.37.0-1|registry.k8s.io/e2e-test-images/busybox:1.37.0-1
 IMAGE|e2e-common|k8s-e2e-nginx|registry.k8s.io/e2e-test-images/nginx:1.14-4|registry.k8s.io/e2e-test-images/nginx:1.14-4
 IMAGE|e2e-common|kwok|registry.k8s.io/kwok/kwok:v0.7.0|registry.k8s.io/kwok/kwok:v0.7.0
 IMAGE|e2e-jobseq|mpi|volcanosh/example-mpi:0.0.3|volcanosh/example-mpi:0.0.3
 IMAGE|e2e-jobseq|tensorflow|volcanosh/dist-mnist-tf-example:0.0.1|volcanosh/dist-mnist-tf-example:0.0.1
 IMAGE|e2e-jobseq|pytorch|volcanosh/pytorch-mnist-v1beta1-9ee8fda-example:0.0.1|volcanosh/pytorch-mnist-v1beta1-9ee8fda-example:0.0.1
+# Volcano v1.13.0 used a Bitnami tag which is no longer published. v1.13.1
+# switched to the equivalent upstream Ray image; retain the old local name.
+IMAGE|e2e-jobseq|ray-bitnami|rayproject/ray:2.49.0|bitnami/ray:2.49.0
 IMAGE|e2e-jobseq|ray|rayproject/ray:2.49.0|rayproject/ray:2.49.0
+IMAGE|e2e-dra|dra-hostpath-1-7|registry.k8s.io/sig-storage/hostpathplugin:v1.7.3|registry.k8s.io/sig-storage/hostpathplugin:v1.7.3
 IMAGE|e2e-dra|dra-hostpath|registry.k8s.io/sig-storage/hostpathplugin:v1.16.1|registry.k8s.io/sig-storage/hostpathplugin:v1.16.1
 IMAGE|benchmark-common|benchmark-busybox|busybox:1.36|busybox:1.36
 IMAGE|benchmark-common|kwok|registry.k8s.io/kwok/kwok:v0.7.0|registry.k8s.io/kwok/kwok:v0.7.0

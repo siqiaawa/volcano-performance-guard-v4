@@ -16,6 +16,18 @@ valid_semver() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 valid_mode() { [[ "$1" == e2e || "$1" == benchmark || "$1" == both ]]; }
 valid_text() { [[ -n "$1" && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *'|'* ]]; }
 
+go_version_at_least() {
+  local have="${1#go}" need="${2#go}"
+  local have_major have_minor have_patch need_major need_minor need_patch
+  [[ "$have" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))?$ ]] || return 1
+  have_major="${BASH_REMATCH[1]}"; have_minor="${BASH_REMATCH[2]}"; have_patch="${BASH_REMATCH[4]:-0}"
+  [[ "$need" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))?$ ]] || return 1
+  need_major="${BASH_REMATCH[1]}"; need_minor="${BASH_REMATCH[2]}"; need_patch="${BASH_REMATCH[4]:-0}"
+  (( have_major > need_major )) ||
+    (( have_major == need_major && have_minor > need_minor )) ||
+    (( have_major == need_major && have_minor == need_minor && have_patch >= need_patch ))
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -434,7 +446,11 @@ printf '%s\n' "$CANDIDATE_COMMIT" > "$OUTPUT_DIR/candidate-commit.txt"
 
 CANDIDATE_GO="$(awk '$1=="toolchain"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
 [[ -n "$CANDIDATE_GO" ]] || CANDIDATE_GO="go$(awk '$1=="go"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
-[[ "$CANDIDATE_GO" == "$GO_TOOLCHAIN" ]] || die "Candidate needs $CANDIDATE_GO but generic bundle contains $GO_TOOLCHAIN; create a new generic bundle with --go-version $CANDIDATE_GO"
+go_version_at_least "$GO_TOOLCHAIN" "$CANDIDATE_GO" || \
+  die "Candidate needs $CANDIDATE_GO but generic bundle contains older $GO_TOOLCHAIN; create a new generic bundle with --go-version $CANDIDATE_GO"
+if [[ "$CANDIDATE_GO" != "$GO_TOOLCHAIN" ]]; then
+  log "using backward-compatible bundled $GO_TOOLCHAIN for Candidate minimum $CANDIDATE_GO"
+fi
 
 # Resolve the complete Candidate module graph on the inner host, where the
 # approved corporate proxy and CA trust have already been verified. The
@@ -502,6 +518,46 @@ if [[ "$MODE" != e2e ]]; then
   fi
 else BENCHMARK_RUN_SCENARIOS=(); fi
 [[ "$KEEP_CLUSTER" != true || $(( ${#E2E_RUNS[@]} + ${#BENCHMARK_RUN_SCENARIOS[@]} )) -eq 1 ]] || die "--keep-cluster requires exactly one run"
+
+# Volcano imports parts of the Kubernetes E2E framework. Some runtime images
+# are therefore selected by k8s.io/kubernetes rather than by Volcano source
+# literals. Resolve those exact references from the already-downloaded module
+# and fail before Kind creation if the generic bundle is incomplete.
+if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
+  CANDIDATE_K8S_MODULE="$(awk '$1=="k8s.io/kubernetes" {print $2;exit}' "$CHECKOUT/go.mod")"
+  [[ "$CANDIDATE_K8S_MODULE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "cannot resolve Candidate k8s.io/kubernetes version"
+  K8S_E2E_MODULE_DIR="$GOMODCACHE/k8s.io/kubernetes@$CANDIDATE_K8S_MODULE"
+  K8S_IMAGE_MANIFEST="$K8S_E2E_MODULE_DIR/test/utils/image/manifest.go"
+  [[ -f "$K8S_IMAGE_MANIFEST" ]] || die "downloaded Kubernetes E2E image manifest is missing: $K8S_IMAGE_MANIFEST"
+  K8S_E2E_REGISTRY="$(awk -F'"' '/PromoterE2eRegistry:[[:space:]]*"/ {print $2;exit}' "$K8S_IMAGE_MANIFEST")"
+  K8S_AGNHOST_VERSION="$(awk -F'"' '/configs\[Agnhost\][[:space:]]*=/ {print $4;exit}' "$K8S_IMAGE_MANIFEST")"
+  K8S_BUSYBOX_VERSION="$(awk -F'"' '/configs\[BusyBox\][[:space:]]*=/ {print $4;exit}' "$K8S_IMAGE_MANIFEST")"
+  K8S_NGINX_VERSION="$(awk -F'"' '/configs\[Nginx\][[:space:]]*=/ {print $4;exit}' "$K8S_IMAGE_MANIFEST")"
+  [[ -n "$K8S_E2E_REGISTRY" && -n "$K8S_AGNHOST_VERSION" && -n "$K8S_BUSYBOX_VERSION" && -n "$K8S_NGINX_VERSION" ]] || \
+    die "cannot resolve Kubernetes E2E runtime images from $K8S_IMAGE_MANIFEST"
+  REQUIRED_CANDIDATE_E2E_IMAGES=(
+    "$K8S_E2E_REGISTRY/agnhost:$K8S_AGNHOST_VERSION"
+    "$K8S_E2E_REGISTRY/busybox:$K8S_BUSYBOX_VERSION"
+    "$K8S_E2E_REGISTRY/nginx:$K8S_NGINX_VERSION"
+  )
+  NEED_DRA_IMAGE=false
+  for value in "${E2E_RUNS[@]}"; do
+    [[ "$value" != ALL && "$value" != DRA ]] || NEED_DRA_IMAGE=true
+  done
+  if [[ "$NEED_DRA_IMAGE" == true ]]; then
+    K8S_DRA_MANIFEST="$K8S_E2E_MODULE_DIR/test/e2e/testing-manifests/dra/dra-test-driver-proxy.yaml"
+    [[ -f "$K8S_DRA_MANIFEST" ]] || die "Candidate DRA runtime manifest is missing: $K8S_DRA_MANIFEST"
+    mapfile -t K8S_DRA_IMAGES < <(awk '$1=="image:" && $2 ~ /hostpathplugin:/ {print $2}' "$K8S_DRA_MANIFEST" | sort -u)
+    [[ ${#K8S_DRA_IMAGES[@]} -gt 0 ]] || die "cannot resolve Candidate DRA runtime image"
+    REQUIRED_CANDIDATE_E2E_IMAGES+=("${K8S_DRA_IMAGES[@]}")
+  fi
+  printf '%s\n' "${REQUIRED_CANDIDATE_E2E_IMAGES[@]}" > "$OUTPUT_DIR/candidate-e2e-images.txt"
+  for value in "${REQUIRED_CANDIDATE_E2E_IMAGES[@]}"; do
+    bundle_has_image_ref "$value" || die "Candidate E2E runtime image is not bundled: $value; update config/profiles.tsv or package with --add-image $value"
+    docker image inspect "${value%@*}" >/dev/null 2>&1 || die "Candidate E2E runtime image was not loaded: $value"
+  done
+  log "verified Candidate-selected Kubernetes E2E runtime images"
+fi
 
 # Local image reuse requires the Docker buildx driver; docker-container cannot
 # see the imported bases without a registry.
@@ -722,11 +778,11 @@ write_runtime_images() {
     case "$key" in
       kind-node|candidate-*) ;;
       extra-*) printf '%s\n' "$ref" >> "$output" ;;
-      busybox-default|busybox-1-24|nginx-default|nginx-latest|k8s-e2e-nginx|kwok)
+      busybox-*|nginx-*|k8s-e2e-*|kwok)
         [[ "$purpose" == e2e* ]] && printf '%s\n' "$ref" >> "$output" ;;
-      mpi|tensorflow|pytorch|ray)
+      mpi|tensorflow|pytorch|ray*)
         [[ "$purpose" == e2e-ALL || "$purpose" == e2e-JOBSEQ ]] && printf '%s\n' "$ref" >> "$output" ;;
-      dra-hostpath)
+      dra-hostpath*)
         [[ "$purpose" == e2e-ALL || "$purpose" == e2e-DRA ]] && printf '%s\n' "$ref" >> "$output" ;;
       benchmark-busybox)
         [[ "$purpose" == benchmark* ]] && printf '%s\n' "$ref" >> "$output" ;;

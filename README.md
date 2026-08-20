@@ -35,7 +35,7 @@ release-assets/volcano-v4-1.32.5-e2e-basic.tar.gz
 release-assets/volcano-v4-1.32.5-e2e-basic.tar.gz.sha256
 ```
 
-命令中没有 `--volcano-ref`。这个包可以先测试 `v1.15.0`，以后再测试其他 tag、branch 或 commit。
+命令中没有 `--volcano-ref`。默认镜像清单覆盖已审计的稳定发布线 `v1.12.x` 到 `v1.15.x`；以后测试其他 tag、branch 或 commit 时，部署脚本还会在创建 Kind 前核对 Candidate 实际选择的 Kubernetes E2E 镜像。
 
 ### 2. 把包和部署脚本传入内网
 
@@ -227,7 +227,7 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 | Go toolchain | `go1.25.0` |
 | Ginkgo | 不打包；内网按 Candidate `go.mod` 安装 |
 
-如 Candidate 将 Go toolchain 改为其他准确版本，重新制作通用包时使用：
+包内 `go1.25.0` 可以运行最低 Go 版本不高于它的 Candidate，并保留 Candidate Dockerfile 自己选择的准确 Go builder。若 Candidate 将最低 Go toolchain 提高到更新版本，重新制作通用包时使用：
 
 ```bash
 --go-version goX.Y.Z \
@@ -235,7 +235,7 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 --add-image golang:X.Y.Z
 ```
 
-Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像是两个独立依赖；如果 Candidate 同时改变了两者，需要像上面一样都加入新通用包。默认 `go1.25.0` 与 `golang:1.25.0` 分别维护在 `versions.tsv` 和 `profiles.tsv`。
+Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像是两个独立依赖。默认宿主工具链是 `go1.25.0`；构建基础镜像同时维护 `golang:1.23.7`、`golang:1.24.0` 和 `golang:1.25.0`，对应稳定 Volcano `v1.12.x` 到 `v1.15.x`。未来 Candidate 使用其他 builder 时仍需更新 `profiles.tsv` 或使用 `--add-image`。
 
 ## 默认基础镜像和运行镜像
 
@@ -243,6 +243,8 @@ Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像是两�
 
 | Key | 镜像 |
 | --- | --- |
+| `candidate-builder-go1-23` | `golang:1.23.7` |
+| `candidate-builder-go1-24` | `golang:1.24.0` |
 | `candidate-builder` | `golang:1.25.0` |
 | `candidate-runtime` | `alpine:latest` |
 
@@ -254,12 +256,19 @@ Profile 按需选择的默认镜像：
 | E2E | `busybox-1-24` | `busybox:1.36` | `busybox:1.24` |
 | E2E | `nginx-default` | `nginx:1.29.3-alpine` | 同名 |
 | E2E | `nginx-latest` | `nginx:1.29.3-alpine` | `nginx:latest` |
+| Kubernetes E2E | `k8s-e2e-agnhost-2-53` | `registry.k8s.io/e2e-test-images/agnhost:2.53` | 同名 |
+| Kubernetes E2E | `k8s-e2e-agnhost-2-56` | `registry.k8s.io/e2e-test-images/agnhost:2.56` | 同名 |
+| Kubernetes E2E | `k8s-e2e-agnhost-2-59` | `registry.k8s.io/e2e-test-images/agnhost:2.59` | 同名 |
+| Kubernetes E2E | `k8s-e2e-busybox-1-36` | `registry.k8s.io/e2e-test-images/busybox:1.36.1-1` | 同名 |
+| Kubernetes E2E | `k8s-e2e-busybox-1-37` | `registry.k8s.io/e2e-test-images/busybox:1.37.0-1` | 同名 |
 | E2E | `k8s-e2e-nginx` | `registry.k8s.io/e2e-test-images/nginx:1.14-4` | 同名 |
 | E2E/Benchmark | `kwok` | `registry.k8s.io/kwok/kwok:v0.7.0` | 同名 |
 | JobSeq | `mpi` | `volcanosh/example-mpi:0.0.3` | 同名 |
 | JobSeq | `tensorflow` | `volcanosh/dist-mnist-tf-example:0.0.1` | 同名 |
 | JobSeq | `pytorch` | `volcanosh/pytorch-mnist-v1beta1-9ee8fda-example:0.0.1` | 同名 |
+| JobSeq | `ray-bitnami` | `rayproject/ray:2.49.0` | `bitnami/ray:2.49.0` |
 | JobSeq | `ray` | `rayproject/ray:2.49.0` | 同名 |
+| DRA | `dra-hostpath-1-7` | `registry.k8s.io/sig-storage/hostpathplugin:v1.7.3` | 同名 |
 | DRA | `dra-hostpath` | `registry.k8s.io/sig-storage/hostpathplugin:v1.16.1` | 同名 |
 | Benchmark | `benchmark-busybox` | `busybox:1.36` | 同名 |
 | Monitoring | `prometheus` | `prom/prometheus:latest` | 同名 |
@@ -267,6 +276,19 @@ Profile 按需选择的默认镜像：
 | Monitoring | `kube-state-metrics` | `docker.io/volcanosh/kube-state-metrics:v2.0.0-beta` | 同名 |
 
 `busybox:1.24` 使用旧 schema 1，Docker 29/containerd 2.1 会拒绝拉取。因此脚本保存现代 `busybox:1.36`，同时创建 Candidate 仍引用的 `busybox:1.24` 本地标签。
+
+Volcano `v1.13.0` 引用的 `bitnami/ray:2.49.0` 已无法从公共仓库取得，`v1.13.1` 起上游改为 `rayproject/ray:2.49.0`。打包脚本因此只下载仍可用的 upstream Ray 镜像，并额外保存旧本地标签；两个条目共享同一组镜像 layer。
+
+Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Candidate 的 `k8s.io/kubernetes` 模块选择。部署脚本会从已下载模块的 `test/utils/image/manifest.go` 和 DRA manifest 中解析准确引用，写入 `candidate-e2e-images.txt`，并在创建 Kind 前验证包内镜像。当前审计结果如下：
+
+| Volcano 稳定线 | Kubernetes 测试模块 | agnhost | E2E busybox | DRA hostpathplugin |
+| --- | --- | --- | --- | --- |
+| `v1.12.x` | `v1.32.2` | `2.53` | `1.36.1-1` | `v1.7.3` |
+| `v1.13.x` | `v1.33.2` | `2.53` | `1.36.1-1` | `v1.7.3` |
+| `v1.14.x` | `v1.34.1` | `2.56` | `1.37.0-1` | `v1.7.3` |
+| `v1.15.x` | `v1.35.3` | `2.59` | `1.37.0-1` | `v1.16.1` |
+
+完整 `e2e-full`/`full` 会包含上述全部版本变体、JobSeq 和 DRA 镜像。`benchmark-full` 的 Candidate `v1.15.x` 路径使用 `busybox:1.36`、KWOK、Prometheus、Grafana、kube-state-metrics，以及在内网从 Candidate 源码构建的 audit-exporter；这些镜像均已列入相应分组。Volcano `v1.12.x-v1.14.x` 的旧 Benchmark 目录结构与当前 `benchmark/testcases` 入口不同，不应仅凭镜像清单宣称可由当前 Benchmark runner 执行。
 
 只预览某个通用包会包含的镜像，不下载：
 
