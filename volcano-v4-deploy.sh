@@ -828,7 +828,10 @@ if stage_done candidate-build-patch; then
   [[ -s "$OUTPUT_DIR/candidate-build-network.patch" ]] || die "saved Candidate build patch evidence is missing"
   log "reusing the patched Candidate Docker build environment"
 else
-  [[ -z "$(git -C "$CHECKOUT" status --porcelain)" ]] || die "Candidate checkout changed before its build patch checkpoint"
+  git -C "$CHECKOUT" status --short > "$OUTPUT_DIR/candidate-status-before-build-patch.txt"
+  if [[ -s "$OUTPUT_DIR/candidate-status-before-build-patch.txt" ]]; then
+    log "Candidate checkout contains generated or local changes; continuing with verified commit $CANDIDATE_COMMIT"
+  fi
   patch_candidate_build_network
   mark_stage candidate-build-patch
 fi

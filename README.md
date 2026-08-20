@@ -402,6 +402,8 @@ bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref
 
 恢复会复用已经完成并验证过的 Candidate checkout、Go module cache、Ginkgo 和 Candidate 镜像构建；完整 E2E/Benchmark 中已经成功的独立 E2E 类型和 Benchmark round 会跳过。Bundle、Candidate、profile/mode、测试选择、轮数或集群前缀只要有一项不同，脚本就拒绝混用该工作目录。显式指定过 `--mode`、`--e2e-type`、`--benchmark-scenario`、`--benchmark-config`、`--benchmark-rounds`、`--pods`、`--scheduler-name` 或 `--cluster-prefix` 时，恢复命令必须重复相同参数。
 
+Candidate 身份以仓库地址和精确 commit 为准。`go mod download all` 可能补写 `go.sum`，离线构建适配也会修改 Dockerfile；这些未提交的工作树变化不会阻断后续构建，脚本会把构建补丁前的状态保存到结果目录供追溯。
+
 保留 Kind 集群时，脚本会自动同时保留工作目录：
 
 ```bash
