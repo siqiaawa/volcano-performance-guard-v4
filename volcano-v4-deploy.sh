@@ -4,6 +4,7 @@
 set -Eeuo pipefail
 
 SCRIPT_VERSION="v4.3.0"
+RESUME_STATE_FORMAT="1"
 DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
 DEFAULT_GOPROXY="https://cmc.centralrepo.rnd.huawei.com/cbu-go,direct"
 DEFAULT_GONOSUMDB="*"
@@ -28,6 +29,32 @@ go_version_at_least() {
     (( have_major == need_major && have_minor == need_minor && have_patch >= need_patch ))
 }
 
+hash_values() { printf '%s\0' "$@" | sha256sum | awk '{print $1}'; }
+state_get() {
+  local key="$1"
+  [[ -f "${STATE_FILE:-}" ]] || return 1
+  awk -v key="$key" 'index($0,key "=")==1 {sub(/^[^=]*=/,""); print; exit}' "$STATE_FILE"
+}
+state_set() {
+  local key="$1" value="$2" tmp
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid resume-state key: $key"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "invalid resume-state value: $key"
+  tmp="${STATE_FILE}.tmp.$$"
+  if [[ -f "$STATE_FILE" ]]; then
+    awk -v key="$key" 'index($0,key "=")!=1' "$STATE_FILE" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+stage_path() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "invalid resume stage: $1"
+  printf '%s/%s.done\n' "$STAGE_DIR" "$1"
+}
+stage_done() { [[ -f "$(stage_path "$1")" ]]; }
+mark_stage() { printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$(stage_path "$1")"; }
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -40,9 +67,9 @@ Input/output:
   --bundle PATH               Bundle .tar.gz, extracted dir, or .part-000
   --bundle-url URL            Download one unsplit bundle with curl
   --output DIR                Default: ./volcano-v4-results-TIME
-  --work-dir DIR              Use a new persistent work directory
-  --keep-work-dir             Keep an automatically created work directory
-  --keep-cluster              Keep the only/last Kind cluster
+  --work-dir DIR              Use a new directory, or resume a saved v4 directory
+  --keep-work-dir             Keep an automatically created resumable directory
+  --keep-cluster              Keep/reuse the only Kind cluster and its work directory
 
 Candidate selection:
   --volcano-ref REF           Required branch, tag or commit to test
@@ -69,12 +96,14 @@ bundle. The Candidate's complete Go module graph and selected Ginkgo are first
 downloaded on the inner host through its approved Go proxy. Docker builders
 then consume a temporary file proxy and never contact that HTTPS proxy. The
 generic bundle contains no Volcano source or Go modules. Nothing is installed
-system-wide.
+system-wide. A saved work directory resumes only when its bundle and complete
+run identity match. A saved cluster restarts the selected E2E suite or failed
+Benchmark round; it cannot resume inside one Ginkgo spec or one go test process.
 EOF
 }
 
 BUNDLE_INPUT=""; BUNDLE_URL=""; OUTPUT_DIR=""; WORK_DIR=""
-KEEP_WORK_DIR=false; KEEP_CLUSTER=false; LIST_CAPABILITIES=false
+KEEP_WORK_DIR=false; KEEP_CLUSTER=false; LIST_CAPABILITIES=false; RESUME_WORK=false
 MODE_OVERRIDE=""; E2E_TYPE_OVERRIDE=""; BENCHMARK_SCENARIO_OVERRIDE=""
 BENCHMARK_CONFIG_OVERRIDE=""; BENCHMARK_ROUNDS=1; PODS=1000
 SCHEDULER_NAME="agent-scheduler"; CLUSTER_PREFIX="volcano-v4"
@@ -154,28 +183,56 @@ configure_build_proxy() {
 }
 configure_build_proxy
 
-if [[ -z "$OUTPUT_DIR" ]]; then OUTPUT_DIR="./volcano-v4-results-$(date -u +%Y%m%d-%H%M%S)"; fi
-[[ ! -e "$OUTPUT_DIR" ]] || die "output already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"
-OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
-printf 'source=%s\nhttp_configured=%s\nhttps_configured=%s\n' \
-  "$VPG_BUILD_PROXY_SOURCE" "$([[ -n "$HTTP_PROXY" ]] && printf true || printf false)" \
-  "$([[ -n "$HTTPS_PROXY" ]] && printf true || printf false)" > "$OUTPUT_DIR/build-proxy.txt"
-
 AUTO_WORK=false
 if [[ -z "$WORK_DIR" ]]; then
   WORK_DIR="$(mktemp -d /tmp/volcano-v4-deploy.XXXXXX)"; AUTO_WORK=true
 else
-  [[ ! -e "$WORK_DIR" ]] || die "work directory already exists: $WORK_DIR"
-  mkdir -p "$WORK_DIR"; WORK_DIR="$(cd "$WORK_DIR" && pwd -P)"
+  if [[ -e "$WORK_DIR" ]]; then
+    [[ -d "$WORK_DIR" ]] || die "work path is not a directory: $WORK_DIR"
+    WORK_DIR="$(cd "$WORK_DIR" && pwd -P)"; RESUME_WORK=true
+  else
+    mkdir -p "$WORK_DIR"; WORK_DIR="$(cd "$WORK_DIR" && pwd -P)"
+  fi
 fi
+STATE_DIR="$WORK_DIR/.vpg4-state"; STATE_FILE="$STATE_DIR/run.env"; STAGE_DIR="$STATE_DIR/stages"
+if [[ "$RESUME_WORK" == true ]]; then
+  [[ -f "$STATE_FILE" ]] || die "existing work directory has no v4 resume state: $WORK_DIR"
+  [[ -d "$STAGE_DIR" ]] || die "saved work directory has no resume stage directory"
+  [[ "$(state_get STATE_FORMAT)" == "$RESUME_STATE_FORMAT" ]] || die "unsupported work-directory resume format"
+  saved_output="$(state_get OUTPUT_DIR)"
+  [[ -n "$saved_output" && -d "$saved_output" ]] || die "saved output directory is missing: $saved_output"
+  if [[ -n "$OUTPUT_DIR" ]]; then
+    [[ -d "$OUTPUT_DIR" ]] || die "resume output directory does not exist: $OUTPUT_DIR"
+    OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
+    [[ "$OUTPUT_DIR" == "$saved_output" ]] || die "resume output mismatch: expected $saved_output"
+  else
+    OUTPUT_DIR="$saved_output"
+  fi
+  log "resuming saved work directory: $WORK_DIR"
+else
+  mkdir -p "$STATE_DIR" "$STAGE_DIR"
+  if [[ -z "$OUTPUT_DIR" ]]; then OUTPUT_DIR="./volcano-v4-results-$(date -u +%Y%m%d-%H%M%S)"; fi
+  [[ ! -e "$OUTPUT_DIR" ]] || die "output already exists: $OUTPUT_DIR"
+  mkdir -p "$OUTPUT_DIR"; OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
+  state_set STATE_FORMAT "$RESUME_STATE_FORMAT"
+  state_set OUTPUT_DIR "$OUTPUT_DIR"
+fi
+if [[ "$KEEP_CLUSTER" == true ]]; then KEEP_WORK_DIR=true; fi
+printf 'source=%s\nhttp_configured=%s\nhttps_configured=%s\nresume=%s\n' \
+  "$VPG_BUILD_PROXY_SOURCE" "$([[ -n "$HTTP_PROXY" ]] && printf true || printf false)" \
+  "$([[ -n "$HTTPS_PROXY" ]] && printf true || printf false)" "$RESUME_WORK" > "$OUTPUT_DIR/build-proxy.txt"
+
 CURRENT_CLUSTER=""; CLUSTER_CREATED=false
 cleanup() {
   status=$?
   if [[ "$CLUSTER_CREATED" == true && "$KEEP_CLUSTER" != true && -n "$CURRENT_CLUSTER" ]] && command -v kind >/dev/null 2>&1; then
     log "deleting project cluster after interruption: $CURRENT_CLUSTER"
     kind delete cluster --name "$CURRENT_CLUSTER" >"$OUTPUT_DIR/kind-delete-trap.log" 2>&1 || true
+    state_set ACTIVE_CLUSTER "" 2>/dev/null || true
+    state_set ACTIVE_PURPOSE "" 2>/dev/null || true
   fi
+  state_set LAST_STATUS "$status" 2>/dev/null || true
+  state_set LAST_FINISHED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null || true
   if [[ "$AUTO_WORK" == true && "$KEEP_WORK_DIR" != true ]]; then
     chmod -R u+w "$WORK_DIR" 2>/dev/null || true
     rm -rf -- "$WORK_DIR" || log "could not completely remove work directory: $WORK_DIR"
@@ -201,13 +258,23 @@ safe_extract() {
 
 if [[ -n "$BUNDLE_URL" ]]; then
   BUNDLE_INPUT="$WORK_DIR/downloaded-bundle.tar.gz"
-  log "downloading bundle"
-  curl --fail --location --retry 3 --connect-timeout 30 -o "$BUNDLE_INPUT" "$BUNDLE_URL"
+  if [[ "$RESUME_WORK" == true && -s "$BUNDLE_INPUT" ]]; then
+    log "reusing the saved downloaded bundle"
+  else
+    log "downloading bundle"
+    curl --fail --location --retry 3 --connect-timeout 30 -o "$BUNDLE_INPUT" "$BUNDLE_URL"
+  fi
 fi
 if [[ -z "$BUNDLE_INPUT" ]]; then
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-  [[ -f "$script_dir/bundle.meta" ]] || die "--bundle is required outside an extracted bundle"
-  BUNDLE_INPUT="$script_dir"
+  saved_bundle_root="$(state_get BUNDLE_ROOT 2>/dev/null || true)"
+  if [[ "$RESUME_WORK" == true && -n "$saved_bundle_root" && -d "$saved_bundle_root" ]]; then
+    BUNDLE_INPUT="$saved_bundle_root"
+    log "reusing the saved extracted bundle"
+  else
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    [[ -f "$script_dir/bundle.meta" ]] || die "--bundle is required outside an extracted bundle or resumable work directory"
+    BUNDLE_INPUT="$script_dir"
+  fi
 fi
 if [[ -d "$BUNDLE_INPUT" ]]; then
   BUNDLE_ROOT="$(cd "$BUNDLE_INPUT" && pwd -P)"
@@ -232,6 +299,7 @@ for required in bundle.meta images.tar.gz tools.tar.gz resources.tar.gz SHA256SU
   [[ -f "$BUNDLE_ROOT/$required" ]] || die "bundle is missing $required"
 done
 (cd "$BUNDLE_ROOT" && sha256sum -c SHA256SUMS)
+BUNDLE_ID="$(sha256sum "$BUNDLE_ROOT/SHA256SUMS" | awk '{print $1}')"
 
 FORMAT=""; BUNDLE_SCRIPT_VERSION=""; BUNDLE_SCOPE=""; PLATFORM=""; PROFILE=""; PACKAGED_MODE=""; DEFAULT_RUN=""
 K8S_VERSION=""; KIND_VERSION=""; HELM_VERSION=""; JQ_VERSION=""; KWOK_VERSION=""; GO_TOOLCHAIN=""
@@ -298,6 +366,34 @@ MODE="${MODE_OVERRIDE:-$PACKAGED_MODE}"
 if [[ "$PACKAGED_MODE" != both && "$MODE" != "$PACKAGED_MODE" ]]; then die "requested mode $MODE is not covered by profile $PROFILE"; fi
 [[ "$MODE" == benchmark || ${#E2E_CAPS[@]} -gt 0 ]] || die "bundle has no E2E capability"
 [[ "$MODE" == e2e || ${#BENCHMARK_CAP_SCENARIOS[@]} -gt 0 ]] || die "bundle has no Benchmark capability"
+
+RUN_ID="$(hash_values "$SCRIPT_VERSION" "$BUNDLE_ID" "$VOLCANO_REPO" "$VOLCANO_REF" "$MODE" \
+  "$E2E_TYPE_OVERRIDE" "$BENCHMARK_SCENARIO_OVERRIDE" "$BENCHMARK_CONFIG_OVERRIDE" \
+  "$BENCHMARK_ROUNDS" "$PODS" "$SCHEDULER_NAME" "$CLUSTER_PREFIX")"
+if [[ "$RESUME_WORK" == true ]]; then
+  saved_run_id="$(state_get RUN_ID)"
+  if [[ -z "$saved_run_id" ]]; then
+    shopt -s nullglob; saved_stages=("$STAGE_DIR"/*.done); shopt -u nullglob
+    [[ ${#saved_stages[@]} -eq 0 ]] || die "saved work directory has stages but no run identity"
+    state_set RUN_ID "$RUN_ID"
+    state_set BUNDLE_ID "$BUNDLE_ID"
+    log "initialized resume identity after an early previous interruption"
+  else
+    [[ "$saved_run_id" == "$RUN_ID" ]] || die "saved work directory belongs to a different bundle, Candidate, mode, or run selection"
+  fi
+else
+  state_set RUN_ID "$RUN_ID"
+  state_set BUNDLE_ID "$BUNDLE_ID"
+  state_set VOLCANO_REPOSITORY_HASH "$(hash_values "$VOLCANO_REPO")"
+  state_set VOLCANO_REF_HASH "$(hash_values "$VOLCANO_REF")"
+  state_set PROFILE "$PROFILE"
+  state_set MODE "$MODE"
+  state_set KUBERNETES_VERSION "$K8S_VERSION"
+fi
+state_set BUNDLE_ROOT "$BUNDLE_ROOT"
+if [[ "$RESUME_WORK" == true && -n "$(state_get ACTIVE_CLUSTER)" && "$KEEP_CLUSTER" != true ]]; then
+  die "saved work directory records an active Kind cluster; add --keep-cluster to validate and reuse it"
+fi
 
 printf 'bundle_scope=%s\nprofile=%s\nmode=%s\ndefault_run=%s\n' \
   "$BUNDLE_SCOPE" "$PROFILE" "$PACKAGED_MODE" "$DEFAULT_RUN"
@@ -434,14 +530,33 @@ bundle_has_image_ref() {
 resource_for_key() { local wanted="$1" i; for ((i=0;i<${#RESOURCE_KEYS[@]};i++)); do [[ "${RESOURCE_KEYS[$i]}" != "$wanted" ]] || { printf '%s\n' "$RESOURCES_DIR/${RESOURCE_PATHS[$i]}"; return; }; done; return 1; }
 
 CHECKOUT="$WORK_DIR/volcano"
-git init "$CHECKOUT" >/dev/null; git -C "$CHECKOUT" remote add origin "$VOLCANO_REPO"
-log "fetching Volcano Candidate: $VOLCANO_REF"
-git -C "$CHECKOUT" fetch --depth 1 origin "$VOLCANO_REF"
-git -C "$CHECKOUT" checkout --detach FETCH_HEAD
-CANDIDATE_COMMIT="$(git -C "$CHECKOUT" rev-parse HEAD)"
-[[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "cannot resolve selected Candidate"
-if [[ -f "$CHECKOUT/.gitmodules" ]]; then git -C "$CHECKOUT" submodule update --init --recursive --depth 1; fi
-git -C "$CHECKOUT" status --short > "$OUTPUT_DIR/candidate-status-before-environment-patch.txt"
+if stage_done candidate-checkout; then
+  CANDIDATE_COMMIT="$(state_get CANDIDATE_COMMIT)"
+  [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ && -d "$CHECKOUT/.git" ]] || die "saved Candidate checkout is incomplete"
+  [[ "$(git -C "$CHECKOUT" rev-parse HEAD)" == "$CANDIDATE_COMMIT" ]] || die "saved Candidate checkout commit changed"
+  [[ "$(git -C "$CHECKOUT" remote get-url origin)" == "$VOLCANO_REPO" ]] || die "saved Candidate repository changed"
+  log "reusing Candidate checkout: $CANDIDATE_COMMIT"
+else
+  if [[ -e "$CHECKOUT" ]]; then
+    [[ -d "$CHECKOUT/.git" ]] || die "partial Candidate checkout is not resumable: $CHECKOUT"
+    [[ -z "$(git -C "$CHECKOUT" status --porcelain)" ]] || die "uncheckpointed Candidate checkout is dirty; use a new work directory"
+    [[ "$(git -C "$CHECKOUT" remote get-url origin)" == "$VOLCANO_REPO" ]] || die "partial Candidate repository does not match"
+  else
+    git init "$CHECKOUT" >/dev/null
+    git -C "$CHECKOUT" remote add origin "$VOLCANO_REPO"
+  fi
+  log "fetching Volcano Candidate: $VOLCANO_REF"
+  git -C "$CHECKOUT" fetch --depth 1 origin "$VOLCANO_REF"
+  git -C "$CHECKOUT" checkout --detach FETCH_HEAD
+  CANDIDATE_COMMIT="$(git -C "$CHECKOUT" rev-parse HEAD)"
+  [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "cannot resolve selected Candidate"
+  if [[ -f "$CHECKOUT/.gitmodules" ]]; then git -C "$CHECKOUT" submodule update --init --recursive --depth 1; fi
+  state_set CANDIDATE_COMMIT "$CANDIDATE_COMMIT"
+  mark_stage candidate-checkout
+fi
+if [[ ! -f "$OUTPUT_DIR/candidate-status-before-environment-patch.txt" ]]; then
+  git -C "$CHECKOUT" status --short > "$OUTPUT_DIR/candidate-status-before-environment-patch.txt"
+fi
 printf '%s\n' "$CANDIDATE_COMMIT" > "$OUTPUT_DIR/candidate-commit.txt"
 
 CANDIDATE_GO="$(awk '$1=="toolchain"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
@@ -458,11 +573,18 @@ fi
 # builders can consume it without contacting the HTTPS proxy or trusting its
 # corporate CA.
 VPG_INNER_GO_MODULE_ARCHIVE="$WORK_DIR/inner-go-modules.tar.gz"
-log "downloading the Candidate Go module graph on the inner host through GOPROXY"
-(
-  cd "$CHECKOUT"
-  go mod download all
-) 2>&1 | tee "$OUTPUT_DIR/go-mod-download.log"
+if stage_done go-modules; then
+  [[ -d "$GOMODCACHE/cache/download" ]] || die "saved Go module cache is missing"
+  log "reusing the complete saved Candidate Go module graph"
+else
+  log "downloading the Candidate Go module graph on the inner host through GOPROXY"
+  (
+    cd "$CHECKOUT"
+    go mod download all
+  ) 2>&1 | tee -a "$OUTPUT_DIR/go-mod-download.log"
+  [[ -d "$GOMODCACHE/cache/download" ]] || die "inner-host Go module proxy cache was not created"
+  mark_stage go-modules
+fi
 [[ -d "$GOMODCACHE/cache/download" ]] || die "inner-host Go module proxy cache was not created"
 tar -C "$GOMODCACHE/cache/download" --exclude='*.lock' --exclude='*.tmp' \
   -czf "$VPG_INNER_GO_MODULE_ARCHIVE" .
@@ -474,8 +596,14 @@ log "prepared the inner-host Go module file proxy for Candidate Docker builds"
 if [[ "$MODE" != benchmark ]]; then
   GINKGO_VERSION="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2;exit} $1=="require"&&$2=="github.com/onsi/ginkgo/v2" {print $3;exit}' "$CHECKOUT/go.mod")"
   [[ "$GINKGO_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "cannot resolve Candidate Ginkgo version"
-  log "installing Candidate-selected Ginkgo $GINKGO_VERSION through GOPROXY"
-  go install "github.com/onsi/ginkgo/v2/ginkgo@$GINKGO_VERSION"
+  if stage_done ginkgo; then
+    [[ -x "$GOPATH/bin/ginkgo" ]] || die "saved Ginkgo binary is missing"
+    log "reusing Candidate-selected Ginkgo $GINKGO_VERSION"
+  else
+    log "installing Candidate-selected Ginkgo $GINKGO_VERSION through GOPROXY"
+    go install "github.com/onsi/ginkgo/v2/ginkgo@$GINKGO_VERSION"
+    mark_stage ginkgo
+  fi
   ginkgo version | tee "$OUTPUT_DIR/ginkgo-version.log"
 fi
 
@@ -696,7 +824,14 @@ patch_candidate_build_network() {
   [[ -s "$OUTPUT_DIR/candidate-build-network.patch" ]] || die "Candidate build network patch is empty"
 }
 
-patch_candidate_build_network
+if stage_done candidate-build-patch; then
+  [[ -s "$OUTPUT_DIR/candidate-build-network.patch" ]] || die "saved Candidate build patch evidence is missing"
+  log "reusing the patched Candidate Docker build environment"
+else
+  [[ -z "$(git -C "$CHECKOUT" status --porcelain)" ]] || die "Candidate checkout changed before its build patch checkpoint"
+  patch_candidate_build_network
+  mark_stage candidate-build-patch
+fi
 for name in "${DOCKERFILES[@]}"; do
   if [[ "$name" == benchmark-audit-exporter ]]; then path="$CHECKOUT/benchmark/manifests/audit-exporter/Dockerfile"
   else path="$CHECKOUT/installer/dockerfile/$name/Dockerfile"; fi
@@ -711,18 +846,30 @@ done
 
 BUILD_TARGETS=(vc-scheduler-image vc-controller-manager-image vc-webhook-manager-image)
 [[ "$BUILD_AGENT" != true ]] || BUILD_TARGETS+=(vc-agent-scheduler-image)
-log "building Candidate images at $CANDIDATE_COMMIT"
-(
-  cd "$CHECKOUT"
-  # Every Dockerfile receives the verified inner-host file proxy for its
-  # explicit go mod download. Disable all later Go network fallback so an
-  # incomplete prefetch fails closed instead of contacting HTTPS from Docker.
-  export GOPROXY=off GONOSUMDB='*' GOSUMDB=off
-  make "${BUILD_TARGETS[@]}" "TAG=$CANDIDATE_COMMIT" IMAGE_PREFIX=volcanosh FORCE_REBUILD=true \
-    BUILDX_OUTPUT_TYPE=docker DOCKER_PLATFORMS=linux/amd64
-) 2>&1 | tee "$OUTPUT_DIR/candidate-build.log"
 CANDIDATE_IMAGES=("volcanosh/vc-scheduler:$CANDIDATE_COMMIT" "volcanosh/vc-controller-manager:$CANDIDATE_COMMIT" "volcanosh/vc-webhook-manager:$CANDIDATE_COMMIT")
 [[ "$BUILD_AGENT" != true ]] || CANDIDATE_IMAGES+=("volcanosh/vc-agent-scheduler:$CANDIDATE_COMMIT")
+candidate_images_available() {
+  local image
+  for image in "${CANDIDATE_IMAGES[@]}"; do
+    [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image" 2>/dev/null)" == linux/amd64 ]] || return 1
+  done
+}
+if stage_done candidate-images && candidate_images_available; then
+  log "reusing previously built Candidate images at $CANDIDATE_COMMIT"
+else
+  log "building Candidate images at $CANDIDATE_COMMIT"
+  (
+    cd "$CHECKOUT"
+    # Every Dockerfile receives the verified inner-host file proxy for its
+    # explicit go mod download. Disable all later Go network fallback so an
+    # incomplete prefetch fails closed instead of contacting HTTPS from Docker.
+    export GOPROXY=off GONOSUMDB='*' GOSUMDB=off
+    make "${BUILD_TARGETS[@]}" "TAG=$CANDIDATE_COMMIT" IMAGE_PREFIX=volcanosh FORCE_REBUILD=true \
+      BUILDX_OUTPUT_TYPE=docker DOCKER_PLATFORMS=linux/amd64
+  ) 2>&1 | tee -a "$OUTPUT_DIR/candidate-build.log"
+  candidate_images_available || die "one or more Candidate images were not built for linux/amd64"
+  mark_stage candidate-images
+fi
 for image in "${CANDIDATE_IMAGES[@]}"; do
   [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" == linux/amd64 ]] || die "Candidate image platform mismatch: $image"
 done
@@ -740,10 +887,41 @@ cluster_name() {
   printf '%s\n' "${name%-}"
 }
 cluster_exists() { kind get clusters 2>/dev/null | grep -Fxq "$1"; }
+record_cluster_identity() {
+  local kubeconfig="$1" purpose="$2"
+  kubectl --kubeconfig "$kubeconfig" -n kube-system create configmap vpg4-resume-state \
+    --from-literal="run-id=$RUN_ID" --from-literal="candidate-commit=$CANDIDATE_COMMIT" \
+    --from-literal="purpose=$purpose" --dry-run=client -o yaml | \
+    kubectl --kubeconfig "$kubeconfig" apply -f - >/dev/null
+}
+validate_saved_cluster() {
+  local name="$1" purpose="$2" kubeconfig="$3" release="$4" observed identity
+  [[ "$RESUME_WORK" == true && "$KEEP_CLUSTER" == true ]] || die "cluster already exists: $name; resume it with the saved --work-dir and --keep-cluster"
+  [[ "$(state_get ACTIVE_CLUSTER)" == "$name" && "$(state_get ACTIVE_PURPOSE)" == "$purpose" ]] || \
+    die "saved active-cluster identity does not match $name"
+  kind get kubeconfig --name "$name" > "$kubeconfig"
+  chmod 0600 "$kubeconfig"
+  observed="$(kubectl --kubeconfig "$kubeconfig" version -o json | jq -r '.serverVersion.gitVersion')"
+  [[ "$observed" == "$K8S_VERSION" ]] || die "saved cluster Kubernetes mismatch: expected $K8S_VERSION, got $observed"
+  identity="$(kubectl --kubeconfig "$kubeconfig" -n kube-system get configmap vpg4-resume-state -o json)" || \
+    die "saved cluster has no v4 resume identity: $name"
+  jq -e --arg run "$RUN_ID" --arg commit "$CANDIDATE_COMMIT" --arg purpose "$purpose" \
+    '.data["run-id"]==$run and .data["candidate-commit"]==$commit and .data.purpose==$purpose' \
+    <<< "$identity" >/dev/null || die "saved cluster identity does not match this run"
+  if [[ -n "$release" ]]; then
+    helm status "$release" -n volcano-system --kubeconfig "$kubeconfig" -o json | \
+      jq -e '.info.status=="deployed"' >/dev/null || die "saved cluster Helm release is not deployed: $release"
+    helm get values "$release" -n volcano-system --kubeconfig "$kubeconfig" --all -o json | \
+      jq -e --arg commit "$CANDIDATE_COMMIT" '.basic.image_tag_version==$commit' >/dev/null || \
+      die "saved cluster Helm release uses a different Candidate: $release"
+  fi
+  log "validated and reusing saved Kind cluster: $name"
+}
 delete_cluster() {
   local purpose="$1"
   if [[ "$KEEP_CLUSTER" == true ]]; then log "keeping cluster: $CURRENT_CLUSTER"; return; fi
   if cluster_exists "$CURRENT_CLUSTER"; then kind delete cluster --name "$CURRENT_CLUSTER" 2>&1 | tee "$OUTPUT_DIR/kind-delete-${purpose}.log"; fi
+  state_set ACTIVE_CLUSTER ""; state_set ACTIVE_PURPOSE ""
   CLUSTER_CREATED=false; CURRENT_CLUSTER=""
 }
 docker_save_archive() {
@@ -829,6 +1007,40 @@ patch_e2e_environment() {
     END{if(inserted!=1) exit 43}
   ' "$install" > "$tmp" || die "cannot add offline image loading to Candidate Kind helper"
   mv "$tmp" "$install"
+  if ! grep -q 'SKIP_CLUSTER_SETUP' "$runner"; then
+    awk '
+      BEGIN{wrapping=0; inserted=0}
+      /^[[:space:]]*if[[:space:]]+\[\[[[:space:]]+\$CLEANUP_CLUSTER[[:space:]]+-eq[[:space:]]+1[[:space:]]+\]\];[[:space:]]+then[[:space:]]*$/ {
+        print "if [[ \"${SKIP_CLUSTER_SETUP:-0}\" -eq 1 ]]; then"
+        print "    echo \"Skipping cluster setup (SKIP_CLUSTER_SETUP=1), using existing cluster\""
+        print "    source \"${VK_ROOT}/hack/lib/install.sh\""
+        print "    check-prerequisites"
+        print "else"
+        wrapping=1
+      }
+      {print}
+      wrapping && /^[[:space:]]*install-volcano[[:space:]]*$/ {
+        print "fi"
+        wrapping=0; inserted++
+      }
+      END{if(inserted!=1 || wrapping) exit 48}
+    ' "$runner" > "$tmp" || die "cannot add saved-cluster setup bypass to Candidate E2E runner"
+    mv "$tmp" "$runner"
+  fi
+  grep -q 'SKIP_CLUSTER_SETUP' "$runner" || die "Candidate E2E runner cannot reuse a saved cluster"
+  awk '
+    BEGIN{inserted=0}
+    /^# Run e2e test/ {
+      print "if [[ -n \"${VPG_RESUME_RUN_ID:-}\" ]]; then"
+      print "  kubectl -n kube-system create configmap vpg4-resume-state --from-literal=run-id=\"${VPG_RESUME_RUN_ID}\" --from-literal=candidate-commit=\"${VPG_CANDIDATE_COMMIT:?}\" --from-literal=purpose=\"${VPG_RESUME_PURPOSE:?}\" --dry-run=client -o yaml | kubectl apply -f -"
+      print "fi"
+      print ""
+      inserted++
+    }
+    {print}
+    END{if(inserted!=1) exit 46}
+  ' "$runner" > "$tmp" || die "cannot add E2E cluster resume identity"
+  mv "$tmp" "$runner"
   if (( K8S_MINOR < 34 )) && grep -q 'DRAConsumableCapacity' "$kind_config"; then
     log "adapting the Candidate feature gates and API versions for Kubernetes v1.$K8S_MINOR"
     sed -i \
@@ -841,49 +1053,85 @@ patch_e2e_environment() {
   [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "Candidate environment patch is empty"
 }
 
-if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then patch_e2e_environment; fi
+if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
+  if stage_done candidate-e2e-patch; then
+    [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "saved Candidate E2E patch evidence is missing"
+    log "reusing the patched Candidate E2E environment"
+  else
+    patch_e2e_environment
+    mark_stage candidate-e2e-patch
+  fi
+fi
 
 run_e2e_one() {
   local type="$1" number="$2" name runtime runtime_archive artifacts cleanup_value=1
+  local stage="e2e-${number}-${type,,}" purpose kubeconfig reuse_cluster=false
   local -a runtime_images=()
+  if stage_done "$stage"; then
+    log "skipping completed Candidate E2E $type"
+    return
+  fi
   name="$(cluster_name "e2e-${type,,}" "$number")"; runtime="$WORK_DIR/runtime-e2e-$number.txt"
+  purpose="e2e-$number-${type,,}"; kubeconfig="$WORK_DIR/kubeconfig-e2e-$number"
   runtime_archive="$WORK_DIR/runtime-e2e-$number.tar"
   artifacts="$OUTPUT_DIR/e2e-$number-$type"; mkdir -p "$artifacts"
   write_runtime_images "e2e-$type" "$runtime"
   mapfile -t runtime_images < "$runtime"
   [[ ${#runtime_images[@]} -gt 0 ]] || die "runtime image list is empty: $runtime"
   docker_save_archive "$runtime_archive" "${runtime_images[@]}"
-  cluster_exists "$name" && die "project cluster already exists: $name"
+  if cluster_exists "$name"; then
+    validate_saved_cluster "$name" "$purpose" "$kubeconfig" "$name"
+    kind load image-archive "$runtime_archive" --name "$name"
+    reuse_cluster=true
+  fi
   CURRENT_CLUSTER="$name"; CLUSTER_CREATED=true
+  state_set ACTIVE_CLUSTER "$name"; state_set ACTIVE_PURPOSE "$purpose"
   [[ "$KEEP_CLUSTER" != true ]] || cleanup_value=0
-  log "running Candidate E2E $type in $name"
+  if [[ "$reuse_cluster" == true ]]; then
+    log "restarting Candidate E2E $type in saved cluster $name"
+  else
+    log "running Candidate E2E $type in $name"
+  fi
   (
     cd "$CHECKOUT"
+    if [[ "$reuse_cluster" == true ]]; then
+      export KUBECONFIG="$kubeconfig" SKIP_CLUSTER_SETUP=1
+    fi
     E2E_TYPE="$type" CLUSTER_NAME="$name" CLEANUP_CLUSTER="$cleanup_value" \
       KIND_OPT="--image $NODE_IMAGE --config $CHECKOUT/hack/e2e-kind-config.yaml" \
       IMAGE_PREFIX=volcanosh TAG="$CANDIDATE_COMMIT" OS=linux ARTIFACTS_PATH="$artifacts" \
       VPG_RUNTIME_IMAGE_ARCHIVE="$runtime_archive" VPG_KWOK_MANIFEST="$(resource_for_key kwok-manifest)" \
-      VPG_KWOK_STAGE="$(resource_for_key kwok-stage)" bash hack/run-e2e-kind.sh
-  ) 2>&1 | tee "$artifacts/run.log"
+      VPG_KWOK_STAGE="$(resource_for_key kwok-stage)" VPG_RESUME_RUN_ID="$RUN_ID" \
+      VPG_CANDIDATE_COMMIT="$CANDIDATE_COMMIT" VPG_RESUME_PURPOSE="$purpose" bash hack/run-e2e-kind.sh
+  ) 2>&1 | tee -a "$artifacts/run.log"
+  mark_stage "$stage"
   if [[ "$KEEP_CLUSTER" != true ]]; then
     cluster_exists "$name" && kind delete cluster --name "$name" >/dev/null 2>&1 || true
+    state_set ACTIVE_CLUSTER ""; state_set ACTIVE_PURPOSE ""
     CLUSTER_CREATED=false; CURRENT_CLUSTER=""
   fi
 }
 
 create_benchmark_cluster() {
-  local name="$1" number="$2" config runtime
+  local name="$1" number="$2" purpose="$3" config runtime
   config="$WORK_DIR/kind-benchmark-$number.yaml"
   runtime="$WORK_DIR/runtime-benchmark-$number.txt"
   [[ -f "$CHECKOUT/benchmark/config/kind-config.yaml" ]] || die "Candidate Benchmark Kind config is missing"
   sed "s|__VOLCANO_ROOT__|$CHECKOUT|g" "$CHECKOUT/benchmark/config/kind-config.yaml" > "$config"
-  cluster_exists "$name" && die "project cluster already exists: $name"
   CURRENT_CLUSTER="$name"; CLUSTER_CREATED=true
-  kind create cluster --name "$name" --image "$NODE_IMAGE" --config "$config" --wait 300s 2>&1 | tee "$OUTPUT_DIR/kind-create-benchmark-$number.log"
   KUBECONFIG="$OUTPUT_DIR/kubeconfig-benchmark-$number"; export KUBECONFIG
-  kind get kubeconfig --name "$name" > "$KUBECONFIG"; chmod 0600 "$KUBECONFIG"
+  if cluster_exists "$name"; then
+    validate_saved_cluster "$name" "$purpose" "$KUBECONFIG" ""
+    REUSED_CLUSTER=true
+  else
+    REUSED_CLUSTER=false
+    state_set ACTIVE_CLUSTER "$name"; state_set ACTIVE_PURPOSE "$purpose"
+    kind create cluster --name "$name" --image "$NODE_IMAGE" --config "$config" --wait 300s 2>&1 | tee "$OUTPUT_DIR/kind-create-benchmark-$number.log"
+    kind get kubeconfig --name "$name" > "$KUBECONFIG"; chmod 0600 "$KUBECONFIG"
+  fi
   observed="$(kubectl version -o json | jq -r '.serverVersion.gitVersion')"
   [[ "$observed" == "$K8S_VERSION" ]] || die "Kubernetes version mismatch: expected $K8S_VERSION, got $observed"
+  record_cluster_identity "$KUBECONFIG" "$purpose"
   write_runtime_images benchmark "$runtime"
   for image in "${CANDIDATE_IMAGES[@]}"; do printf '%s\n' "$image" >> "$runtime"; done
   sort -u -o "$runtime" "$runtime"; load_image_list "$name" "$runtime" 2>&1 | tee "$OUTPUT_DIR/kind-load-benchmark-$number.log"
@@ -931,22 +1179,53 @@ resolve_benchmark_config() {
 }
 
 run_benchmark_one() {
-  local scenario="$1" configured="$2" number="$3" name config round round_dir
+  local scenario="$1" configured="$2" number="$3" name config round round_dir purpose stage
   name="$(cluster_name "benchmark-${scenario,,}" "$number")"
+  purpose="benchmark-$number-${scenario,,}"
   config="$(resolve_benchmark_config "$configured" "$number")"
-  create_benchmark_cluster "$name" "$number"
-  install_candidate "$number"
-  log "creating Candidate Benchmark KWOK nodes"
-  if [[ "$configured" == *net-topo* ]]; then
-    (cd "$CHECKOUT/benchmark"; ENABLE_TOPOLOGY=true USE_EXISTING_CLUSTER=true make create-nodes) \
-      2>&1 | tee "$OUTPUT_DIR/benchmark-infrastructure-$number.log"
-    (cd "$CHECKOUT/benchmark"; make create-hypernodes) 2>&1 | tee "$OUTPUT_DIR/benchmark-hypernodes-$number.log"
+  create_benchmark_cluster "$name" "$number" "$purpose"
+  stage="benchmark-${number}-${scenario,,}-candidate"
+  if [[ "$REUSED_CLUSTER" == true ]] && stage_done "$stage"; then
+    validate_saved_cluster "$name" "$purpose" "$KUBECONFIG" volcano
+    log "reusing the Candidate installation in saved Benchmark cluster"
   else
-    (cd "$CHECKOUT/benchmark"; USE_EXISTING_CLUSTER=true make create-nodes) \
-      2>&1 | tee "$OUTPUT_DIR/benchmark-infrastructure-$number.log"
+    install_candidate "$number"
+    mark_stage "$stage"
   fi
-  if has_image_key prometheus; then prepare_monitoring "$name" "$number"; fi
+  stage="benchmark-${number}-${scenario,,}-infrastructure"
+  if [[ "$REUSED_CLUSTER" == true ]] && stage_done "$stage"; then
+    log "reusing saved Candidate Benchmark KWOK infrastructure"
+  else
+    log "creating Candidate Benchmark KWOK nodes"
+    if [[ "$configured" == *net-topo* ]]; then
+      (cd "$CHECKOUT/benchmark"; ENABLE_TOPOLOGY=true USE_EXISTING_CLUSTER=true make create-nodes) \
+        2>&1 | tee "$OUTPUT_DIR/benchmark-infrastructure-$number.log"
+      (cd "$CHECKOUT/benchmark"; make create-hypernodes) 2>&1 | tee "$OUTPUT_DIR/benchmark-hypernodes-$number.log"
+    else
+      (cd "$CHECKOUT/benchmark"; USE_EXISTING_CLUSTER=true make create-nodes) \
+        2>&1 | tee "$OUTPUT_DIR/benchmark-infrastructure-$number.log"
+    fi
+    mark_stage "$stage"
+  fi
+  stage="benchmark-${number}-${scenario,,}-monitoring"
+  if has_image_key prometheus; then
+    if [[ "$REUSED_CLUSTER" == true ]] && stage_done "$stage"; then
+      log "reusing saved Candidate Benchmark monitoring"
+    else
+      prepare_monitoring "$name" "$number"
+      mark_stage "$stage"
+    fi
+  fi
+  if [[ "$REUSED_CLUSTER" == true ]]; then
+    log "cleaning incomplete Benchmark workloads before continuing"
+    (cd "$CHECKOUT/benchmark"; make clean-vcjobs) >/dev/null 2>&1 || true
+  fi
   for ((round=1; round<=BENCHMARK_ROUNDS; round++)); do
+    stage="benchmark-${number}-${scenario,,}-round-$round"
+    if stage_done "$stage"; then
+      log "skipping completed Candidate Benchmark $scenario round $round/$BENCHMARK_ROUNDS"
+      continue
+    fi
     printf -v round_dir '%s/benchmark-%02d-%s-round-%02d' "$OUTPUT_DIR" "$number" "$scenario" "$round"
     mkdir -p "$round_dir"
     log "running Candidate Benchmark $scenario round $round/$BENCHMARK_ROUNDS"
@@ -959,7 +1238,8 @@ run_benchmark_one() {
       [[ ! -d results ]] || cp -a results/. "$round_dir/"
       make clean-vcjobs || true
       exit "$test_status"
-    ) 2>&1 | tee "$round_dir/run.log"
+    ) 2>&1 | tee -a "$round_dir/run.log"
+    mark_stage "$stage"
   done
   delete_cluster "benchmark-$number"
 }
@@ -983,6 +1263,11 @@ candidate_commit=$CANDIDATE_COMMIT
 e2e_selection=$E2E_SELECTION
 benchmark_selection=$BENCHMARK_SELECTION
 benchmark_rounds=$BENCHMARK_ROUNDS
+resumed_work_directory=$RESUME_WORK
+work_directory=$WORK_DIR
+keep_work_directory=$KEEP_WORK_DIR
+keep_cluster=$KEEP_CLUSTER
+active_cluster=$(state_get ACTIVE_CLUSTER || true)
 go_proxy=$GOPROXY_VALUE
 go_nosumdb=$GONOSUMDB_VALUE
 go_sumdb=$GOSUMDB_VALUE

@@ -5,7 +5,7 @@
 关键边界：
 
 - 外网包与 Volcano 版本完全解耦，不拉取 Volcano 源码，不解析 Volcano ref，也不包含 Go modules；
-- 内网每次通过 `--volcano-ref` 选择 Candidate，并通过已批准的公司 Go Proxy 下载该 Candidate 的完整 Go module graph；
+- 内网首次通过 `--volcano-ref` 选择 Candidate，并通过已批准的公司 Go Proxy 下载该 Candidate 的完整 Go module graph；保存工作目录后可校验并复用该缓存；
 - 只要 Kubernetes/Kind、Go toolchain、基础镜像、测试运行镜像和固定资源没有新增或变化，同一个外网包可以一直复用；
 - 修改 Volcano 源码或 `go.mod/go.sum` 但没有增加上述非模块依赖时，不需要重新打外网包；
 - 项目只维护两个 Bash 脚本和两个 TSV 配置文件，不依赖 Python，也不复制 Volcano 测试代码。
@@ -382,17 +382,43 @@ gh release upload v2.0 文件... --repo siqiaawa/volcano-performance-guard-v4
 
 结果目录包含准确 Candidate commit、工具/Go 环境、Bundle 和 Docker load 日志、Candidate build 日志、环境补丁、E2E artifacts 或 Benchmark results，以及最终 `summary.txt`。
 
-保留临时 checkout、Go cache 和构建现场：
+保留临时 checkout、Go cache 和构建现场，以便失败后恢复：
 
 ```bash
 bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --output ./results --keep-work-dir
 ```
 
-只在单次运行时保留 Kind 集群：
+失败日志最后会显示准确工作目录，例如：
+
+```text
+[vpg4-deploy] kept work directory: /tmp/volcano-v4-deploy.ABC123
+```
+
+使用同一个 Candidate 和运行选择恢复时，把这个已保存目录交给 `--work-dir`。Bundle 和结果目录会从恢复状态中读取，不必重复填写：
+
+```bash
+bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0
+```
+
+恢复会复用已经完成并验证过的 Candidate checkout、Go module cache、Ginkgo 和 Candidate 镜像构建；完整 E2E/Benchmark 中已经成功的独立 E2E 类型和 Benchmark round 会跳过。Bundle、Candidate、profile/mode、测试选择、轮数或集群前缀只要有一项不同，脚本就拒绝混用该工作目录。显式指定过 `--mode`、`--e2e-type`、`--benchmark-scenario`、`--benchmark-config`、`--benchmark-rounds`、`--pods`、`--scheduler-name` 或 `--cluster-prefix` 时，恢复命令必须重复相同参数。
+
+保留 Kind 集群时，脚本会自动同时保留工作目录：
 
 ```bash
 bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --output ./results --keep-cluster
 ```
+
+恢复这个集群时同时给出保存目录和 `--keep-cluster`：
+
+```bash
+bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0 --keep-cluster
+```
+
+脚本会核对本地 run identity、集群内 `vpg4-resume-state` ConfigMap、Kubernetes 版本、Candidate commit 和 Helm release 后才复用集群。E2E 会在原集群中从所选 E2E 类型的开头重新运行，不能从单个 Ginkgo spec 中间继续；Benchmark 会清理未完成工作负载，并从第一个没有成功标记的 round 继续。
+
+`--keep-cluster` 仍只允许一次执行中恰好有一个 E2E 类型或一个 Benchmark 场景；`FULL` 等多运行选择应使用 `--keep-work-dir` 恢复，脚本会跳过已经成功的运行，但不会同时保留多个集群。
+
+只有新脚本创建且包含 `.vpg4-state/run.env` 的工作目录可以恢复；此前旧版本仅由 `--keep-work-dir` 留下的诊断目录没有阶段身份，仍需新开一次运行。
 
 默认会删除本次脚本创建的临时目录和 Kind 集群，不会清理整机 Docker 数据。
 
