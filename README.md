@@ -94,6 +94,7 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.32.5-e2e-basic.tar.gz --volcan
   ├─ 在宿主机从公司 Go Proxy 下载完整 Go modules 和 Candidate 选择的 Ginkgo
   ├─ 将宿主 module cache 临时转换成 Docker 可读的 file proxy
   ├─ 使用 Candidate 自己的 Dockerfile、通过 file proxy 构建组件镜像
+  ├─ 从 Candidate Makefile 解析每个 E2E 目标的准确参数和前置产物
   ├─ 使用 Candidate 自己的 E2E/Benchmark 入口
   └─ 保存日志、测试产物、临时兼容补丁和 summary.txt
 ```
@@ -126,6 +127,7 @@ SHA256SUMS
 | `go.mod/go.sum` 增删 Go modules | 否 | Go modules 在内网下载 |
 | Ginkgo 版本变化 | 否 | 按 Candidate `go.mod` 在内网安装 |
 | 修改 `volcano-v4-deploy.sh` | 否 | 单独替换脚本 |
+| 修改 `E2E_FULL`/`BENCHMARK_FULL` 集合 | 是，仅重做对应 FULL 包 | 可运行集合写在 `bundle.meta` 中 |
 | Kubernetes/Kind/节点镜像变化 | 是 | 属于外网包内容 |
 | Candidate 要求不同 Go toolchain | 是 | Go toolchain 属于通用工具包 |
 | Candidate Dockerfile 新增基础镜像 | 是 | 内网构建不能自动拉公共镜像 |
@@ -150,7 +152,7 @@ bash volcano-v4-package.sh --list-profiles
 | `e2e-basic` | `SCHEDULINGBASE` | 第一次验证，依赖最少 |
 | `e2e:<TYPE>` | 指定 TYPE | 只准备一个 E2E 分支 |
 | `e2e:ALL` | 上游 `E2E_TYPE=ALL` | 保持上游 ALL 原意 |
-| `e2e-full` | `FULL` | 上游 ALL 加独立 E2E 分支 |
+| `e2e-full` | `FULL` | 逐个运行 Candidate 的全部已维护上游 E2E 目标 |
 | `benchmark-basic` | gang | 基础 Benchmark，不含 Monitoring |
 | `benchmark:gang` | gang | Gang Benchmark |
 | `benchmark:pod` | pod | Pod Benchmark |
@@ -167,7 +169,25 @@ SHARDINGCONTROLLER GANGEVICT
 SCHEDULERSHARDING_NONE SCHEDULERSHARDING_SOFT SCHEDULERSHARDING_HARD
 ```
 
-`FULL` 是 `config/profiles.tsv` 明确维护的多次运行集合，不等于上游一次 `E2E_TYPE=ALL`。
+`FULL` 是 `config/profiles.tsv` 明确维护的多次运行集合，不等于上游一次 `E2E_TYPE=ALL`。它逐个调用上游 Make 目标，使每个目标自己的 Feature Gate、Provisioner 设置和前置产物都生效。对于较早的 Candidate，`FULL` 中该版本尚未定义的独立 Make 目标会在预检阶段记录并跳过；显式选择一个 Candidate 不存在的 TYPE 则会直接报错。`e2e:ALL` 仍保留 Candidate 自己的一次性 `E2E_TYPE=ALL` 语义。
+
+### E2E 参数自动跟随 Candidate
+
+部署脚本不会把 `FEATURE_GATES`、`IGNORED_PROVISIONERS` 等参数按 Volcano 版本硬编码。Candidate checkout 完成后，脚本对每个选中的 TYPE 查找对应的上游 Make 目标，用 `make -n` 取得该目标实际调用 `hack/run-e2e-kind.sh` 时的环境赋值，并在创建 Kind 前写入 `candidate-e2e-contracts.txt`。
+
+例如同一个脚本会自动得到：
+
+```text
+v1.12.0 SCHEDULINGBASE -> E2E_TYPE=SCHEDULINGBASE
+v1.15.0 SCHEDULINGBASE -> E2E_TYPE=SCHEDULINGBASE, IGNORED_PROVISIONERS=kubernetes.io/no-provisioner
+v1.14.0 DRA            -> FEATURE_GATES=DynamicResourceAllocation=true
+v1.15.0 DRA            -> FEATURE_GATES=DynamicResourceAllocation=true,DRAConsumableCapacity=true
+v1.15.0 VCCTL          -> 先构建上游 vcctl 前置目标
+```
+
+每个独立 E2E 开始前都会先清空上一轮解析出的测试变量，再加载本轮契约，因此 DRA 或 SchedulingGates 的 Feature Gate 不会泄漏到后续测试。普通参数变化、参数新增或前置目标变化不要求重新制作外网包；只有上游改掉 Make 目标或 `hack/run-e2e-kind.sh` 的入口结构时，部署脚本才会在预检阶段 fail-closed，并需要增加一个小的兼容适配。
+
+这次修改后，已有 `e2e-basic` 或单 TYPE 包仍可直接复用，只需替换部署脚本。已经按旧配置生成的 `e2e-full`/`full` 包仍保留旧 `bundle.meta` 中的 `ALL` 集合；要使用新的“逐个上游目标”完整模式，需要把对应 FULL Profile 重新打包一次。该动作只是更新通用包的能力元数据和既有依赖集合，不会把包绑定到某个 Volcano 版本。
 
 从大包中只运行已覆盖的一部分时仍要指定 Candidate：
 
@@ -310,13 +330,13 @@ Candidate 新增构建基础镜像或测试运行镜像时，可以更新 `confi
 
 ## Kubernetes v1.32-v1.33 注意事项
 
-Volcano v1.15.0 的 Kind 配置包含 Kubernetes v1.34 才提供的 `DRAConsumableCapacity` 和 MutatingAdmissionPolicy beta API。对 v1.32-v1.33 的非 DRA E2E，部署脚本会在临时 checkout 中做最小兼容调整并把 diff 保存为 `candidate-environment.patch`。
+Volcano v1.15.0 的 Kind 配置包含 Kubernetes v1.34 才提供的 `DRAConsumableCapacity` 和 MutatingAdmissionPolicy beta API。对 v1.32-v1.33 的非 DRA E2E，部署脚本会在临时 checkout 中做最小兼容调整并把 diff 保存为 `candidate-environment.patch`。DRA 判断来自当前 Candidate 的 Make 契约和 Kind 配置，不再假定所有 Volcano 版本都使用 v1.15.0 的 Feature Gate。
 
-以下选择不会被降级模拟，而会直接拒绝，必须改用 Kubernetes v1.34+：
+当当前 Candidate 实际启用了 `DRAConsumableCapacity` 时，以下选择不会被降级模拟，而会直接拒绝，必须改用 Kubernetes v1.34+：
 
 - `--e2e-type DRA`；
 - 上游 `ALL`；
-- 包含上游 `ALL` 的 `e2e-full` 或 `full`。
+- 包含 DRA 独立目标的 `e2e-full` 或 `full`。
 
 ## 网络和服务器要求
 
@@ -380,7 +400,7 @@ gh release upload v2.0 文件... --repo siqiaawa/volcano-performance-guard-v4
 
 ## 结果、调试与清理
 
-结果目录包含准确 Candidate commit、工具/Go 环境、Bundle 和 Docker load 日志、Candidate build 日志、环境补丁、E2E artifacts 或 Benchmark results，以及最终 `summary.txt`。
+结果目录包含准确 Candidate commit、工具/Go 环境、Bundle 和 Docker load 日志、Candidate build 日志、`candidate-e2e-contracts.txt`、环境补丁、E2E artifacts 或 Benchmark results，以及最终 `summary.txt`。`candidate-e2e-contracts.txt` 会列出每轮的上游 Make 目标、Make 参数、非镜像前置目标和最终注入的环境变量。
 
 保留临时 checkout、Go cache 和构建现场，以便失败后恢复：
 
@@ -416,7 +436,7 @@ bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --outpu
 bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0 --keep-cluster
 ```
 
-脚本会核对本地 run identity、集群内 `vpg4-resume-state` ConfigMap、Kubernetes 版本、Candidate commit 和 Helm release 后才复用集群。E2E 会在原集群中从所选 E2E 类型的开头重新运行，不能从单个 Ginkgo spec 中间继续；Benchmark 会清理未完成工作负载，并从第一个没有成功标记的 round 继续。
+脚本会核对本地 run identity、集群内 `vpg4-resume-state` ConfigMap、Kubernetes 版本、Candidate commit 和 Helm release 后才复用集群。E2E 会在原集群中从所选 E2E 类型的开头重新运行，不能从单个 Ginkgo spec 中间继续；Benchmark 会清理未完成工作负载，并从第一个没有成功标记的 round 继续。保存集群不会重新安装 Volcano，因此首次切换到包含新 E2E 契约解析的部署脚本时，应新建一次集群；保存工作目录、Go cache 和 Candidate 镜像仍可继续复用。
 
 `--keep-cluster` 仍只允许一次执行中恰好有一个 E2E 类型或一个 Benchmark 场景；`FULL` 等多运行选择应使用 `--keep-work-dir` 恢复，脚本会跳过已经成功的运行，但不会同时保留多个集群。
 
@@ -432,4 +452,4 @@ bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref
 - 新独立 E2E：增加 `E2E_FULL` 或 Profile；
 - 新 Benchmark 配置：增加 `BENCHMARK_FULL`。
 
-配置文件只是数据列表，不执行 Shell 代码。只有 Volcano 改变官方 E2E/Benchmark 入口、组件 Dockerfile 结构或 Bundle 格式时，才需要修改脚本。
+配置文件只是数据列表，不执行 Shell 代码。Volcano 仅改变 E2E 目标的环境参数或简单前置目标时不需要维护版本表；部署脚本会从 Candidate Makefile 自动取得。只有 Volcano 改变官方 E2E/Benchmark 入口结构、组件 Dockerfile 结构或 Bundle 格式时，才需要修改脚本。

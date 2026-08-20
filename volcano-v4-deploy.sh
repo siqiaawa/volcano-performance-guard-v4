@@ -607,6 +607,197 @@ if [[ "$MODE" != benchmark ]]; then
   ginkgo version | tee "$OUTPUT_DIR/ginkgo-version.log"
 fi
 
+# Treat each upstream E2E Make target as the Candidate's execution contract.
+# This follows per-release feature gates, ignored provisioners, sharding modes
+# and non-image prerequisites without maintaining a Volcano version table.
+E2E_CONTRACT_DIR="$WORK_DIR/e2e-contracts"
+E2E_CONTRACT_REPORT="$OUTPUT_DIR/candidate-e2e-contracts.txt"
+E2E_CONTRACT_KEYS=(E2E_TYPE FEATURE_GATES IGNORED_PROVISIONERS SHARDING_MODE DRA_GINKGO_FOCUS)
+RESOLVED_E2E_TARGET=""; RESOLVED_E2E_ERROR=""; RESOLVED_E2E_MAKE_ARGS=()
+
+e2e_contract_path() {
+  [[ "$1" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 1
+  printf '%s/%s.tsv\n' "$E2E_CONTRACT_DIR" "${1,,}"
+}
+
+e2e_make_target_for_type() {
+  local type="$1" suffix
+  RESOLVED_E2E_MAKE_ARGS=()
+  case "$type" in
+    ALL) RESOLVED_E2E_TARGET=e2e ;;
+    AGENTSCHEDULER) RESOLVED_E2E_TARGET=e2e-test-agentscheduler ;;
+    AGENTSCHEDULER_NONE|AGENTSCHEDULER_SOFT|AGENTSCHEDULER_HARD)
+      RESOLVED_E2E_TARGET=e2e-test-agentscheduler
+      suffix="${type#AGENTSCHEDULER_}"; RESOLVED_E2E_MAKE_ARGS+=("SHARDING_MODE=${suffix,,}")
+      ;;
+    SCHEDULERSHARDING) RESOLVED_E2E_TARGET=e2e-test-schedulersharding ;;
+    SCHEDULERSHARDING_NONE|SCHEDULERSHARDING_SOFT|SCHEDULERSHARDING_HARD)
+      RESOLVED_E2E_TARGET=e2e-test-schedulersharding
+      suffix="${type#SCHEDULERSHARDING_}"; RESOLVED_E2E_MAKE_ARGS+=("SHARDING_MODE=${suffix,,}")
+      ;;
+    *)
+      suffix="$(printf '%s' "$type" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+      RESOLVED_E2E_TARGET="e2e-test-$suffix"
+      ;;
+  esac
+}
+
+find_candidate_make_target() {
+  awk -v target="$1" '
+    /^\t/ || /^[[:space:]]*#/ {next}
+    {
+      line=$0; sub(/^[[:space:]]+/, "", line)
+      colon=index(line, ":"); if (!colon) next
+      count=split(substr(line, 1, colon-1), names, /[[:space:]]+/)
+      for (i=1; i<=count; i++) if (names[i]==target) {print line; exit}
+    }
+  ' "$CHECKOUT/Makefile"
+}
+
+add_e2e_contract_key() {
+  local key="$1" existing
+  for existing in "${E2E_CONTRACT_KEYS[@]}"; do [[ "$existing" != "$key" ]] || return 0; done
+  E2E_CONTRACT_KEYS+=("$key")
+}
+
+resolve_candidate_e2e_contract() {
+  local type="$1" target_line rhs item dry_run runner prefix capture assignment key value file found=false index
+  local -a runner_lines=() prerequisites=() keys=() values=()
+  RESOLVED_E2E_ERROR=""
+  [[ "$type" =~ ^[A-Z][A-Z0-9_]*$ ]] || { RESOLVED_E2E_ERROR="invalid E2E type: $type"; return 11; }
+  e2e_make_target_for_type "$type"
+  target_line="$(find_candidate_make_target "$RESOLVED_E2E_TARGET")"
+  if [[ -z "$target_line" ]]; then
+    RESOLVED_E2E_ERROR="Candidate has no upstream Make target $RESOLVED_E2E_TARGET for E2E $type"
+    return 10
+  fi
+  rhs="${target_line#*:}"; rhs="${rhs%%#*}"
+  read -r -a prerequisites <<< "$rhs"
+  dry_run="$WORK_DIR/e2e-contract-${type,,}.make-n"
+  if ! (cd "$CHECKOUT"; make --no-print-directory -n "${RESOLVED_E2E_MAKE_ARGS[@]}" "$RESOLVED_E2E_TARGET") > "$dry_run" 2>&1; then
+    cp -- "$dry_run" "$OUTPUT_DIR/candidate-e2e-contract-${type,,}-error.txt"
+    RESOLVED_E2E_ERROR="cannot render $RESOLVED_E2E_TARGET; see candidate-e2e-contract-${type,,}-error.txt"
+    return 11
+  fi
+  mapfile -t runner_lines < <(grep -E '(^|[[:space:]])(bash[[:space:]]+)?(\./)?hack/run-e2e-kind\.sh[[:space:]]*$' "$dry_run" || true)
+  rm -f -- "$dry_run"
+  if [[ ${#runner_lines[@]} -ne 1 ]]; then
+    RESOLVED_E2E_ERROR="expected one upstream run-e2e-kind.sh recipe for $RESOLVED_E2E_TARGET, found ${#runner_lines[@]}"
+    return 11
+  fi
+  runner="${runner_lines[0]}"
+  runner="${runner#"${runner%%[![:space:]]*}"}"; runner="${runner%"${runner##*[![:space:]]}"}"
+  case "$runner" in
+    './hack/run-e2e-kind.sh'|'hack/run-e2e-kind.sh'|'bash ./hack/run-e2e-kind.sh'|'bash hack/run-e2e-kind.sh') prefix="" ;;
+    *' bash ./hack/run-e2e-kind.sh') prefix="${runner% bash ./hack/run-e2e-kind.sh}" ;;
+    *' bash hack/run-e2e-kind.sh') prefix="${runner% bash hack/run-e2e-kind.sh}" ;;
+    *' ./hack/run-e2e-kind.sh') prefix="${runner% ./hack/run-e2e-kind.sh}" ;;
+    *' hack/run-e2e-kind.sh') prefix="${runner% hack/run-e2e-kind.sh}" ;;
+    *) RESOLVED_E2E_ERROR="unsupported upstream E2E recipe: $runner"; return 11 ;;
+  esac
+  capture="$WORK_DIR/e2e-contract-${type,,}.env"
+  # The Candidate is built and executed later. Evaluate only its leading
+  # assignments in an empty environment so host credentials cannot leak.
+  if ! (cd "$CHECKOUT"; env -i PATH=/usr/bin:/bin bash -c "${prefix:+$prefix }env -0") > "$capture"; then
+    RESOLVED_E2E_ERROR="cannot evaluate upstream E2E assignments for $RESOLVED_E2E_TARGET"
+    return 11
+  fi
+  while IFS= read -r -d '' assignment; do
+    key="${assignment%%=*}"; value="${assignment#*=}"
+    case "$key" in PWD|SHLVL|PATH|_) continue ;; esac
+    if [[ ! "$key" =~ ^[A-Z_][A-Z0-9_]*$ || "$value" == *$'\t'* || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+      RESOLVED_E2E_ERROR="invalid upstream E2E environment assignment: $key"
+      return 11
+    fi
+    case "$key" in
+      VPG_*|CLUSTER_NAME|CLEANUP_CLUSTER|KIND_OPT|IMAGE_PREFIX|TAG|OS|ARTIFACTS_PATH|KUBECONFIG|SKIP_CLUSTER_SETUP|HOME|GOROOT|GOPATH|GOMODCACHE|GOCACHE|GOPROXY|GONOSUMDB|GOSUMDB|GOTOOLCHAIN)
+        RESOLVED_E2E_ERROR="upstream E2E contract attempts to override managed variable $key"; return 11 ;;
+    esac
+    keys+=("$key"); values+=("$value")
+  done < "$capture"
+  rm -f -- "$capture"
+  for ((index=0; index<${#keys[@]}; index++)); do
+    if [[ "${keys[$index]}" == E2E_TYPE ]]; then
+      found=true
+      [[ "${values[$index]}" == "$type" ]] || {
+        RESOLVED_E2E_ERROR="$RESOLVED_E2E_TARGET resolves E2E_TYPE=${values[$index]}, expected $type"; return 11; }
+    fi
+  done
+  if [[ "$found" != true ]]; then keys+=(E2E_TYPE); values+=("$type"); fi
+  file="$(e2e_contract_path "$type")" || { RESOLVED_E2E_ERROR="invalid E2E contract path"; return 11; }
+  : > "$file"; printf 'TARGET\t%s\n' "$RESOLVED_E2E_TARGET" >> "$file"
+  for item in "${RESOLVED_E2E_MAKE_ARGS[@]}"; do printf 'MAKE_ARG\t%s\n' "$item" >> "$file"; done
+  for item in "${prerequisites[@]}"; do
+    case "$item" in ''|images|'|') continue ;; esac
+    [[ "$item" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
+      RESOLVED_E2E_ERROR="unsupported prerequisite '$item' on $RESOLVED_E2E_TARGET"; return 11; }
+    printf 'PREREQ\t%s\n' "$item" >> "$file"
+  done
+  for ((index=0; index<${#keys[@]}; index++)); do
+    printf 'ENV\t%s\t%s\n' "${keys[$index]}" "${values[$index]}" >> "$file"
+    add_e2e_contract_key "${keys[$index]}"
+  done
+}
+
+prepare_candidate_e2e_contracts() {
+  local type status file record key value
+  local -a runnable=()
+  mkdir -p "$E2E_CONTRACT_DIR"; : > "$E2E_CONTRACT_REPORT"
+  for type in "${E2E_RUNS[@]}"; do
+    if resolve_candidate_e2e_contract "$type"; then
+      :
+    else
+      status=$?
+      if [[ "$status" -eq 10 && "$E2E_SELECTION" == FULL ]]; then
+        log "Candidate does not define E2E $type; skipping this profile entry"
+        printf 'type=%s\nstatus=not-defined-by-candidate\nreason=%s\n\n' "$type" "$RESOLVED_E2E_ERROR" >> "$E2E_CONTRACT_REPORT"
+        continue
+      fi
+      die "$RESOLVED_E2E_ERROR"
+    fi
+    runnable+=("$type"); file="$(e2e_contract_path "$type")"
+    printf 'type=%s\n' "$type" >> "$E2E_CONTRACT_REPORT"
+    while IFS=$'\t' read -r record key value; do
+      case "$record" in
+        TARGET) printf 'target=%s\n' "$key" ;;
+        MAKE_ARG) printf 'make_arg=%s\n' "$key" ;;
+        PREREQ) printf 'prerequisite=%s\n' "$key" ;;
+        ENV) printf 'env.%s=%s\n' "$key" "$value" ;;
+      esac
+    done < "$file" >> "$E2E_CONTRACT_REPORT"
+    printf '\n' >> "$E2E_CONTRACT_REPORT"
+    log "resolved upstream E2E contract: $type -> $RESOLVED_E2E_TARGET"
+  done
+  E2E_RUNS=("${runnable[@]}")
+  [[ ${#E2E_RUNS[@]} -gt 0 ]] || die "Candidate exposes none of the E2E entries selected by profile $PROFILE"
+}
+
+e2e_contract_value() {
+  local file
+  file="$(e2e_contract_path "$1")" || return 1
+  awk -F '\t' -v key="$2" '$1=="ENV" && $2==key {print $3; exit}' "$file"
+}
+
+load_e2e_contract_environment() {
+  local file record key value
+  file="$(e2e_contract_path "$1")" || die "invalid E2E contract path: $1"
+  for key in "${E2E_CONTRACT_KEYS[@]}"; do unset "$key" || true; done
+  while IFS=$'\t' read -r record key value; do
+    [[ "$record" != ENV ]] || export "$key=$value"
+  done < "$file"
+}
+
+build_e2e_contract_prerequisites() {
+  local file record value extra
+  local -a make_args=() prerequisites=()
+  file="$(e2e_contract_path "$1")" || die "invalid E2E contract path: $1"
+  while IFS=$'\t' read -r record value extra; do
+    case "$record" in MAKE_ARG) make_args+=("$value") ;; PREREQ) prerequisites+=("$value") ;; esac
+  done < "$file"
+  [[ ${#prerequisites[@]} -gt 0 ]] || return 0
+  log "building upstream E2E prerequisites for $1: ${prerequisites[*]}"
+  (cd "$CHECKOUT"; make "${make_args[@]}" "${prerequisites[@]}") 2>&1 | tee -a "$2/prerequisites.log"
+}
 E2E_SELECTION="${E2E_TYPE_OVERRIDE:-$DEFAULT_RUN}"
 BENCHMARK_SELECTION="${BENCHMARK_SCENARIO_OVERRIDE:-$DEFAULT_RUN}"
 if [[ "$MODE" == both ]]; then
@@ -622,10 +813,18 @@ if [[ "$MODE" != benchmark ]]; then
   fi
 else E2E_RUNS=(); fi
 
+if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then prepare_candidate_e2e_contracts; fi
+
 if (( K8S_MINOR < 34 && ${#E2E_RUNS[@]} > 0 )); then
   for value in "${E2E_RUNS[@]}"; do
     case "$value" in
-      ALL|DRA) die "E2E $value requires Kubernetes v1.34+ because Candidate enables DRAConsumableCapacity" ;;
+      ALL|DRA)
+        feature_gates="$(e2e_contract_value "$value" FEATURE_GATES || true)"
+        if [[ "$feature_gates" == *DRAConsumableCapacity=true* ]] || \
+          grep -q 'DRAConsumableCapacity' "$CHECKOUT/hack/e2e-kind-config.yaml"; then
+          die "Candidate E2E $value requires Kubernetes v1.34+ because its upstream contract enables DRAConsumableCapacity"
+        fi
+        ;;
     esac
   done
 fi
@@ -1078,6 +1277,7 @@ run_e2e_one() {
   purpose="e2e-$number-${type,,}"; kubeconfig="$WORK_DIR/kubeconfig-e2e-$number"
   runtime_archive="$WORK_DIR/runtime-e2e-$number.tar"
   artifacts="$OUTPUT_DIR/e2e-$number-$type"; mkdir -p "$artifacts"
+  build_e2e_contract_prerequisites "$type" "$artifacts"
   write_runtime_images "e2e-$type" "$runtime"
   mapfile -t runtime_images < "$runtime"
   [[ ${#runtime_images[@]} -gt 0 ]] || die "runtime image list is empty: $runtime"
@@ -1097,10 +1297,11 @@ run_e2e_one() {
   fi
   (
     cd "$CHECKOUT"
+    load_e2e_contract_environment "$type"
     if [[ "$reuse_cluster" == true ]]; then
       export KUBECONFIG="$kubeconfig" SKIP_CLUSTER_SETUP=1
     fi
-    E2E_TYPE="$type" CLUSTER_NAME="$name" CLEANUP_CLUSTER="$cleanup_value" \
+    CLUSTER_NAME="$name" CLEANUP_CLUSTER="$cleanup_value" \
       KIND_OPT="--image $NODE_IMAGE --config $CHECKOUT/hack/e2e-kind-config.yaml" \
       IMAGE_PREFIX=volcanosh TAG="$CANDIDATE_COMMIT" OS=linux ARTIFACTS_PATH="$artifacts" \
       VPG_RUNTIME_IMAGE_ARCHIVE="$runtime_archive" VPG_KWOK_MANIFEST="$(resource_for_key kwok-manifest)" \

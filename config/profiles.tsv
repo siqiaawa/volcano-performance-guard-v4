@@ -72,10 +72,18 @@ RESOURCE|e2e-common|kwok-stage|https://github.com/kubernetes-sigs/kwok/releases/
 RESOURCE|benchmark-common|kwok-manifest|https://github.com/kubernetes-sigs/kwok/releases/download/${KWOK_VERSION}/kwok.yaml|kwok.yaml
 RESOURCE|benchmark-common|kwok-stage|https://github.com/kubernetes-sigs/kwok/releases/download/${KWOK_VERSION}/stage-fast.yaml|stage-fast.yaml
 
-# E2E_FULL|TYPE. FULL runs every entry separately; upstream ALL remains unchanged.
-E2E_FULL|ALL
+# E2E_FULL|TYPE. FULL runs each upstream Make target separately so every
+# target-specific feature gate, provisioner setting and prerequisite applies.
+E2E_FULL|SCHEDULINGBASE
+E2E_FULL|SCHEDULINGACTION
 E2E_FULL|SCHEDULINGGATES
+E2E_FULL|JOBP
+E2E_FULL|JOBSEQ
+E2E_FULL|VCCTL
 E2E_FULL|STRESS
+E2E_FULL|CRONJOB
+E2E_FULL|DRA
+E2E_FULL|HYPERNODE
 E2E_FULL|ADMISSION_POLICY
 E2E_FULL|ADMISSION_WEBHOOK
 E2E_FULL|AGENTSCHEDULER_NONE
