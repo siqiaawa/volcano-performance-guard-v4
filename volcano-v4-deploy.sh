@@ -440,7 +440,9 @@ for ((index=0; index<${#RESOURCE_KEYS[@]}; index++)); do
   [[ "$(sha256sum "$RESOURCES_DIR/$path"|awk '{print $1}')" == "$expected" ]] || die "resource checksum mismatch: $key"
 done
 
-chmod 0755 "$BIN_DIR/kind" "$BIN_DIR/kubectl" "$BIN_DIR/helm" "$BIN_DIR/jq" "$TOOLS_DIR/go/bin/go"
+[[ -d "$TOOLS_DIR/go/bin" && -d "$TOOLS_DIR/go/pkg/tool/linux_amd64" ]] || die "packaged Go toolchain is incomplete"
+chmod 0755 "$BIN_DIR/kind" "$BIN_DIR/kubectl" "$BIN_DIR/helm" "$BIN_DIR/jq" \
+  "$TOOLS_DIR/go/bin/"* "$TOOLS_DIR/go/pkg/tool/linux_amd64/"*
 export GOROOT="$TOOLS_DIR/go" GOTOOLCHAIN=local GOPATH="$WORK_DIR/gopath"
 export GOMODCACHE="$WORK_DIR/go-mod-cache" GOCACHE="$WORK_DIR/go-build-cache"
 export GOPROXY="$GOPROXY_VALUE" GONOSUMDB="$GONOSUMDB_VALUE" GOSUMDB="$GOSUMDB_VALUE"
@@ -455,6 +457,7 @@ helm version --short | grep -F "$HELM_VERSION" >/dev/null || die "Helm version m
 [[ "$(jq --version)" == "$JQ_VERSION" ]] || die "jq version mismatch"
 go version | tee "$OUTPUT_DIR/go-version.log"
 go version | grep -F " $GO_TOOLCHAIN " >/dev/null || die "Go version mismatch"
+go tool compile -V=full | tee "$OUTPUT_DIR/go-compile-version.log"
 go env GOPROXY GONOSUMDB GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
 
 # Classic Docker stores report the image config digest as .Id. Docker 29 with

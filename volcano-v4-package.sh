@@ -279,6 +279,8 @@ fi
 mv "$go_archive.part" "$go_archive"
 [[ "$(sha256sum "$go_archive" | awk '{print $1}')" == "$GO_SHA256" ]] || die "Go checksum mismatch"
 tar -xzf "$go_archive" -C "$TOOLS_STAGE"
+[[ -d "$TOOLS_STAGE/go/bin" && -d "$TOOLS_STAGE/go/pkg/tool/linux_amd64" ]] || die "invalid Go toolchain archive"
+chmod 0755 "$TOOLS_STAGE/go/bin/"* "$TOOLS_STAGE/go/pkg/tool/linux_amd64/"*
 tar -C "$TOOLS_STAGE" -czf "$STAGE/tools.tar.gz" .
 
 log "downloading ${#RESOURCE_KEYS[@]} small resources"
