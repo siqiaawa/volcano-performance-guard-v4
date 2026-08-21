@@ -1173,8 +1173,10 @@ write_runtime_images() {
     case "$key" in
       kind-node|candidate-*) ;;
       extra-*) printf '%s\n' "$ref" >> "$output" ;;
-      busybox-*|nginx-*|k8s-e2e-*|kwok)
+      busybox-*|nginx-*|k8s-e2e-*)
         [[ "$purpose" == e2e* ]] && printf '%s\n' "$ref" >> "$output" ;;
+      kwok)
+        [[ "$purpose" == e2e* || "$purpose" == benchmark* ]] && printf '%s\n' "$ref" >> "$output" ;;
       mpi|tensorflow|pytorch|ray*)
         [[ "$purpose" == e2e-ALL || "$purpose" == e2e-JOBSEQ ]] && printf '%s\n' "$ref" >> "$output" ;;
       dra-hostpath*)
