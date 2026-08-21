@@ -115,6 +115,52 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --vo
 
 使用内部 Git 镜像时，在上述命令中增加 `--volcano-repo https://内部Git服务/volcano.git`。
 
+## 调试方法
+
+结果目录包含准确 Candidate commit、工具/Go 环境、Bundle 和 Docker load 日志、Candidate build 日志、`candidate-e2e-contracts.txt`、环境补丁、E2E artifacts 或 Benchmark results，以及最终 `summary.txt`。`candidate-e2e-contracts.txt` 会列出每轮的上游 Make 目标、Make 参数、非镜像前置目标和最终注入的环境变量。
+
+保留临时 checkout、Go cache 和构建现场，以便失败后恢复：
+
+```bash
+bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --output ./results --keep-work-dir
+```
+
+失败日志最后会显示准确工作目录，例如：
+
+```text
+[vpg4-deploy] kept work directory: /tmp/volcano-v4-deploy.ABC123
+```
+
+使用同一个 Candidate 和运行选择恢复时，把这个已保存目录交给 `--work-dir`。Bundle 和结果目录会从恢复状态中读取，不必重复填写：
+
+```bash
+bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0
+```
+
+恢复会复用已经完成并验证过的 Candidate checkout、Go module cache、Ginkgo 和 Candidate 镜像构建；完整 E2E/Benchmark 中已经成功的独立 E2E 类型和 Benchmark round 会跳过。Bundle、Candidate、profile/mode、测试选择、轮数或集群前缀只要有一项不同，脚本就拒绝混用该工作目录。显式指定过 `--mode`、`--e2e-type`、`--benchmark-scenario`、`--benchmark-config`、`--benchmark-rounds`、`--pods`、`--scheduler-name` 或 `--cluster-prefix` 时，恢复命令必须重复相同参数。
+
+Candidate 身份以仓库地址和精确 commit 为准。`go mod download all` 可能补写 `go.sum`，离线构建适配也会修改 Dockerfile；这些未提交的工作树变化不会阻断后续构建，脚本会把构建补丁前的状态保存到结果目录供追溯。
+
+保留 Kind 集群时，脚本会自动同时保留工作目录：
+
+```bash
+bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --output ./results --keep-cluster
+```
+
+恢复这个集群时同时给出保存目录和 `--keep-cluster`：
+
+```bash
+bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0 --keep-cluster
+```
+
+脚本会核对本地 run identity、集群内 `vpg4-resume-state` ConfigMap、Kubernetes 版本、Candidate commit 和 Helm release 后才复用集群。E2E 会在原集群中从所选 E2E 类型的开头重新运行，不能从单个 Ginkgo spec 中间继续；Benchmark 会清理未完成工作负载，并从第一个没有成功标记的 round 继续。保存集群不会重新安装 Volcano，因此首次切换到包含新 E2E 契约解析的部署脚本时，应新建一次集群；保存工作目录、Go cache 和 Candidate 镜像仍可继续复用。
+
+`--keep-cluster` 仍只允许一次执行中恰好有一个 E2E 类型或一个 Benchmark 场景；`FULL` 等多运行选择应使用 `--keep-work-dir` 恢复，脚本会跳过已经成功的运行，但不会同时保留多个集群。
+
+只有新脚本创建且包含 `.vpg4-state/run.env` 的工作目录可以恢复；此前旧版本仅由 `--keep-work-dir` 留下的诊断目录没有阶段身份，仍需新开一次运行。
+
+默认会删除本次脚本创建的临时目录和 Kind 集群，不会清理整机 Docker 数据。
+
 
 ## 外网打包脚本说明
 
@@ -126,11 +172,11 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --vo
 bash volcano-v4-package.sh --k8s-version vX.Y.Z --profile PROFILE --output DIR
 ```
 
-| 参数 | 含义 |
-| --- | --- |
-| `--k8s-version vX.Y.Z` | Kind 集群使用的精确 Kubernetes 版本，必须包含 patch 版本 |
-| `--profile PROFILE` | 从 `config/profiles.tsv` 选择要打进包里的测试能力和依赖集合 |
-| `--output DIR` | 外网产物目录；目录可以存在，但同名目标包不能已经存在 |
+| 参数                   | 含义                                                        |
+| ---------------------- | ----------------------------------------------------------- |
+| `--k8s-version vX.Y.Z` | Kind 集群使用的精确 Kubernetes 版本，必须包含 patch 版本    |
+| `--profile PROFILE`    | 从 `config/profiles.tsv` 选择要打进包里的测试能力和依赖集合 |
+| `--output DIR`         | 外网产物目录；目录可以存在，但同名目标包不能已经存在        |
 
 推荐的完整包命令是：
 
@@ -158,17 +204,17 @@ bash volcano-v4-package.sh --list-profiles
 
 当前可用 Profile 以 `--list-profiles` 的实际输出为准；常用选择如下：
 
-| Profile | 默认运行 | 外网包用途 |
-| --- | --- | --- |
-| `e2e-basic` | `SCHEDULINGBASE` | 最小 E2E 包，适合第一次验证 |
-| `e2e:<TYPE>` | 指定 TYPE | 只包含 `--list-profiles` 已列出的对应 E2E 分支所需通用依赖 |
-| `e2e:ALL` | 上游 `E2E_TYPE=ALL` | 保留 Candidate 上游一次运行 ALL 的语义 |
-| `e2e-full` | `FULL` | 包含全部已维护独立 E2E 的依赖和能力元数据 |
-| `benchmark-basic` | gang | 基础 Gang Benchmark，不含 Monitoring |
-| `benchmark:gang` | gang | Gang Benchmark |
-| `benchmark:pod` | pod | Pod Benchmark |
-| `benchmark-full` | `FULL` | Gang、Pod、网络拓扑和 Monitoring |
-| `full` | `FULL` | 完整 E2E 与完整 Benchmark，推荐长期复用 |
+| Profile           | 默认运行            | 外网包用途                                                 |
+| ----------------- | ------------------- | ---------------------------------------------------------- |
+| `e2e-basic`       | `SCHEDULINGBASE`    | 最小 E2E 包，适合第一次验证                                |
+| `e2e:<TYPE>`      | 指定 TYPE           | 只包含 `--list-profiles` 已列出的对应 E2E 分支所需通用依赖 |
+| `e2e:ALL`         | 上游 `E2E_TYPE=ALL` | 保留 Candidate 上游一次运行 ALL 的语义                     |
+| `e2e-full`        | `FULL`              | 包含全部已维护独立 E2E 的依赖和能力元数据                  |
+| `benchmark-basic` | gang                | 基础 Gang Benchmark，不含 Monitoring                       |
+| `benchmark:gang`  | gang                | Gang Benchmark                                             |
+| `benchmark:pod`   | pod                 | Pod Benchmark                                              |
+| `benchmark-full`  | `FULL`              | Gang、Pod、网络拓扑和 Monitoring                           |
+| `full`            | `FULL`              | 完整 E2E 与完整 Benchmark，推荐长期复用                    |
 
 `e2e-full` 和 `full` 当前维护的独立 E2E TYPE 是：
 
@@ -196,14 +242,14 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --list-images
 
 ### 覆盖版本、镜像和配置
 
-| 参数 | 使用场景 |
-| --- | --- |
-| `--config-dir DIR` | 使用另一套同时包含 `versions.tsv` 和 `profiles.tsv` 的配置目录 |
+| 参数                                        | 使用场景                                                                     |
+| ------------------------------------------- | ---------------------------------------------------------------------------- |
+| `--config-dir DIR`                          | 使用另一套同时包含 `versions.tsv` 和 `profiles.tsv` 的配置目录               |
 | `--kind-version VERSION --node-image IMAGE` | 使用 `config/versions.tsv` 尚未维护的 Kubernetes/Kind 组合；两项必须一起指定 |
-| `--helm-version VERSION` | 临时覆盖 `versions.tsv` 中的 Helm 版本 |
-| `--go-version goX.Y.Z --go-sha256 SHA256` | 临时覆盖内网宿主 Go toolchain；版本与官方压缩包 SHA256 必须一起指定 |
-| `--set-image KEY=IMAGE` | 从外网可访问的镜像或镜像代理拉取某个已选 Key，但仍按配置中的内网引用保存 |
-| `--add-image IMAGE` | 向本次包临时增加一个配置中没有的精确基础镜像或测试运行镜像 |
+| `--helm-version VERSION`                    | 临时覆盖 `versions.tsv` 中的 Helm 版本                                       |
+| `--go-version goX.Y.Z --go-sha256 SHA256`   | 临时覆盖内网宿主 Go toolchain；版本与官方压缩包 SHA256 必须一起指定          |
+| `--set-image KEY=IMAGE`                     | 从外网可访问的镜像或镜像代理拉取某个已选 Key，但仍按配置中的内网引用保存     |
+| `--add-image IMAGE`                         | 向本次包临时增加一个配置中没有的精确基础镜像或测试运行镜像                   |
 
 未列出的 Kubernetes 版本必须使用准确且最好带 digest 的节点镜像，例如：
 
@@ -268,18 +314,18 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 
 ### 什么时候必须重新制作外网包
 
-| 变化 | 是否重打包 | 原因 |
-| --- | --- | --- |
-| 切换 Volcano tag、branch 或 commit | 否 | Candidate 在内网选择 |
-| 修改普通 Volcano 源码 | 否 | 源码在内网拉取和构建 |
-| `go.mod/go.sum` 增删 Go modules | 否 | Go modules 在内网从批准的 Go Proxy 下载 |
-| Ginkgo 版本变化 | 否 | 内网按 Candidate `go.mod` 安装 |
-| 只修改 `volcano-v4-deploy.sh` | 否 | 部署脚本不在外网包内 |
-| 修改 `E2E_FULL`、`BENCHMARK_FULL` 或 Profile 依赖组 | 是 | 能力元数据和依赖集合写在 `bundle.meta` 中 |
-| Kubernetes、Kind、节点镜像或通用工具变化 | 是 | 它们属于包内容 |
-| Candidate Dockerfile 新增基础镜像 | 是 | 内网构建不能自动拉取公共镜像 |
-| E2E/Benchmark 新增运行镜像或固定资源 | 是 | 必须预装进内网 Docker |
-| Candidate 要求比包内更新的 Go toolchain | 是 | 宿主 Go toolchain 属于 `tools.tar.gz` |
+| 变化                                                | 是否重打包 | 原因                                      |
+| --------------------------------------------------- | ---------- | ----------------------------------------- |
+| 切换 Volcano tag、branch 或 commit                  | 否         | Candidate 在内网选择                      |
+| 修改普通 Volcano 源码                               | 否         | 源码在内网拉取和构建                      |
+| `go.mod/go.sum` 增删 Go modules                     | 否         | Go modules 在内网从批准的 Go Proxy 下载   |
+| Ginkgo 版本变化                                     | 否         | 内网按 Candidate `go.mod` 安装            |
+| 只修改 `volcano-v4-deploy.sh`                       | 否         | 部署脚本不在外网包内                      |
+| 修改 `E2E_FULL`、`BENCHMARK_FULL` 或 Profile 依赖组 | 是         | 能力元数据和依赖集合写在 `bundle.meta` 中 |
+| Kubernetes、Kind、节点镜像或通用工具变化            | 是         | 它们属于包内容                            |
+| Candidate Dockerfile 新增基础镜像                   | 是         | 内网构建不能自动拉取公共镜像              |
+| E2E/Benchmark 新增运行镜像或固定资源                | 是         | 必须预装进内网 Docker                     |
+| Candidate 要求比包内更新的 Go toolchain             | 是         | 宿主 Go toolchain 属于 `tools.tar.gz`     |
 
 打包脚本遇到未知 Profile、未配置的 Kubernetes/Kind 组合、缺失镜像 Key、错误平台或校验不一致时会直接停止，不会静默改用其他版本。
 
@@ -410,62 +456,6 @@ GOPROXY=file:///tmp/vpg4-goproxy GONOSUMDB='*' GOSUMDB=off go mod download
 因此 Docker builder 不再访问公司 HTTPS Go Proxy，也不需要继承宿主机的公司 CA。宿主预下载日志保存在 `go-mod-download.log`，临时 file proxy 的校验值保存在 `inner-go-modules.sha256`；临时归档默认随工作目录清理，不进入外网包和最终 Candidate 镜像。
 
 Webhook 离线运行时使用包内已有的 Go builder 基础镜像代替会执行 `apk add` 和下载 kubectl 的 Alpine 阶段；脚本会显式把最终阶段的 `WORKDIR` 设为 `/`，保证 Helm admission-init 的 `./gen-admission-secret.sh` 与上游运行方式一致。
-
-### 旧版 Docker 的 `image save` 兼容
-
-较老的 Docker 不支持：
-
-```text
-docker image save --platform=linux/amd64
-```
-
-部署脚本先验证每个待保存镜像确实是 `linux/amd64`。如果 `docker image save --help` 支持 `--platform` 就使用它；否则自动退回普通 `docker image save`。因此不会再因为 `unknown flag: --platform` 中断，同时仍保持平台校验。
-
-## 结果、调试与清理
-
-结果目录包含准确 Candidate commit、工具/Go 环境、Bundle 和 Docker load 日志、Candidate build 日志、`candidate-e2e-contracts.txt`、环境补丁、E2E artifacts 或 Benchmark results，以及最终 `summary.txt`。`candidate-e2e-contracts.txt` 会列出每轮的上游 Make 目标、Make 参数、非镜像前置目标和最终注入的环境变量。
-
-保留临时 checkout、Go cache 和构建现场，以便失败后恢复：
-
-```bash
-bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --output ./results --keep-work-dir
-```
-
-失败日志最后会显示准确工作目录，例如：
-
-```text
-[vpg4-deploy] kept work directory: /tmp/volcano-v4-deploy.ABC123
-```
-
-使用同一个 Candidate 和运行选择恢复时，把这个已保存目录交给 `--work-dir`。Bundle 和结果目录会从恢复状态中读取，不必重复填写：
-
-```bash
-bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0
-```
-
-恢复会复用已经完成并验证过的 Candidate checkout、Go module cache、Ginkgo 和 Candidate 镜像构建；完整 E2E/Benchmark 中已经成功的独立 E2E 类型和 Benchmark round 会跳过。Bundle、Candidate、profile/mode、测试选择、轮数或集群前缀只要有一项不同，脚本就拒绝混用该工作目录。显式指定过 `--mode`、`--e2e-type`、`--benchmark-scenario`、`--benchmark-config`、`--benchmark-rounds`、`--pods`、`--scheduler-name` 或 `--cluster-prefix` 时，恢复命令必须重复相同参数。
-
-Candidate 身份以仓库地址和精确 commit 为准。`go mod download all` 可能补写 `go.sum`，离线构建适配也会修改 Dockerfile；这些未提交的工作树变化不会阻断后续构建，脚本会把构建补丁前的状态保存到结果目录供追溯。
-
-保留 Kind 集群时，脚本会自动同时保留工作目录：
-
-```bash
-bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --output ./results --keep-cluster
-```
-
-恢复这个集群时同时给出保存目录和 `--keep-cluster`：
-
-```bash
-bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0 --keep-cluster
-```
-
-脚本会核对本地 run identity、集群内 `vpg4-resume-state` ConfigMap、Kubernetes 版本、Candidate commit 和 Helm release 后才复用集群。E2E 会在原集群中从所选 E2E 类型的开头重新运行，不能从单个 Ginkgo spec 中间继续；Benchmark 会清理未完成工作负载，并从第一个没有成功标记的 round 继续。保存集群不会重新安装 Volcano，因此首次切换到包含新 E2E 契约解析的部署脚本时，应新建一次集群；保存工作目录、Go cache 和 Candidate 镜像仍可继续复用。
-
-`--keep-cluster` 仍只允许一次执行中恰好有一个 E2E 类型或一个 Benchmark 场景；`FULL` 等多运行选择应使用 `--keep-work-dir` 恢复，脚本会跳过已经成功的运行，但不会同时保留多个集群。
-
-只有新脚本创建且包含 `.vpg4-state/run.env` 的工作目录可以恢复；此前旧版本仅由 `--keep-work-dir` 留下的诊断目录没有阶段身份，仍需新开一次运行。
-
-默认会删除本次脚本创建的临时目录和 Kind 集群，不会清理整机 Docker 数据。
 
 ## 维护配置
 
