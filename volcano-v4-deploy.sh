@@ -468,7 +468,22 @@ LOADED_IMAGE_MANIFEST_READY=false
 
 image_config_id_from_manifest() {
   local manifest="$1" ref="$2" config_path config_hash
-  config_path="$(jq -er --arg ref "$ref" '[.[]|select((.RepoTags//[])|index($ref))|.Config]|unique|if length==1 then .[0] else error("missing") end' "$manifest")" || return 1
+  # Docker archive manifests may omit the docker.io registry prefix and the
+  # implicit library namespace even when bundle.meta uses the fully qualified
+  # spelling. Compare canonical Docker Hub names while leaving other registry
+  # references unchanged.
+  config_path="$(jq -er --arg ref "$ref" '
+    def canonical_ref:
+      sub("^index\\.docker\\.io/"; "")
+      | sub("^docker\\.io/"; "")
+      | if test("/") then . else "library/" + . end;
+    ($ref | canonical_ref) as $wanted
+    | [.[]
+       | select(any((.RepoTags // [])[]; canonical_ref == $wanted))
+       | .Config]
+    | unique
+    | if length == 1 then .[0] else error("missing") end
+  ' "$manifest")" || return 1
   config_hash="${config_path##*/}"
   config_hash="${config_hash%.json}"
   [[ "$config_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
