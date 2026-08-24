@@ -972,6 +972,7 @@ patch_candidate_build_network() {
         if ($0 ~ /^[[:space:]]*RUN[[:space:]]+go[[:space:]]+mod[[:space:]]+download/) {
           command=$0
           sub(/^[[:space:]]*RUN[[:space:]]+/, "", command)
+          sub(/\r$/, "", command)
           print "COPY .vpg4-inner-go-modules.tar.gz /tmp/vpg4-inner-go-modules.tar.gz"
           print "RUN mkdir -p /tmp/vpg4-goproxy \\"
           print "    && tar -xzf /tmp/vpg4-inner-go-modules.tar.gz -C /tmp/vpg4-goproxy \\"
@@ -1052,6 +1053,37 @@ else
   patch_candidate_build_network
   mark_stage candidate-build-patch
 fi
+
+# Builds created by older deploy scripts may have saved a CR from a CRLF
+# Dockerfile immediately before the generated continuation backslash. Repair
+# those resumable work directories in place; the fixed patcher above prevents
+# the malformed command in new work directories.
+repair_legacy_candidate_go_download_cr() {
+  local name rel path tmp repaired=false
+  local -a evidence_paths=(
+    Makefile
+    .dockerignore
+    installer/dockerfile/webhook-manager/gen-admission-secret.sh
+  )
+  for name in "${DOCKERFILES[@]}"; do
+    if [[ "$name" == benchmark-audit-exporter ]]; then rel="benchmark/manifests/audit-exporter/Dockerfile"
+    else rel="installer/dockerfile/$name/Dockerfile"; fi
+    path="$CHECKOUT/$rel"; evidence_paths+=("$rel")
+    if LC_ALL=C grep -Fq $'\r \\' "$path"; then
+      tmp="$WORK_DIR/repair-${name}-dockerfile.tmp"
+      tr -d '\r' < "$path" > "$tmp" || die "cannot repair CRLF Candidate Dockerfile: $rel"
+      mv "$tmp" "$path"
+      repaired=true
+    fi
+  done
+  if [[ "$repaired" == true ]]; then
+    git -C "$CHECKOUT" diff -- "${evidence_paths[@]}" > "$OUTPUT_DIR/candidate-build-network.patch"
+    [[ -s "$OUTPUT_DIR/candidate-build-network.patch" ]] || die "repaired Candidate build patch evidence is empty"
+    log "repaired CRLF contamination in the saved Candidate Docker build patch"
+  fi
+}
+repair_legacy_candidate_go_download_cr
+
 for name in "${DOCKERFILES[@]}"; do
   if [[ "$name" == benchmark-audit-exporter ]]; then path="$CHECKOUT/benchmark/manifests/audit-exporter/Dockerfile"
   else path="$CHECKOUT/installer/dockerfile/$name/Dockerfile"; fi
