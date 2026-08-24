@@ -538,6 +538,7 @@ done
 [[ -n "$NODE_IMAGE" ]] || die "bundle does not contain kind-node"
 
 has_image_key() { local wanted="$1" x; for x in "${IMAGE_KEYS[@]}"; do [[ "$x" == "$wanted" ]] && return 0; done; return 1; }
+image_ref_for_key() { local wanted="$1" i; for ((i=0;i<${#IMAGE_KEYS[@]};i++)); do [[ "${IMAGE_KEYS[$i]}" != "$wanted" ]] || { printf '%s\n' "${IMAGE_SAVE_REFS[$i]}"; return; }; done; return 1; }
 bundle_has_image_ref() {
   local wanted="${1%@*}" i
   for ((i=0; i<${#IMAGE_SAVE_REFS[@]}; i++)); do
@@ -927,6 +928,22 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
     docker image inspect "${value%@*}" >/dev/null 2>&1 || die "Candidate E2E runtime image was not loaded: $value"
   done
   log "verified Candidate-selected Kubernetes E2E runtime images"
+
+  NEED_JOBSEQ_RUNTIME_DATA=false
+  for value in "${E2E_RUNS[@]}"; do
+    [[ "$value" != ALL && "$value" != JOBSEQ ]] || NEED_JOBSEQ_RUNTIME_DATA=true
+  done
+  if [[ "$NEED_JOBSEQ_RUNTIME_DATA" == true ]]; then
+    has_image_key tensorflow || die "JOBSEQ requires the bundled TensorFlow runtime image"
+    has_image_key pytorch || die "JOBSEQ requires the bundled PyTorch runtime image"
+    tensorflow_ref="$(image_ref_for_key tensorflow)"
+    pytorch_ref="$(image_ref_for_key pytorch)"
+    docker run --rm --network none "$tensorflow_ref" --download_only=True > "$OUTPUT_DIR/tensorflow-offline-data-check.log" 2>&1 || \
+      die "TensorFlow runtime image lacks embedded MNIST data; recreate the bundle with the current package script"
+    docker run --rm --network none --workdir /home "$pytorch_ref" --epochs=0 --no-cuda > "$OUTPUT_DIR/pytorch-offline-data-check.log" 2>&1 || \
+      die "PyTorch runtime image lacks embedded FashionMNIST data; recreate the bundle with the current package script"
+    log "verified offline TensorFlow and PyTorch training data"
+  fi
 fi
 
 # Local image reuse requires the Docker buildx driver; docker-container cannot
@@ -1273,9 +1290,52 @@ patch_candidate_e2e_cluster_identity() {
   return 0
 }
 
+patch_candidate_ray_offline_images() {
+  local ray_test="$CHECKOUT/test/e2e/jobseq/ray_plugin.go"
+  [[ -f "$ray_test" ]] || return 1
+  if ! grep -q 'PruneUnusedImagesOnAllNodes(e2eutil.KubeClient)' "$ray_test"; then
+    return 1
+  fi
+  log "disabling Candidate Ray E2E pruning of packaged runtime images"
+  sed -i \
+    -e 's/By("Prune images before test")/By("Keep packaged images before offline test")/' \
+    -e 's/By("Prune images after test")/By("Keep packaged images after offline test")/' \
+    -e '/^[[:space:]]*PruneUnusedImagesOnAllNodes(e2eutil.KubeClient)[[:space:]]*$/d' \
+    "$ray_test"
+  grep -q 'PruneUnusedImagesOnAllNodes(e2eutil.KubeClient)' "$ray_test" && \
+    die "Candidate Ray E2E still prunes packaged runtime images"
+  return 0
+}
+
+patch_candidate_e2e_local_image_tags() {
+  local test_root="$CHECKOUT/test/e2e" util="$CHECKOUT/test/e2e/util/util.go" path
+  local changed=false
+  [[ -d "$test_root" ]] || return 1
+  if [[ -f "$util" ]] && grep -Eq 'Default(BusyBox|Nginx)Image[[:space:]]*=[[:space:]]*"(busybox|nginx)"' "$util"; then
+    sed -Ei \
+      -e 's/(DefaultBusyBoxImage[[:space:]]*=[[:space:]]*)"busybox"/\1"busybox:1.24"/' \
+      -e 's/(DefaultNginxImage[[:space:]]*=[[:space:]]*)"nginx"/\1"nginx:1.29.3-alpine"/' \
+      "$util"
+    changed=true
+  fi
+  while IFS= read -r path; do
+    sed -Ei \
+      -e 's/(Image:[[:space:]]*)"busybox"/\1"busybox:1.24"/g' \
+      -e 's/(Image:[[:space:]]*)"nginx"/\1"nginx:1.29.3-alpine"/g' \
+      "$path"
+    changed=true
+  done < <(grep -rlE --include='*.go' 'Image:[[:space:]]*"(busybox|nginx)"' "$test_root" || true)
+  grep -REq --include='*.go' 'Image:[[:space:]]*"(busybox|nginx)"' "$test_root" && \
+    die "Candidate E2E still uses an implicit latest runtime image"
+  [[ ! -f "$util" ]] || ! grep -Eq 'Default(BusyBox|Nginx)Image[[:space:]]*=[[:space:]]*"(busybox|nginx)"' "$util" || \
+    die "Candidate E2E still defines an implicit latest runtime image"
+  [[ "$changed" == true ]]
+}
+
 patch_e2e_environment() {
   local install="$CHECKOUT/hack/lib/install.sh" runner="$CHECKOUT/hack/run-e2e-kind.sh"
-  local kind_config="$CHECKOUT/hack/e2e-kind-config.yaml" tmp="$WORK_DIR/patch.tmp"
+  local kind_config="$CHECKOUT/hack/e2e-kind-config.yaml"
+  local tmp="$WORK_DIR/patch.tmp"
   [[ -f "$install" && -f "$runner" && -f "$kind_config" ]] || die "Candidate E2E entrypoints are missing"
   awk '
     BEGIN{inside=0; replaced=0}
@@ -1352,8 +1412,10 @@ patch_e2e_environment() {
       -e 's|admissionregistration.k8s.io/v1beta1|admissionregistration.k8s.io/v1alpha1=true,resource.k8s.io/v1beta1=true|g' \
       "$kind_config"
   fi
+  patch_candidate_ray_offline_images || true
+  patch_candidate_e2e_local_image_tags || true
   patch_candidate_e2e_cluster_identity || true
-  git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml > "$OUTPUT_DIR/candidate-environment.patch"
+  git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
   [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "Candidate environment patch is empty"
 }
 
@@ -1365,10 +1427,14 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
     patch_e2e_environment
     mark_stage candidate-e2e-patch
   fi
-  if patch_candidate_e2e_cluster_identity; then
-    git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml > "$OUTPUT_DIR/candidate-environment.patch"
+  repaired_e2e_patch=false
+  if patch_candidate_e2e_cluster_identity; then repaired_e2e_patch=true; fi
+  if patch_candidate_ray_offline_images; then repaired_e2e_patch=true; fi
+  if patch_candidate_e2e_local_image_tags; then repaired_e2e_patch=true; fi
+  if [[ "$repaired_e2e_patch" == true ]]; then
+    git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
     [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "repaired Candidate E2E patch evidence is empty"
-    log "repaired the saved Candidate E2E Kind and Helm release identity"
+    log "repaired the saved Candidate E2E offline environment"
   fi
 fi
 

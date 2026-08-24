@@ -230,9 +230,13 @@ BUNDLE_PATH="$OUTPUT_DIR/${BUNDLE_NAME}.tar.gz"
 WORK_DIR="$(mktemp -d /tmp/volcano-v4-package.XXXXXX)"
 STAGE="$WORK_DIR/$BUNDLE_NAME"; TOOLS_STAGE="$WORK_DIR/tools"; TOOLS_BIN="$TOOLS_STAGE/bin"
 RESOURCES_STAGE="$WORK_DIR/resources"
+BAKE_CONTAINERS=()
 mkdir -p "$STAGE" "$TOOLS_BIN" "$RESOURCES_STAGE"
 cleanup() {
   status=$?
+  for container in "${BAKE_CONTAINERS[@]}"; do
+    docker rm -f "$container" >/dev/null 2>&1 || true
+  done
   if [[ "$KEEP_WORK_DIR" == true ]]; then log "kept work directory: $WORK_DIR"
   else chmod -R u+w "$WORK_DIR" 2>/dev/null || true; rm -rf -- "$WORK_DIR"
   fi
@@ -326,14 +330,62 @@ META="$STAGE/bundle.meta"
 SAVE_REFS=(); PULLED_REFS=()
 append_unique() { local v="$1" x; for x in "${SAVE_REFS[@]}"; do [[ "$x" == "$v" ]] && return; done; SAVE_REFS+=("$v"); }
 pull_once() { local v="$1" x; for x in "${PULLED_REFS[@]}"; do [[ "$x" == "$v" ]] && return; done; docker pull --platform linux/amd64 "$v"; PULLED_REFS+=("$v"); }
+bake_offline_training_data() {
+  local key="$1" base="$2" target="$3" data_path="$4" run_workdir="$5"
+  local data_parent="${data_path%/*}" donor clean attempt source_config target_config proxy
+  local downloaded=false
+  local -a proxy_args=()
+  shift 5
+  for proxy in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    [[ -z "${!proxy:-}" ]] || proxy_args+=(--env "$proxy=${!proxy}")
+  done
+  log "embedding runtime training data in [$key] $target"
+  if [[ -n "$run_workdir" ]]; then
+    donor="$(docker create "${proxy_args[@]}" --workdir "$run_workdir" "$base" "$@")"
+  else
+    donor="$(docker create "${proxy_args[@]}" "$base" "$@")"
+  fi
+  [[ "$donor" =~ ^[0-9a-f]{64}$ ]] || die "cannot create $key data download container"
+  BAKE_CONTAINERS+=("$donor")
+  for attempt in 1 2 3; do
+    if docker start --attach "$donor"; then downloaded=true; break; fi
+    log "retrying [$key] runtime data download ($attempt/3)"
+  done
+  [[ "$downloaded" == true ]] || die "cannot download runtime training data for $key"
+  source_config="$(docker image inspect --format '{{json (index .Config "Entrypoint")}}|{{json (index .Config "Cmd")}}|{{json (index .Config "Env")}}|{{json (index .Config "WorkingDir")}}|{{json (index .Config "User")}}' "$base")"
+  clean="$(docker create "$base")"
+  [[ "$clean" =~ ^[0-9a-f]{64}$ ]] || die "cannot create clean $key image container"
+  BAKE_CONTAINERS+=("$clean")
+  docker cp "$donor:$data_path" - | docker cp - "$clean:$data_parent" || \
+    die "cannot embed runtime training data for $key"
+  docker commit "$clean" "$target" >/dev/null || die "cannot commit offline runtime image for $key"
+  target_config="$(docker image inspect --format '{{json (index .Config "Entrypoint")}}|{{json (index .Config "Cmd")}}|{{json (index .Config "Env")}}|{{json (index .Config "WorkingDir")}}|{{json (index .Config "User")}}' "$target")"
+  [[ "$target_config" == "$source_config" ]] || die "offline runtime image changed the configured entrypoint for $key"
+
+  case "$key" in
+    tensorflow)
+      docker run --rm --network none "$target" --download_only=True > "$WORK_DIR/$key-offline-check.log" 2>&1 || \
+        die "embedded TensorFlow MNIST data failed the offline check"
+      ;;
+    pytorch)
+      docker run --rm --network none --workdir /home "$target" --epochs=0 --no-cuda > "$WORK_DIR/$key-offline-check.log" 2>&1 || \
+        die "embedded PyTorch FashionMNIST data failed the offline check"
+      ;;
+  esac
+  docker rm "$donor" "$clean" >/dev/null
+}
 for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
   key="${IMAGE_KEYS[$index]}"; pull_ref="${IMAGE_PULL_REFS[$index]}"; save_ref="${IMAGE_SAVE_REFS[$index]}"
   log "pulling [$key] $pull_ref"
   pull_once "$pull_ref"
-  inspect="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "$pull_ref")"
+  case "$key" in
+    tensorflow) bake_offline_training_data "$key" "$pull_ref" "$save_ref" /tmp/mnist-data "" --download_only=True ;;
+    pytorch) bake_offline_training_data "$key" "$pull_ref" "$save_ref" /home/data /home --epochs=0 --no-cuda ;;
+    *) [[ "$pull_ref" == "$save_ref" ]] || docker tag "$pull_ref" "$save_ref" ;;
+  esac
+  inspect="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "$save_ref")"
   [[ "${inspect%%|*}" == linux/amd64 ]] || die "image platform mismatch: $pull_ref"
   image_id="${inspect#*|}"; [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid image ID: $pull_ref"
-  [[ "$pull_ref" == "$save_ref" ]] || docker tag "$pull_ref" "$save_ref"
   append_unique "$save_ref"
   printf 'IMAGE=%s|%s|%s|%s|-\n' "$key" "$pull_ref" "$save_ref" "$image_id" >> "$META"
 done
