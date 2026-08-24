@@ -805,6 +805,23 @@ load_e2e_contract_environment() {
   done < "$file"
 }
 
+candidate_default_e2e_release_name() {
+  awk '
+    {
+      line=$0
+      sub(/\r$/, "", line)
+      if (line ~ /^[[:space:]]*(export[[:space:]]+)?CLUSTER_NAME=\$\{CLUSTER_NAME:-[^}]+\}[[:space:]]*$/) {
+        sub(/^[[:space:]]*(export[[:space:]]+)?CLUSTER_NAME=\$\{CLUSTER_NAME:-/, "", line)
+        sub(/\}[[:space:]]*$/, "", line)
+        sub(/^["\047]/, "", line)
+        sub(/["\047]$/, "", line)
+        print line
+        exit
+      }
+    }
+  ' "$CHECKOUT/hack/run-e2e-kind.sh"
+}
+
 build_e2e_contract_prerequisites() {
   local file record value extra
   local -a make_args=() prerequisites=()
@@ -832,6 +849,14 @@ if [[ "$MODE" != benchmark ]]; then
 else E2E_RUNS=(); fi
 
 if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then prepare_candidate_e2e_contracts; fi
+
+E2E_HELM_RELEASE_NAME=""
+if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
+  E2E_HELM_RELEASE_NAME="$(candidate_default_e2e_release_name)"
+  [[ ${#E2E_HELM_RELEASE_NAME} -le 53 && "$E2E_HELM_RELEASE_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || \
+    die "cannot resolve the Candidate's default E2E Helm release name"
+  log "using Candidate-default E2E Helm release: $E2E_HELM_RELEASE_NAME"
+fi
 
 if (( K8S_MINOR < 34 && ${#E2E_RUNS[@]} > 0 )); then
   for value in "${E2E_RUNS[@]}"; do
@@ -1128,9 +1153,8 @@ done
 
 cluster_name() {
   local purpose="$1" index="$2" name suffix max_base
-  # Volcano uses the Helm release name in the admission certificate CN. Keep
-  # "<release>-admission-service.volcano-system.svc" within OpenSSL's 64-byte
-  # commonName limit while preserving the per-run index.
+  # Keep generated Kind names compact and stable while preserving the per-run
+  # index used by saved-work identity checks.
   suffix="-$index"
   max_base=$((27 - ${#suffix}))
   name="${CLUSTER_PREFIX}-${CANDIDATE_COMMIT:0:8}-${purpose}-${index}"
@@ -1225,6 +1249,30 @@ write_runtime_images() {
   sort -u -o "$output" "$output"
 }
 
+patch_candidate_e2e_cluster_identity() {
+  local runner="$CHECKOUT/hack/run-e2e-kind.sh" tmp="$WORK_DIR/patch-e2e-cluster.tmp"
+  [[ -f "$runner" ]] || die "Candidate E2E runner is missing"
+  if ! grep -Fq 'export CLUSTER_CONTEXT=("--name" "${CLUSTER_NAME}")' "$runner"; then
+    grep -q 'VPG_KIND_CLUSTER_NAME' "$runner" || \
+      die "Candidate E2E runner does not expose a supported Kind cluster identity contract"
+    return 1
+  fi
+  awk '
+    BEGIN {replaced=0}
+    {
+      if ($0 == "export CLUSTER_CONTEXT=(\"--name\" \"${CLUSTER_NAME}\")") {
+        print "export CLUSTER_CONTEXT=(\"--name\" \"${VPG_KIND_CLUSTER_NAME:-${CLUSTER_NAME}}\")"
+        replaced++
+        next
+      }
+      print
+    }
+    END {if(replaced!=1) exit 50}
+  ' "$runner" > "$tmp" || die "cannot decouple Candidate E2E Kind and Helm release names"
+  mv "$tmp" "$runner"
+  return 0
+}
+
 patch_e2e_environment() {
   local install="$CHECKOUT/hack/lib/install.sh" runner="$CHECKOUT/hack/run-e2e-kind.sh"
   local kind_config="$CHECKOUT/hack/e2e-kind-config.yaml" tmp="$WORK_DIR/patch.tmp"
@@ -1303,6 +1351,7 @@ patch_e2e_environment() {
       -e 's|admissionregistration.k8s.io/v1beta1|admissionregistration.k8s.io/v1alpha1=true,resource.k8s.io/v1beta1=true|g' \
       "$kind_config"
   fi
+  patch_candidate_e2e_cluster_identity || true
   git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml > "$OUTPUT_DIR/candidate-environment.patch"
   [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "Candidate environment patch is empty"
 }
@@ -1314,6 +1363,11 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   else
     patch_e2e_environment
     mark_stage candidate-e2e-patch
+  fi
+  if patch_candidate_e2e_cluster_identity; then
+    git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml > "$OUTPUT_DIR/candidate-environment.patch"
+    [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "repaired Candidate E2E patch evidence is empty"
+    log "repaired the saved Candidate E2E Kind and Helm release identity"
   fi
 fi
 
@@ -1335,7 +1389,7 @@ run_e2e_one() {
   [[ ${#runtime_images[@]} -gt 0 ]] || die "runtime image list is empty: $runtime"
   docker_save_archive "$runtime_archive" "${runtime_images[@]}"
   if cluster_exists "$name"; then
-    validate_saved_cluster "$name" "$purpose" "$kubeconfig" "$name"
+    validate_saved_cluster "$name" "$purpose" "$kubeconfig" "$E2E_HELM_RELEASE_NAME"
     kind load image-archive "$runtime_archive" --name "$name"
     reuse_cluster=true
   fi
@@ -1353,11 +1407,12 @@ run_e2e_one() {
     if [[ "$reuse_cluster" == true ]]; then
       export KUBECONFIG="$kubeconfig" SKIP_CLUSTER_SETUP=1
     fi
-    CLUSTER_NAME="$name" CLEANUP_CLUSTER="$cleanup_value" \
+    CLUSTER_NAME="$E2E_HELM_RELEASE_NAME" CLEANUP_CLUSTER="$cleanup_value" \
       KIND_OPT="--image $NODE_IMAGE --config $CHECKOUT/hack/e2e-kind-config.yaml" \
       IMAGE_PREFIX=volcanosh TAG="$CANDIDATE_COMMIT" OS=linux ARTIFACTS_PATH="$artifacts" \
       VPG_RUNTIME_IMAGE_ARCHIVE="$runtime_archive" VPG_KWOK_MANIFEST="$(resource_for_key kwok-manifest)" \
       VPG_KWOK_STAGE="$(resource_for_key kwok-stage)" VPG_RESUME_RUN_ID="$RUN_ID" \
+      VPG_KIND_CLUSTER_NAME="$name" \
       VPG_CANDIDATE_COMMIT="$CANDIDATE_COMMIT" VPG_RESUME_PURPOSE="$purpose" bash hack/run-e2e-kind.sh
   ) 2>&1 | tee -a "$artifacts/run.log"
   mark_stage "$stage"
