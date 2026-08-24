@@ -1301,7 +1301,8 @@ patch_e2e_environment() {
       if($0 ~ /^[[:space:]]*kind[[:space:]]+create[[:space:]]+cluster/) pending=1
       if(pending && $0 !~ /\\[[:space:]]*$/) {
         print "  if [[ -n \"${VPG_RUNTIME_IMAGE_ARCHIVE:-}\" ]]; then"
-        print "    kind load image-archive \"${VPG_RUNTIME_IMAGE_ARCHIVE}\" --name \"${CLUSTER_NAME}\""
+        print "    echo \"Loading offline runtime images into Kind cluster ${CLUSTER_CONTEXT[1]}\""
+        print "    kind load image-archive \"${VPG_RUNTIME_IMAGE_ARCHIVE}\" \"${CLUSTER_CONTEXT[@]}\""
         print "  fi"
         pending=0; inserted++
       }
