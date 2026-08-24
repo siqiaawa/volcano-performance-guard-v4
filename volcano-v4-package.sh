@@ -330,29 +330,63 @@ META="$STAGE/bundle.meta"
 SAVE_REFS=(); PULLED_REFS=()
 append_unique() { local v="$1" x; for x in "${SAVE_REFS[@]}"; do [[ "$x" == "$v" ]] && return; done; SAVE_REFS+=("$v"); }
 pull_once() { local v="$1" x; for x in "${PULLED_REFS[@]}"; do [[ "$x" == "$v" ]] && return; done; docker pull --platform linux/amd64 "$v"; PULLED_REFS+=("$v"); }
-bake_offline_training_data() {
-  local key="$1" base="$2" target="$3" data_path="$4" run_workdir="$5"
-  local data_parent="${data_path%/*}" donor clean attempt source_config target_config proxy
-  local downloaded=false
-  local -a proxy_args=()
-  shift 5
-  for proxy in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
-    [[ -z "${!proxy:-}" ]] || proxy_args+=(--env "$proxy=${!proxy}")
+prepare_training_data() {
+  local key="$1" spec url expected name actual
+  local -a files=()
+  TRAINING_DATA_DIR="$WORK_DIR/training-data/$key"
+  mkdir -p "$TRAINING_DATA_DIR"
+  case "$key" in
+    tensorflow)
+      files=(
+        'https://storage.googleapis.com/cvdf-datasets/mnist/train-images-idx3-ubyte.gz|440fcabf73cc546fa21475e81ea370265605f56be210a4024d2ca8f203523609'
+        'https://storage.googleapis.com/cvdf-datasets/mnist/train-labels-idx1-ubyte.gz|3552534a0a558bbed6aed32b30c495cca23d567ec52cac8be1a0730e8010255c'
+        'https://storage.googleapis.com/cvdf-datasets/mnist/t10k-images-idx3-ubyte.gz|8d422c7b0a1c1c79245a5bcf07fe86e33eeafee792b84584aec276f5a2dbc4e6'
+        'https://storage.googleapis.com/cvdf-datasets/mnist/t10k-labels-idx1-ubyte.gz|f7ae60f92e00ec6debd23a6088c31dbd2371eca3ffa0defaefb259924204aec6'
+      )
+      ;;
+    pytorch)
+      files=(
+        'http://fashion-mnist.s3-website.eu-central-1.amazonaws.com/train-images-idx3-ubyte.gz|3aede38d61863908ad78613f6a32ed271626dd12800ba2636569512369268a84'
+        'http://fashion-mnist.s3-website.eu-central-1.amazonaws.com/train-labels-idx1-ubyte.gz|a04f17134ac03560a47e3764e11b92fc97de4d1bfaf8ba1a3aa29af54cc90845'
+        'http://fashion-mnist.s3-website.eu-central-1.amazonaws.com/t10k-images-idx3-ubyte.gz|346e55b948d973a97e58d2351dde16a484bd415d4595297633bb08f03db6a073'
+        'http://fashion-mnist.s3-website.eu-central-1.amazonaws.com/t10k-labels-idx1-ubyte.gz|67da17c76eaffca5446c3361aaab5c3cd6d1c2608764d35dfb1850b086bf8dd5'
+      )
+      ;;
+    *) die "unsupported offline training data key: $key" ;;
+  esac
+  log "downloading verified runtime training data for [$key] on the outer host"
+  for spec in "${files[@]}"; do
+    url="${spec%%|*}"; expected="${spec##*|}"; name="${url##*/}"
+    curl --fail --location --retry 3 --connect-timeout 30 -o "$TRAINING_DATA_DIR/$name.part" "$url"
+    actual="$(sha256sum "$TRAINING_DATA_DIR/$name.part" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] || die "runtime training data checksum mismatch: $url"
+    mv "$TRAINING_DATA_DIR/$name.part" "$TRAINING_DATA_DIR/$name"
   done
+}
+bake_offline_training_data() {
+  local key="$1" base="$2" target="$3" data_path data_parent donor clean source_config target_config
+  local pytorch_prepare
+  prepare_training_data "$key"
   log "embedding runtime training data in [$key] $target"
-  if [[ -n "$run_workdir" ]]; then
-    donor="$(docker create "${proxy_args[@]}" --workdir "$run_workdir" "$base" "$@")"
-  else
-    donor="$(docker create "${proxy_args[@]}" "$base" "$@")"
-  fi
+  case "$key" in
+    tensorflow)
+      data_path=/tmp/mnist-data
+      donor="$(docker create --network none "$base" --download_only=True)"
+      ;;
+    pytorch)
+      data_path=/home/data
+      pytorch_prepare='from torchvision.datasets import FashionMNIST; FashionMNIST.urls=["file:///vpg-input/train-images-idx3-ubyte.gz","file:///vpg-input/train-labels-idx1-ubyte.gz","file:///vpg-input/t10k-images-idx3-ubyte.gz","file:///vpg-input/t10k-labels-idx1-ubyte.gz"]; FashionMNIST("/home/data", train=True, download=True); FashionMNIST("/home/data", train=False)'
+      donor="$(docker create --network none --workdir /home --entrypoint python3 "$base" -c "$pytorch_prepare")"
+      ;;
+  esac
   [[ "$donor" =~ ^[0-9a-f]{64}$ ]] || die "cannot create $key data download container"
   BAKE_CONTAINERS+=("$donor")
-  for attempt in 1 2 3; do
-    if docker start --attach "$donor"; then downloaded=true; break; fi
-    log "retrying [$key] runtime data download ($attempt/3)"
-  done
-  [[ "$downloaded" == true ]] || die "cannot download runtime training data for $key"
+  if [[ "$key" == tensorflow ]]; then docker cp "$TRAINING_DATA_DIR" "$donor:$data_path"
+  else docker cp "$TRAINING_DATA_DIR" "$donor:/vpg-input"
+  fi
+  docker start --attach "$donor" || die "cannot prepare offline runtime training data for $key"
   source_config="$(docker image inspect --format '{{json (index .Config "Entrypoint")}}|{{json (index .Config "Cmd")}}|{{json (index .Config "Env")}}|{{json (index .Config "WorkingDir")}}|{{json (index .Config "User")}}' "$base")"
+  data_parent="${data_path%/*}"
   clean="$(docker create "$base")"
   [[ "$clean" =~ ^[0-9a-f]{64}$ ]] || die "cannot create clean $key image container"
   BAKE_CONTAINERS+=("$clean")
@@ -379,8 +413,7 @@ for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
   log "pulling [$key] $pull_ref"
   pull_once "$pull_ref"
   case "$key" in
-    tensorflow) bake_offline_training_data "$key" "$pull_ref" "$save_ref" /tmp/mnist-data "" --download_only=True ;;
-    pytorch) bake_offline_training_data "$key" "$pull_ref" "$save_ref" /home/data /home --epochs=0 --no-cuda ;;
+    tensorflow|pytorch) bake_offline_training_data "$key" "$pull_ref" "$save_ref" ;;
     *) [[ "$pull_ref" == "$save_ref" ]] || docker tag "$pull_ref" "$save_ref" ;;
   esac
   inspect="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "$save_ref")"

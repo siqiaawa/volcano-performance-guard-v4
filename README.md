@@ -396,7 +396,7 @@ Profile 按需选择的默认镜像：
 | Monitoring     | `grafana`              | `grafana/grafana:latest`                                | 同名                 |
 | Monitoring     | `kube-state-metrics`   | `docker.io/volcanosh/kube-state-metrics:v2.0.0-beta`    | 同名                 |
 
-打包脚本会在外网将 TensorFlow 所需的 MNIST 和 PyTorch 所需的 FashionMNIST 固化进对应镜像，并在完全禁网的临时容器中验证数据可读取。内网脚本会在创建 Kind 集群前重复该禁网检查；JOBSEQ 的 Ray 用例保留已装入节点的离线镜像，不执行上游测试中的 containerd image prune；Candidate E2E 中无 tag 的 `busybox`/`nginx` 也会在临时 checkout 内固定为包中已有的非 `latest` tag，避免 Kubernetes 默认重新拉取。因此完整 E2E 不会在 Pod 启动后继续下载这两套训练数据、删除刚装入的 Ray 镜像，或因隐式 `latest` 再访问镜像仓库。
+打包脚本会在外网宿主机下载并逐项校验 TensorFlow 所需的 MNIST 和 PyTorch 所需的 FashionMNIST，再把数据交给完全禁网的临时容器转换、固化并验证。下载因此使用打包命令所在宿主机的代理，不要求 Docker 容器能够连接宿主代理。内网脚本会在创建 Kind 集群前重复该禁网检查；JOBSEQ 的 Ray 用例保留已装入节点的离线镜像，不执行上游测试中的 containerd image prune；Candidate E2E 中无 tag 的 `busybox`/`nginx` 也会在临时 checkout 内固定为包中已有的非 `latest` tag，避免 Kubernetes 默认重新拉取。因此完整 E2E 不会在 Pod 启动后继续下载这两套训练数据、删除刚装入的 Ray 镜像，或因隐式 `latest` 再访问镜像仓库。
 
 `busybox:1.24` 使用旧 schema 1，Docker 29/containerd 2.1 会拒绝拉取。因此脚本保存现代 `busybox:1.36`，同时创建 Candidate 仍引用的 `busybox:1.24` 本地标签。
 
