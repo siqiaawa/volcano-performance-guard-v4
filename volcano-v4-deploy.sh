@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 SCRIPT_VERSION="v4.3.0"
-RESUME_STATE_FORMAT="1"
+RESUME_STATE_FORMAT="2"
 DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
 DEFAULT_GOPROXY="direct"
 DEFAULT_GONOSUMDB="*"
@@ -100,6 +100,10 @@ generic bundle contains no Volcano source or Go modules. Nothing is installed
 system-wide. A saved work directory resumes only when its bundle and complete
 run identity match. A saved cluster restarts the selected E2E suite or failed
 Benchmark round; it cannot resume inside one Ginkgo spec or one go test process.
+When multiple E2E types, Benchmark scenarios, or Benchmark rounds are selected,
+a failed test batch is recorded and later batches still run. Fatal dependency,
+build, shared-infrastructure, or result-write failures still stop immediately. The final
+exit status remains nonzero when any test batch failed.
 EOF
 }
 
@@ -539,7 +543,6 @@ done
 [[ -n "$NODE_IMAGE" ]] || die "bundle does not contain kind-node"
 
 has_image_key() { local wanted="$1" x; for x in "${IMAGE_KEYS[@]}"; do [[ "$x" == "$wanted" ]] && return 0; done; return 1; }
-image_ref_for_key() { local wanted="$1" i; for ((i=0;i<${#IMAGE_KEYS[@]};i++)); do [[ "${IMAGE_KEYS[$i]}" != "$wanted" ]] || { printf '%s\n' "${IMAGE_SAVE_REFS[$i]}"; return; }; done; return 1; }
 bundle_has_image_ref() {
   local wanted="${1%@*}" i
   for ((i=0; i<${#IMAGE_SAVE_REFS[@]}; i++)); do
@@ -930,21 +933,6 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   done
   log "verified Candidate-selected Kubernetes E2E runtime images"
 
-  NEED_JOBSEQ_RUNTIME_DATA=false
-  for value in "${E2E_RUNS[@]}"; do
-    [[ "$value" != ALL && "$value" != JOBSEQ ]] || NEED_JOBSEQ_RUNTIME_DATA=true
-  done
-  if [[ "$NEED_JOBSEQ_RUNTIME_DATA" == true ]]; then
-    has_image_key tensorflow || die "JOBSEQ requires the bundled TensorFlow runtime image"
-    has_image_key pytorch || die "JOBSEQ requires the bundled PyTorch runtime image"
-    tensorflow_ref="$(image_ref_for_key tensorflow)"
-    pytorch_ref="$(image_ref_for_key pytorch)"
-    docker run --rm --network none "$tensorflow_ref" --download_only=True > "$OUTPUT_DIR/tensorflow-offline-data-check.log" 2>&1 || \
-      die "TensorFlow runtime image lacks embedded MNIST data; recreate the bundle with the current package script"
-    docker run --rm --network none --workdir /home "$pytorch_ref" --epochs=0 --no-cuda > "$OUTPUT_DIR/pytorch-offline-data-check.log" 2>&1 || \
-      die "PyTorch runtime image lacks embedded FashionMNIST data; recreate the bundle with the current package script"
-    log "verified offline TensorFlow and PyTorch training data"
-  fi
 fi
 
 # Local image reuse requires the Docker buildx driver; docker-container cannot
@@ -1212,9 +1200,15 @@ validate_saved_cluster() {
   log "validated and reusing saved Kind cluster: $name"
 }
 delete_cluster() {
-  local purpose="$1"
+  local purpose="$1" delete_status=0
   if [[ "$KEEP_CLUSTER" == true ]]; then log "keeping cluster: $CURRENT_CLUSTER"; return; fi
-  if cluster_exists "$CURRENT_CLUSTER"; then kind delete cluster --name "$CURRENT_CLUSTER" 2>&1 | tee "$OUTPUT_DIR/kind-delete-${purpose}.log"; fi
+  if cluster_exists "$CURRENT_CLUSTER"; then
+    set +e
+    kind delete cluster --name "$CURRENT_CLUSTER" 2>&1 | tee "$OUTPUT_DIR/kind-delete-${purpose}.log"
+    delete_status=$?
+    set -e
+    [[ "$delete_status" -eq 0 ]] || log "WARNING: failed to completely delete cluster $CURRENT_CLUSTER; continuing after batch cleanup"
+  fi
   state_set ACTIVE_CLUSTER ""; state_set ACTIVE_PURPOSE ""
   CLUSTER_CREATED=false; CURRENT_CLUSTER=""
 }
@@ -1291,23 +1285,6 @@ patch_candidate_e2e_cluster_identity() {
   return 0
 }
 
-patch_candidate_ray_offline_images() {
-  local ray_test="$CHECKOUT/test/e2e/jobseq/ray_plugin.go"
-  [[ -f "$ray_test" ]] || return 1
-  if ! grep -q 'PruneUnusedImagesOnAllNodes(e2eutil.KubeClient)' "$ray_test"; then
-    return 1
-  fi
-  log "disabling Candidate Ray E2E pruning of packaged runtime images"
-  sed -i \
-    -e 's/By("Prune images before test")/By("Keep packaged images before offline test")/' \
-    -e 's/By("Prune images after test")/By("Keep packaged images after offline test")/' \
-    -e '/^[[:space:]]*PruneUnusedImagesOnAllNodes(e2eutil.KubeClient)[[:space:]]*$/d' \
-    "$ray_test"
-  grep -q 'PruneUnusedImagesOnAllNodes(e2eutil.KubeClient)' "$ray_test" && \
-    die "Candidate Ray E2E still prunes packaged runtime images"
-  return 0
-}
-
 patch_candidate_e2e_local_image_tags() {
   local test_root="$CHECKOUT/test/e2e" util="$CHECKOUT/test/e2e/util/util.go" path
   local changed=false
@@ -1331,382 +1308,6 @@ patch_candidate_e2e_local_image_tags() {
   [[ ! -f "$util" ]] || ! grep -Eq 'Default(BusyBox|Nginx)Image[[:space:]]*=[[:space:]]*"(busybox|nginx)"' "$util" || \
     die "Candidate E2E still defines an implicit latest runtime image"
   [[ "$changed" == true ]]
-}
-
-# Runtime images are already present in an offline Kind cluster, so distributed
-# JobSeq pods can start much faster than they do in the upstream online CI. Do
-# not use image-pull latency as an implicit readiness barrier: wait for the
-# TensorFlow PS, give its non-chief worker time to start, and verify MPI worker
-# SSH authentication before starting OpenMPI over the Pod network.
-patch_candidate_jobseq_readiness() {
-  local root="$CHECKOUT/test/e2e/jobseq" path tmp changed=false
-  [[ -d "$root" ]] || return 1
-
-  for path in "$root/tensorflow.go" "$root/tensorflow_plugin.go"; do
-    [[ -f "$path" ]] || continue
-    if grep -Fq 'nc -z -w 1 ${PS_READY_HOST} 2222' "$path"; then
-      awk '{gsub(/nc -z -w 1 \$\{PS_READY_HOST\} 2222/, "python -c \047import socket,sys; socket.create_connection((sys.argv[1],2222),1).close()\047 ${PS_READY_HOST}"); print}' \
-        "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-        die "cannot repair TensorFlow PS readiness in Candidate E2E: ${path#$CHECKOUT/}"
-      mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-      changed=true
-    fi
-    if grep -q 'VPG4_TF_PEER_READY' "$path"; then
-      awk '
-        BEGIN {replaced=0}
-        {
-          if ($0 ~ /VPG4_TF_PEER_READY/) {
-            sub(/if printf %s \$\{TF_CONFIG\} \| grep -q index\.:0; then .*; fi; python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/,
-                "if printf %s ${TF_CONFIG} | grep -q index.:0; then VPG4_TF_CHIEF_DELAY=15; sleep ${VPG4_TF_CHIEF_DELAY}; fi; python /var/tf_dist_mnist/dist_mnist.py --train_steps 1000")
-            replaced++
-          }
-          print
-        }
-        END {if(replaced!=1) exit 50}
-      ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-        die "cannot repair TensorFlow chief readiness in Candidate E2E: ${path#$CHECKOUT/}"
-      mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-      changed=true
-      continue
-    fi
-    grep -q 'VPG4_TF_CHIEF_DELAY' "$path" && continue
-    if grep -q 'VPG4_TF_PS_READY' "$path"; then
-      awk '
-        BEGIN {replaced=0}
-        {
-          if ($0 ~ /VPG4_TF_PS_READY/ && $0 ~ /python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/) {
-            sub(/python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/,
-                "if printf %s ${TF_CONFIG} | grep -q index.:0; then VPG4_TF_CHIEF_DELAY=15; sleep ${VPG4_TF_CHIEF_DELAY}; fi; python /var/tf_dist_mnist/dist_mnist.py --train_steps 1000")
-            replaced++
-          }
-          print
-        }
-        END {if(replaced!=1) exit 50}
-      ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-        die "cannot add TensorFlow chief delay to Candidate E2E: ${path#$CHECKOUT/}"
-      mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-      changed=true
-      continue
-    fi
-    awk '
-      BEGIN {worker=0; replaced=0}
-      /Name:[[:space:]]+"worker"/ {worker=1}
-      {
-        if (worker && $0 ~ /python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/) {
-          sub(/python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/,
-              "PS_READY_HOST=$(head -n 1 /etc/volcano/ps.host); VPG4_TF_PS_READY=false; for attempt in $(seq 1 60); do if python -c \047import socket,sys; socket.create_connection((sys.argv[1],2222),1).close()\047 ${PS_READY_HOST} >/dev/null 2>\\&1; then VPG4_TF_PS_READY=true; break; fi; sleep 1; done; if [ ${VPG4_TF_PS_READY} != true ]; then echo TensorFlow_PS_not_ready:${PS_READY_HOST} >\\&2; exit 1; fi; if printf %s ${TF_CONFIG} | grep -q index.:0; then VPG4_TF_CHIEF_DELAY=15; sleep ${VPG4_TF_CHIEF_DELAY}; fi; python /var/tf_dist_mnist/dist_mnist.py --train_steps 1000")
-          worker=0
-          replaced++
-        }
-        print
-      }
-      END {if(replaced!=1) exit 51}
-    ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-      die "cannot add TensorFlow PS readiness to Candidate E2E: ${path#$CHECKOUT/}"
-    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-    changed=true
-  done
-
-  path="$root/mpi.go"
-  if [[ -f "$path" ]] && grep -Fq 'timeout 1 ssh ${host} true' "$path"; then
-    awk '{gsub(/timeout 1 ssh \$\{host\} true/, "timeout 2 bash -c \"exec 3<>/dev/tcp/${host}/22\""); print}' \
-      "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-      die "cannot repair MPI worker readiness in Candidate E2E: ${path#$CHECKOUT/}"
-    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-    changed=true
-  elif [[ -f "$path" ]] && ! grep -q 'VPG4_MPI_WORKERS' "$path"; then
-    awk '
-      BEGIN {replaced=0}
-      {
-        if ($0 ~ /mpiexec --allow-run-as-root --hostfile \/etc\/volcano\/mpiworker.host -np 2 mpi_hello_world > \/home\/re`/) {
-          print "VPG4_MPI_WORKERS=$(cat /etc/volcano/mpiworker.host)"
-          print "for host in ${VPG4_MPI_WORKERS}; do"
-          print "  VPG4_MPI_WORKER_READY=false"
-          print "  for attempt in $(seq 1 60); do"
-          print "    if timeout 2 bash -c \"exec 3<>/dev/tcp/${host}/22\" >/dev/null 2>&1; then VPG4_MPI_WORKER_READY=true; break; fi"
-          print "    sleep 1"
-          print "  done"
-          print "  if [ ${VPG4_MPI_WORKER_READY} != true ]; then echo MPI_worker_SSH_not_ready:${host} >&2; exit 1; fi"
-          print "done"
-          print "mpiexec --allow-run-as-root --hostfile /etc/volcano/mpiworker.host -np 2 mpi_hello_world`,"
-          replaced++
-          next
-        }
-        print
-      }
-      END {if(replaced!=1) exit 52}
-    ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-      die "cannot add MPI worker readiness to Candidate E2E: ${path#$CHECKOUT/}"
-    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-    changed=true
-  fi
-
-  path="$root/mpi_plugin.go"
-  if [[ -f "$path" ]] && grep -Fq 'timeout 1 ssh ${host} true' "$path"; then
-    awk '{gsub(/timeout 1 ssh \$\{host\} true/, "timeout 2 bash -c \"exec 3<>/dev/tcp/${host}/22\""); print}' \
-      "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-      die "cannot repair MPI plugin worker readiness in Candidate E2E: ${path#$CHECKOUT/}"
-    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-    changed=true
-  elif [[ -f "$path" ]] && ! grep -q 'VPG4_MPI_WORKERS' "$path"; then
-    awk '
-      BEGIN {replaced=0}
-      {
-        if ($0 ~ /mpiexec --allow-run-as-root --host \$\{MPI_HOST\} -np 2 mpi_hello_world > \/home\/re`/) {
-          print "VPG4_MPI_WORKERS=$(printf %s ${MPI_HOST} | tr , \047 \047)"
-          print "for host in ${VPG4_MPI_WORKERS}; do"
-          print "  VPG4_MPI_WORKER_READY=false"
-          print "  for attempt in $(seq 1 60); do"
-          print "    if timeout 2 bash -c \"exec 3<>/dev/tcp/${host}/22\" >/dev/null 2>&1; then VPG4_MPI_WORKER_READY=true; break; fi"
-          print "    sleep 1"
-          print "  done"
-          print "  if [ ${VPG4_MPI_WORKER_READY} != true ]; then echo MPI_worker_SSH_not_ready:${host} >&2; exit 1; fi"
-          print "done"
-          print "mpiexec --allow-run-as-root --host ${MPI_HOST} -np 2 mpi_hello_world`,"
-          replaced++
-          next
-        }
-        print
-      }
-      END {if(replaced!=1) exit 53}
-    ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-      die "cannot add MPI plugin worker readiness to Candidate E2E: ${path#$CHECKOUT/}"
-    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-    changed=true
-  fi
-
-  # A listening port only proves that sshd has started. Make authentication
-  # non-interactive and bounded so mpiexec cannot wait forever at a password
-  # prompt. Launch every remote daemon from the master and pin OpenMPI to the
-  # Pod interface; this avoids topology-dependent rsh tree spawning and host
-  # interface selection in Kind clusters. StrictModes is disabled only for the
-  # short-lived E2E sshd because its authorized_keys comes from a Secret mount.
-  for path in "$root/mpi.go" "$root/mpi_plugin.go"; do
-    [[ -f "$path" ]] || continue
-    grep -q 'VPG4_MPI_WORKERS' "$path" || continue
-    grep -q 'VPG4_MPI_AUTH_READY' "$path" && continue
-    awk '
-      BEGIN {auth=0; launch=0}
-      {
-        gsub(/\/usr\/sbin\/sshd -D;/, "/usr/sbin/sshd -D -o StrictModes=no;")
-        gsub(/\/usr\/sbin\/sshd;/, "/usr/sbin/sshd -o StrictModes=no;")
-        if ($0 ~ /if \[ \$\{VPG4_MPI_WORKER_READY\} != true \]; then echo MPI_worker_SSH_not_ready:/) {
-          print
-          print "  VPG4_MPI_AUTH_READY=false"
-          print "  VPG4_MPI_SSH_ERROR=/tmp/vpg4-mpi-ssh-error"
-          print "  for attempt in $(seq 1 12); do"
-          print "    if timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 ${host} true >${VPG4_MPI_SSH_ERROR} 2>&1; then VPG4_MPI_AUTH_READY=true; break; fi"
-          print "    sleep 1"
-          print "  done"
-          print "  if [ ${VPG4_MPI_AUTH_READY} != true ]; then echo MPI_worker_SSH_authentication_failed:${host} >&2; cat ${VPG4_MPI_SSH_ERROR} >&2; exit 1; fi"
-          print "  rm -f ${VPG4_MPI_SSH_ERROR}"
-          auth++
-          next
-        }
-        if ($0 ~ /mpiexec --allow-run-as-root/ && $0 !~ /plm_rsh_no_tree_spawn/) {
-          sub(/mpiexec --allow-run-as-root /, "mpiexec --allow-run-as-root --mca plm_rsh_no_tree_spawn 1 --mca plm_rsh_args \047-o BatchMode=yes -o ConnectTimeout=5\047 --mca oob_tcp_if_include eth0 --mca btl_tcp_if_include eth0 ")
-          launch++
-        }
-        print
-      }
-      END {if(auth!=1 || launch!=1) exit 54}
-    ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
-      die "cannot harden MPI SSH launch in Candidate E2E: ${path#$CHECKOUT/}"
-    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
-    changed=true
-  done
-
-  [[ "$changed" == true ]]
-}
-
-# Ray is intentionally a long-running Job. The upstream test waits for its
-# Service before opening a phase watch, by which time a preloaded offline image
-# can already be Running. Verify the real final requirement instead of requiring
-# observation of the transient Pending event.
-patch_candidate_ray_running_wait() {
-  local path="$CHECKOUT/test/e2e/jobseq/ray_plugin.go" tmp="$WORK_DIR/patch-ray-wait.tmp"
-  [[ -f "$path" ]] || return 1
-  grep -q 'WaitJobStates(testCtx, job.*vcbatch.Running' "$path" && return 1
-  awk '
-    BEGIN {pending=0; replaced=0}
-    {
-      if (!pending && $0 ~ /err := e2eutil.WaitJobPhases\(testCtx, job, \[\]vcbatch.JobPhase\{/) {
-        held=$0
-        pending=1
-        next
-      }
-      if (pending) {
-        if ($0 ~ /vcbatch.Pending,[[:space:]]*vcbatch.Running\}\)/) {
-          print "\t\terr := e2eutil.WaitJobStates(testCtx, job, []vcbatch.JobPhase{vcbatch.Running}, e2eutil.TenMinute)"
-          replaced++
-        } else {
-          print held
-          print
-        }
-        pending=0
-        next
-      }
-      print
-    }
-    END {if(pending || replaced!=1) exit 54}
-  ' "$path" > "$tmp" || die "cannot make Candidate Ray E2E wait for its real final state"
-  mv "$tmp" "$path"
-  return 0
-}
-
-# Preserve the Candidate's normal pass/fail criteria while collecting the
-# evidence needed to diagnose real application failures before namespace
-# cleanup. Secrets are deliberately excluded.
-patch_candidate_e2e_failure_artifacts() {
-  local path="$CHECKOUT/test/e2e/util/util.go" tmp="$WORK_DIR/patch-e2e-artifacts.tmp"
-  local helper="$WORK_DIR/patch-e2e-artifacts.go"
-  [[ -f "$path" ]] || return 1
-  grep -q '^func dumpPodLogs' "$path" && return 1
-  grep -q '"pods".*dumpPods' "$path" || return 1
-  grep -q '^// dumpPodGroups dumps' "$path" || return 1
-
-  cat > "$helper" <<'EOF'
-// dumpPodLogs saves current and previous logs for every regular and init
-// container before the failed test namespace is removed.
-func dumpPodLogs(ctx *TestContext, path string) error {
-	pods, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list pods for logs: %v", err)
-	}
-	logsPath := filepath.Join(path, "pod-logs")
-	if err := os.MkdirAll(logsPath, 0755); err != nil {
-		return fmt.Errorf("failed to create pod log directory: %v", err)
-	}
-	for _, pod := range pods.Items {
-		containers := append([]v1.Container{}, pod.Spec.InitContainers...)
-		containers = append(containers, pod.Spec.Containers...)
-		statuses := append([]v1.ContainerStatus{}, pod.Status.InitContainerStatuses...)
-		statuses = append(statuses, pod.Status.ContainerStatuses...)
-		for _, container := range containers {
-			hasPrevious := false
-			for _, status := range statuses {
-				if status.Name == container.Name && status.RestartCount > 0 {
-					hasPrevious = true
-				}
-			}
-			for _, previous := range []bool{false, true} {
-				if previous && !hasPrevious {
-					continue
-				}
-				label := "current"
-				if previous {
-					label = "previous"
-				}
-				data, logErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).GetLogs(
-					pod.Name, &v1.PodLogOptions{Container: container.Name, Previous: previous, Timestamps: true},
-				).DoRaw(context.TODO())
-				if logErr != nil {
-					data = []byte(fmt.Sprintf("unable to collect log: %v\n", logErr))
-				}
-				name := fmt.Sprintf("%s--%s--%s.log", pod.Name, container.Name, label)
-				if err := os.WriteFile(filepath.Join(logsPath, name), data, 0644); err != nil {
-					klog.Errorf("Failed to write pod log %s: %v", name, err)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func dumpServices(ctx *TestContext, path string) error {
-	items, err := ctx.Kubeclient.CoreV1().Services(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list services: %v", err)
-	}
-	return writeResourceToFile(items, filepath.Join(path, "services.yaml"))
-}
-
-func dumpConfigMaps(ctx *TestContext, path string) error {
-	items, err := ctx.Kubeclient.CoreV1().ConfigMaps(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list configmaps: %v", err)
-	}
-	return writeResourceToFile(items, filepath.Join(path, "configmaps.yaml"))
-}
-
-func dumpEvents(ctx *TestContext, path string) error {
-	items, err := ctx.Kubeclient.CoreV1().Events(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list events: %v", err)
-	}
-	return writeResourceToFile(items, filepath.Join(path, "events.yaml"))
-}
-
-func dumpNetworkPolicies(ctx *TestContext, path string) error {
-	items, err := ctx.Kubeclient.NetworkingV1().NetworkPolicies(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list network policies: %v", err)
-	}
-	return writeResourceToFile(items, filepath.Join(path, "networkpolicies.yaml"))
-}
-
-func dumpEndpointSlices(ctx *TestContext, path string) error {
-	items, err := ctx.Kubeclient.DiscoveryV1().EndpointSlices(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list endpoint slices: %v", err)
-	}
-	return writeResourceToFile(items, filepath.Join(path, "endpointslices.yaml"))
-}
-
-EOF
-
-  awk '
-    BEGIN {inserted=0}
-    {
-      print
-      if ($0 ~ /"pods".*dumpPods/) {
-        print "\t\t\"pod logs\":        func() error { return dumpPodLogs(ctx, nsPath) },"
-        print "\t\t\"services\":        func() error { return dumpServices(ctx, nsPath) },"
-        print "\t\t\"configmaps\":      func() error { return dumpConfigMaps(ctx, nsPath) },"
-        print "\t\t\"events\":          func() error { return dumpEvents(ctx, nsPath) },"
-        print "\t\t\"networkpolicies\": func() error { return dumpNetworkPolicies(ctx, nsPath) },"
-        print "\t\t\"endpointslices\":   func() error { return dumpEndpointSlices(ctx, nsPath) },"
-        inserted++
-      }
-    }
-    END {if(inserted!=1) exit 55}
-  ' "$path" > "$tmp" || die "cannot register Candidate E2E failure artifact collectors"
-  mv "$tmp" "$path"
-
-  awk -v helper="$helper" '
-    BEGIN {inserted=0}
-    /^\/\/ dumpPodGroups dumps/ && !inserted {
-      while ((getline line < helper) > 0) print line
-      close(helper)
-      inserted++
-    }
-    {print}
-    END {if(inserted!=1) exit 56}
-  ' "$path" > "$tmp" || die "cannot add Candidate E2E failure artifact collectors"
-  mv "$tmp" "$path"
-  rm -f -- "$helper"
-  return 0
-}
-
-patch_candidate_phase_wait_diagnostics() {
-  local path="$CHECKOUT/test/e2e/util/job.go" tmp="$WORK_DIR/patch-phase-wait.tmp"
-  [[ -f "$path" ]] || return 1
-  grep -q 'VPG4: discard errors from already reached phases' "$path" && return 1
-  awk '
-    BEGIN {inside=0; inserted=0}
-    /^func WaitJobPhases\(/ {inside=1}
-    inside && /^[[:space:]]*index\+\+[[:space:]]*$/ {
-      print
-      print "\t\t\tadditionalError = nil // VPG4: discard errors from already reached phases"
-      inserted++
-      next
-    }
-    /^func WaitJobStates\(/ {inside=0}
-    {print}
-    END {if(inserted!=1) exit 57}
-  ' "$path" > "$tmp" || die "cannot improve Candidate phase-wait diagnostics"
-  mv "$tmp" "$path"
-  return 0
 }
 
 patch_e2e_environment() {
@@ -1789,12 +1390,7 @@ patch_e2e_environment() {
       -e 's|admissionregistration.k8s.io/v1beta1|admissionregistration.k8s.io/v1alpha1=true,resource.k8s.io/v1beta1=true|g' \
       "$kind_config"
   fi
-  patch_candidate_ray_offline_images || true
   patch_candidate_e2e_local_image_tags || true
-  patch_candidate_jobseq_readiness || true
-  patch_candidate_ray_running_wait || true
-  patch_candidate_e2e_failure_artifacts || true
-  patch_candidate_phase_wait_diagnostics || true
   patch_candidate_e2e_cluster_identity || true
   git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
   [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "Candidate environment patch is empty"
@@ -1810,12 +1406,7 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   fi
   repaired_e2e_patch=false
   if patch_candidate_e2e_cluster_identity; then repaired_e2e_patch=true; fi
-  if patch_candidate_ray_offline_images; then repaired_e2e_patch=true; fi
   if patch_candidate_e2e_local_image_tags; then repaired_e2e_patch=true; fi
-  if patch_candidate_jobseq_readiness; then repaired_e2e_patch=true; fi
-  if patch_candidate_ray_running_wait; then repaired_e2e_patch=true; fi
-  if patch_candidate_e2e_failure_artifacts; then repaired_e2e_patch=true; fi
-  if patch_candidate_phase_wait_diagnostics; then repaired_e2e_patch=true; fi
   if [[ "$repaired_e2e_patch" == true ]]; then
     git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
     [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "repaired Candidate E2E patch evidence is empty"
@@ -1823,12 +1414,47 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   fi
 fi
 
+RUN_RESULTS_FILE="$OUTPUT_DIR/run-results.tsv"
+RUN_RESULT_COUNT=0
+RUN_FAILURE_COUNT=0
+printf 'category\tname\tstatus\texit_code\tlog\n' > "$RUN_RESULTS_FILE"
+
+record_run_result() {
+  local category="$1" name="$2" status="$3" exit_code="$4" log_path="$5" label
+  RUN_RESULT_COUNT=$((RUN_RESULT_COUNT + 1))
+  if [[ "$status" == failed ]]; then RUN_FAILURE_COUNT=$((RUN_FAILURE_COUNT + 1)); fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$category" "$name" "$status" "$exit_code" "$log_path" >> "$RUN_RESULTS_FILE"
+  case "$status" in
+    passed) label="PASS" ;;
+    previously-passed) label="PASS (completed earlier)" ;;
+    failed) label="FAIL" ;;
+    *) label="$status" ;;
+  esac
+  log "RESULT $label: $category/$name exit=$exit_code log=$log_path"
+}
+
+print_run_result_summary() {
+  local category name status exit_code log_path label
+  log "batch result summary: total=$RUN_RESULT_COUNT failed=$RUN_FAILURE_COUNT"
+  while IFS=$'\t' read -r category name status exit_code log_path; do
+    [[ "$category" != category ]] || continue
+    case "$status" in
+      passed) label="PASS" ;;
+      previously-passed) label="PASS (completed earlier)" ;;
+      failed) label="FAIL" ;;
+      *) label="$status" ;;
+    esac
+    log "  $label $category/$name exit=$exit_code log=$log_path"
+  done < "$RUN_RESULTS_FILE"
+}
+
 run_e2e_one() {
-  local type="$1" number="$2" name runtime runtime_archive artifacts cleanup_value=1
+  local type="$1" number="$2" name runtime runtime_archive artifacts cleanup_value=1 batch_status
   local stage="e2e-${number}-${type,,}" purpose kubeconfig reuse_cluster=false
   local -a runtime_images=()
   if stage_done "$stage"; then
     log "skipping completed Candidate E2E $type"
+    record_run_result e2e "$number-$type" previously-passed 0 "$OUTPUT_DIR/e2e-$number-$type/run.log"
     return
   fi
   name="$(cluster_name "e2e-${type,,}" "$number")"; runtime="$WORK_DIR/runtime-e2e-$number.txt"
@@ -1853,7 +1479,9 @@ run_e2e_one() {
   else
     log "running Candidate E2E $type in $name"
   fi
+  set +e
   (
+    set -e
     cd "$CHECKOUT"
     load_e2e_contract_environment "$type"
     if [[ "$reuse_cluster" == true ]]; then
@@ -1867,12 +1495,16 @@ run_e2e_one() {
       VPG_KIND_CLUSTER_NAME="$name" \
       VPG_CANDIDATE_COMMIT="$CANDIDATE_COMMIT" VPG_RESUME_PURPOSE="$purpose" bash hack/run-e2e-kind.sh
   ) 2>&1 | tee -a "$artifacts/run.log"
-  mark_stage "$stage"
-  if [[ "$KEEP_CLUSTER" != true ]]; then
-    cluster_exists "$name" && kind delete cluster --name "$name" >/dev/null 2>&1 || true
-    state_set ACTIVE_CLUSTER ""; state_set ACTIVE_PURPOSE ""
-    CLUSTER_CREATED=false; CURRENT_CLUSTER=""
+  batch_status=$?
+  set -e
+  if [[ "$batch_status" -eq 0 ]]; then
+    mark_stage "$stage"
+    record_run_result e2e "$number-$type" passed 0 "$artifacts/run.log"
+  else
+    record_run_result e2e "$number-$type" failed "$batch_status" "$artifacts/run.log"
   fi
+  delete_cluster "e2e-$number"
+  case "$batch_status" in 129|130|143) return "$batch_status" ;; esac
 }
 
 create_benchmark_cluster() {
@@ -1942,7 +1574,7 @@ resolve_benchmark_config() {
 }
 
 run_benchmark_one() {
-  local scenario="$1" configured="$2" number="$3" name config round round_dir purpose stage
+  local scenario="$1" configured="$2" number="$3" name config round round_dir purpose stage batch_status
   name="$(cluster_name "benchmark-${scenario,,}" "$number")"
   purpose="benchmark-$number-${scenario,,}"
   config="$(resolve_benchmark_config "$configured" "$number")"
@@ -1985,14 +1617,17 @@ run_benchmark_one() {
   fi
   for ((round=1; round<=BENCHMARK_ROUNDS; round++)); do
     stage="benchmark-${number}-${scenario,,}-round-$round"
+    printf -v round_dir '%s/benchmark-%02d-%s-round-%02d' "$OUTPUT_DIR" "$number" "$scenario" "$round"
     if stage_done "$stage"; then
       log "skipping completed Candidate Benchmark $scenario round $round/$BENCHMARK_ROUNDS"
+      record_run_result benchmark "$number-$scenario-round-$round" previously-passed 0 "$round_dir/run.log"
       continue
     fi
-    printf -v round_dir '%s/benchmark-%02d-%s-round-%02d' "$OUTPUT_DIR" "$number" "$scenario" "$round"
     mkdir -p "$round_dir"
     log "running Candidate Benchmark $scenario round $round/$BENCHMARK_ROUNDS"
+    set +e
     (
+      set -e
       cd "$CHECKOUT/benchmark"
       set +e
       bash scripts/run-tests.sh "$scenario" "--config=$config"
@@ -2002,7 +1637,18 @@ run_benchmark_one() {
       make clean-vcjobs || true
       exit "$test_status"
     ) 2>&1 | tee -a "$round_dir/run.log"
-    mark_stage "$stage"
+    batch_status=$?
+    set -e
+    if [[ "$batch_status" -eq 0 ]]; then
+      mark_stage "$stage"
+      record_run_result benchmark "$number-$scenario-round-$round" passed 0 "$round_dir/run.log"
+    else
+      record_run_result benchmark "$number-$scenario-round-$round" failed "$batch_status" "$round_dir/run.log"
+    fi
+    if [[ "$batch_status" == 129 || "$batch_status" == 130 || "$batch_status" == 143 ]]; then
+      delete_cluster "benchmark-$number"
+      return "$batch_status"
+    fi
   done
   delete_cluster "benchmark-$number"
 }
@@ -2012,8 +1658,9 @@ for ((index=0; index<${#BENCHMARK_RUN_SCENARIOS[@]}; index++)); do
   run_benchmark_one "${BENCHMARK_RUN_SCENARIOS[$index]}" "${BENCHMARK_RUN_CONFIGS[$index]}" "$((index+1))"
 done
 
+if [[ "$RUN_FAILURE_COUNT" -eq 0 ]]; then OVERALL_STATUS=passed; else OVERALL_STATUS=failed; fi
 cat > "$OUTPUT_DIR/summary.txt" <<EOF
-status=passed
+status=$OVERALL_STATUS
 script_version=$SCRIPT_VERSION
 bundle_scope=$BUNDLE_SCOPE
 profile=$PROFILE
@@ -2035,6 +1682,14 @@ go_proxy=$GOPROXY_VALUE
 go_nosumdb=$GONOSUMDB_VALUE
 go_sumdb=$GOSUMDB_VALUE
 go_module_delivery=inner-host-file-proxy
+run_result_count=$RUN_RESULT_COUNT
+run_failure_count=$RUN_FAILURE_COUNT
+run_results_file=$RUN_RESULTS_FILE
 finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
+print_run_result_summary
+if [[ "$RUN_FAILURE_COUNT" -gt 0 ]]; then
+  log "completed all runnable batches with failures; results: $OUTPUT_DIR"
+  exit 1
+fi
 log "completed successfully; results: $OUTPUT_DIR"

@@ -109,6 +109,10 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --vo
 
 结果目录包含准确 Candidate commit、工具/Go 环境、Bundle 和 Docker load 日志、Candidate build 日志、`candidate-e2e-contracts.txt`、环境补丁、E2E artifacts 或 Benchmark results，以及最终 `summary.txt`。`candidate-e2e-contracts.txt` 会列出每轮的上游 Make 目标、Make 参数、非镜像前置目标和最终注入的环境变量。
 
+`FULL`、`both` 或多轮 Benchmark 不会因为一个测试批次返回非零状态就停止：独立 E2E TYPE 失败后继续下一个 TYPE，Benchmark round 失败后继续下一 round 和下一个场景。每批结果会立即打印为 `RESULT PASS` 或 `RESULT FAIL`，最后再次输出完整批次清单，并写入 `run-results.tsv`。`summary.txt` 中的 `status`、`run_result_count` 和 `run_failure_count` 给出整体结论；只要存在失败批次，脚本在全部可运行批次完成后仍以非零状态退出，不会把部分失败误报为整体成功。
+
+上述继续策略以独立 E2E TYPE 和 Benchmark round 为边界。Bundle 校验、依赖下载、Candidate 构建、E2E 契约解析、Benchmark 共享基础设施或结果文件写入失败仍会立即停止；某个 E2E TYPE 自己的 Kind 创建、安装或测试命令失败会记为该批失败并继续下一个独立 TYPE。用户按 `Ctrl+C` 或进程收到终止信号时不会继续后续批次。
+
 保留临时 checkout、Go cache 和构建现场，以便失败后恢复：
 
 ```bash
@@ -127,7 +131,7 @@ bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --outpu
 bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0
 ```
 
-恢复会复用已经完成并验证过的 Candidate checkout、Go module cache、Ginkgo 和 Candidate 镜像构建；完整 E2E/Benchmark 中已经成功的独立 E2E 类型和 Benchmark round 会跳过。Bundle、Candidate、profile/mode、测试选择、轮数或集群前缀只要有一项不同，脚本就拒绝混用该工作目录。显式指定过 `--mode`、`--e2e-type`、`--benchmark-scenario`、`--benchmark-config`、`--benchmark-rounds`、`--pods`、`--scheduler-name` 或 `--cluster-prefix` 时，恢复命令必须重复相同参数。
+恢复会复用已经完成并验证过的 Candidate checkout、Go module cache、Ginkgo 和 Candidate 镜像构建；完整 E2E/Benchmark 中已经成功的独立 E2E 类型和 Benchmark round 会跳过，失败批次没有完成标记，因此会重新执行。Bundle、Candidate、profile/mode、测试选择、轮数或集群前缀只要有一项不同，脚本就拒绝混用该工作目录。显式指定过 `--mode`、`--e2e-type`、`--benchmark-scenario`、`--benchmark-config`、`--benchmark-rounds`、`--pods`、`--scheduler-name` 或 `--cluster-prefix` 时，恢复命令必须重复相同参数。
 
 Candidate 身份以仓库地址和精确 commit 为准。`go mod download all` 可能补写 `go.sum`，离线构建适配也会修改 Dockerfile；这些未提交的工作树变化不会阻断后续构建，脚本会把构建补丁前的状态保存到结果目录供追溯。
 
@@ -386,7 +390,9 @@ Profile 按需选择的默认镜像：
 | Monitoring     | `grafana`              | `grafana/grafana:latest`                                | 同名                 |
 | Monitoring     | `kube-state-metrics`   | `docker.io/volcanosh/kube-state-metrics:v2.0.0-beta`    | 同名                 |
 
-打包脚本会在外网宿主机下载并逐项校验 TensorFlow 所需的 MNIST 和 PyTorch 所需的 FashionMNIST，再把数据交给完全禁网的临时容器转换、固化并验证。下载因此使用打包命令所在宿主机的代理，不要求 Docker 容器能够连接宿主代理。内网脚本会在创建 Kind 集群前重复该禁网检查；JOBSEQ 的 Ray 用例保留已装入节点的离线镜像，不执行上游测试中的 containerd image prune；Candidate E2E 中无 tag 的 `busybox`/`nginx` 也会在临时 checkout 内固定为包中已有的非 `latest` tag，避免 Kubernetes 默认重新拉取。因此完整 E2E 不会在 Pod 启动后继续下载这两套训练数据、删除刚装入的 Ray 镜像，或因隐式 `latest` 再访问镜像仓库。
+Candidate E2E 中无 tag 的 `busybox`/`nginx` 会在临时 checkout 内固定为包中已有的非 `latest` tag，避免 Kubernetes 默认重新拉取。
+
+除上述镜像引用、Kubernetes 版本兼容、离线镜像加载和保存集群恢复外，部署脚本不改写某个具体 E2E 用例的启动命令、等待时间、网络参数或通过条件。TensorFlow、MPI、Ray 及其他测试均执行所选 Candidate 的原生实现；环境不满足时保留其原始失败结果，由使用者结合 `run-results.tsv` 和各批 `run.log` 判断。
 
 `busybox:1.24` 使用旧 schema 1，Docker 29/containerd 2.1 会拒绝拉取。因此脚本保存现代 `busybox:1.36`，同时创建 Candidate 仍引用的 `busybox:1.24` 本地标签。
 
