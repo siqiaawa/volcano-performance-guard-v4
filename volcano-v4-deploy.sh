@@ -1335,21 +1335,65 @@ patch_candidate_e2e_local_image_tags() {
 # Runtime images are already present in an offline Kind cluster, so distributed
 # JobSeq pods can start much faster than they do in the upstream online CI. Do
 # not use image-pull latency as an implicit readiness barrier: wait for the
-# actual TensorFlow PS and MPI worker SSH endpoints before starting clients.
+# TensorFlow PS, give its non-chief worker time to start, and verify MPI worker
+# SSH ports before starting clients.
 patch_candidate_jobseq_readiness() {
   local root="$CHECKOUT/test/e2e/jobseq" path tmp changed=false
   [[ -d "$root" ]] || return 1
 
   for path in "$root/tensorflow.go" "$root/tensorflow_plugin.go"; do
     [[ -f "$path" ]] || continue
-    grep -q 'VPG4_TF_PS_READY' "$path" && continue
+    if grep -Fq 'nc -z -w 1 ${PS_READY_HOST} 2222' "$path"; then
+      awk '{gsub(/nc -z -w 1 \$\{PS_READY_HOST\} 2222/, "python -c \047import socket,sys; socket.create_connection((sys.argv[1],2222),1).close()\047 ${PS_READY_HOST}"); print}' \
+        "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+        die "cannot repair TensorFlow PS readiness in Candidate E2E: ${path#$CHECKOUT/}"
+      mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+      changed=true
+    fi
+    if grep -q 'VPG4_TF_PEER_READY' "$path"; then
+      awk '
+        BEGIN {replaced=0}
+        {
+          if ($0 ~ /VPG4_TF_PEER_READY/) {
+            sub(/if printf %s \$\{TF_CONFIG\} \| grep -q index\.:0; then .*; fi; python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/,
+                "if printf %s ${TF_CONFIG} | grep -q index.:0; then VPG4_TF_CHIEF_DELAY=15; sleep ${VPG4_TF_CHIEF_DELAY}; fi; python /var/tf_dist_mnist/dist_mnist.py --train_steps 1000")
+            replaced++
+          }
+          print
+        }
+        END {if(replaced!=1) exit 50}
+      ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+        die "cannot repair TensorFlow chief readiness in Candidate E2E: ${path#$CHECKOUT/}"
+      mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+      changed=true
+      continue
+    fi
+    grep -q 'VPG4_TF_CHIEF_DELAY' "$path" && continue
+    if grep -q 'VPG4_TF_PS_READY' "$path"; then
+      awk '
+        BEGIN {replaced=0}
+        {
+          if ($0 ~ /VPG4_TF_PS_READY/ && $0 ~ /python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/) {
+            sub(/python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/,
+                "if printf %s ${TF_CONFIG} | grep -q index.:0; then VPG4_TF_CHIEF_DELAY=15; sleep ${VPG4_TF_CHIEF_DELAY}; fi; python /var/tf_dist_mnist/dist_mnist.py --train_steps 1000")
+            replaced++
+          }
+          print
+        }
+        END {if(replaced!=1) exit 50}
+      ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+        die "cannot add TensorFlow chief delay to Candidate E2E: ${path#$CHECKOUT/}"
+      mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+      changed=true
+      continue
+    fi
     awk '
       BEGIN {worker=0; replaced=0}
       /Name:[[:space:]]+"worker"/ {worker=1}
       {
         if (worker && $0 ~ /python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/) {
           sub(/python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/,
-              "PS_READY_HOST=$(head -n 1 /etc/volcano/ps.host); VPG4_TF_PS_READY=false; for attempt in $(seq 1 60); do if nc -z -w 1 ${PS_READY_HOST} 2222 >/dev/null 2>\\&1; then VPG4_TF_PS_READY=true; break; fi; sleep 1; done; if [ ${VPG4_TF_PS_READY} != true ]; then echo TensorFlow_PS_not_ready:${PS_READY_HOST} >\\&2; exit 1; fi; if printf %s ${TF_CONFIG} | grep -q index.:0; then VPG4_TF_PEER_HOST=$(tail -n 1 /etc/volcano/worker.host); VPG4_TF_PEER_READY=false; for attempt in $(seq 1 60); do if nc -z -w 1 ${VPG4_TF_PEER_HOST} 2222 >/dev/null 2>\\&1; then VPG4_TF_PEER_READY=true; break; fi; sleep 1; done; if [ ${VPG4_TF_PEER_READY} != true ]; then echo TensorFlow_peer_not_ready:${VPG4_TF_PEER_HOST} >\\&2; exit 1; fi; fi; python /var/tf_dist_mnist/dist_mnist.py --train_steps 1000")
+              "PS_READY_HOST=$(head -n 1 /etc/volcano/ps.host); VPG4_TF_PS_READY=false; for attempt in $(seq 1 60); do if python -c \047import socket,sys; socket.create_connection((sys.argv[1],2222),1).close()\047 ${PS_READY_HOST} >/dev/null 2>\\&1; then VPG4_TF_PS_READY=true; break; fi; sleep 1; done; if [ ${VPG4_TF_PS_READY} != true ]; then echo TensorFlow_PS_not_ready:${PS_READY_HOST} >\\&2; exit 1; fi; if printf %s ${TF_CONFIG} | grep -q index.:0; then VPG4_TF_CHIEF_DELAY=15; sleep ${VPG4_TF_CHIEF_DELAY}; fi; python /var/tf_dist_mnist/dist_mnist.py --train_steps 1000")
           worker=0
           replaced++
         }
@@ -1363,7 +1407,13 @@ patch_candidate_jobseq_readiness() {
   done
 
   path="$root/mpi.go"
-  if [[ -f "$path" ]] && ! grep -q 'VPG4_MPI_WORKERS' "$path"; then
+  if [[ -f "$path" ]] && grep -Fq 'timeout 1 ssh ${host} true' "$path"; then
+    awk '{gsub(/timeout 1 ssh \$\{host\} true/, "timeout 2 bash -c \"exec 3<>/dev/tcp/${host}/22\""); print}' \
+      "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+      die "cannot repair MPI worker readiness in Candidate E2E: ${path#$CHECKOUT/}"
+    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+    changed=true
+  elif [[ -f "$path" ]] && ! grep -q 'VPG4_MPI_WORKERS' "$path"; then
     awk '
       BEGIN {replaced=0}
       {
@@ -1372,7 +1422,7 @@ patch_candidate_jobseq_readiness() {
           print "for host in ${VPG4_MPI_WORKERS}; do"
           print "  VPG4_MPI_WORKER_READY=false"
           print "  for attempt in $(seq 1 60); do"
-          print "    if timeout 1 ssh ${host} true >/dev/null 2>&1; then VPG4_MPI_WORKER_READY=true; break; fi"
+          print "    if timeout 2 bash -c \"exec 3<>/dev/tcp/${host}/22\" >/dev/null 2>&1; then VPG4_MPI_WORKER_READY=true; break; fi"
           print "    sleep 1"
           print "  done"
           print "  if [ ${VPG4_MPI_WORKER_READY} != true ]; then echo MPI_worker_SSH_not_ready:${host} >&2; exit 1; fi"
@@ -1391,7 +1441,13 @@ patch_candidate_jobseq_readiness() {
   fi
 
   path="$root/mpi_plugin.go"
-  if [[ -f "$path" ]] && ! grep -q 'VPG4_MPI_WORKERS' "$path"; then
+  if [[ -f "$path" ]] && grep -Fq 'timeout 1 ssh ${host} true' "$path"; then
+    awk '{gsub(/timeout 1 ssh \$\{host\} true/, "timeout 2 bash -c \"exec 3<>/dev/tcp/${host}/22\""); print}' \
+      "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+      die "cannot repair MPI plugin worker readiness in Candidate E2E: ${path#$CHECKOUT/}"
+    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+    changed=true
+  elif [[ -f "$path" ]] && ! grep -q 'VPG4_MPI_WORKERS' "$path"; then
     awk '
       BEGIN {replaced=0}
       {
@@ -1400,7 +1456,7 @@ patch_candidate_jobseq_readiness() {
           print "for host in ${VPG4_MPI_WORKERS}; do"
           print "  VPG4_MPI_WORKER_READY=false"
           print "  for attempt in $(seq 1 60); do"
-          print "    if timeout 1 ssh ${host} true >/dev/null 2>&1; then VPG4_MPI_WORKER_READY=true; break; fi"
+          print "    if timeout 2 bash -c \"exec 3<>/dev/tcp/${host}/22\" >/dev/null 2>&1; then VPG4_MPI_WORKER_READY=true; break; fi"
           print "    sleep 1"
           print "  done"
           print "  if [ ${VPG4_MPI_WORKER_READY} != true ]; then echo MPI_worker_SSH_not_ready:${host} >&2; exit 1; fi"
