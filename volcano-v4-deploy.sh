@@ -3,7 +3,7 @@
 # Candidate, build it locally and invoke the Candidate's own E2E/Benchmark code.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.3.0"
+SCRIPT_VERSION="v4.3.1"
 RESUME_STATE_FORMAT="1"
 DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
 DEFAULT_GOPROXY="https://cmc.centralrepo.rnd.huawei.com/cbu-go,direct"
@@ -1332,6 +1332,285 @@ patch_candidate_e2e_local_image_tags() {
   [[ "$changed" == true ]]
 }
 
+# Runtime images are already present in an offline Kind cluster, so distributed
+# JobSeq pods can start much faster than they do in the upstream online CI. Do
+# not use image-pull latency as an implicit readiness barrier: wait for the
+# actual TensorFlow PS and MPI worker SSH endpoints before starting clients.
+patch_candidate_jobseq_readiness() {
+  local root="$CHECKOUT/test/e2e/jobseq" path tmp changed=false
+  [[ -d "$root" ]] || return 1
+
+  for path in "$root/tensorflow.go" "$root/tensorflow_plugin.go"; do
+    [[ -f "$path" ]] || continue
+    grep -q 'VPG4_TF_PS_READY' "$path" && continue
+    awk '
+      BEGIN {worker=0; replaced=0}
+      /Name:[[:space:]]+"worker"/ {worker=1}
+      {
+        if (worker && $0 ~ /python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/) {
+          sub(/python \/var\/tf_dist_mnist\/dist_mnist.py --train_steps 1000/,
+              "PS_READY_HOST=$(head -n 1 /etc/volcano/ps.host); VPG4_TF_PS_READY=false; for attempt in $(seq 1 60); do if nc -z -w 1 ${PS_READY_HOST} 2222 >/dev/null 2>\\&1; then VPG4_TF_PS_READY=true; break; fi; sleep 1; done; if [ ${VPG4_TF_PS_READY} != true ]; then echo TensorFlow_PS_not_ready:${PS_READY_HOST} >\\&2; exit 1; fi; if printf %s ${TF_CONFIG} | grep -q index.:0; then VPG4_TF_PEER_HOST=$(tail -n 1 /etc/volcano/worker.host); VPG4_TF_PEER_READY=false; for attempt in $(seq 1 60); do if nc -z -w 1 ${VPG4_TF_PEER_HOST} 2222 >/dev/null 2>\\&1; then VPG4_TF_PEER_READY=true; break; fi; sleep 1; done; if [ ${VPG4_TF_PEER_READY} != true ]; then echo TensorFlow_peer_not_ready:${VPG4_TF_PEER_HOST} >\\&2; exit 1; fi; fi; python /var/tf_dist_mnist/dist_mnist.py --train_steps 1000")
+          worker=0
+          replaced++
+        }
+        print
+      }
+      END {if(replaced!=1) exit 51}
+    ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+      die "cannot add TensorFlow PS readiness to Candidate E2E: ${path#$CHECKOUT/}"
+    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+    changed=true
+  done
+
+  path="$root/mpi.go"
+  if [[ -f "$path" ]] && ! grep -q 'VPG4_MPI_WORKERS' "$path"; then
+    awk '
+      BEGIN {replaced=0}
+      {
+        if ($0 ~ /mpiexec --allow-run-as-root --hostfile \/etc\/volcano\/mpiworker.host -np 2 mpi_hello_world > \/home\/re`/) {
+          print "VPG4_MPI_WORKERS=$(cat /etc/volcano/mpiworker.host)"
+          print "for host in ${VPG4_MPI_WORKERS}; do"
+          print "  VPG4_MPI_WORKER_READY=false"
+          print "  for attempt in $(seq 1 60); do"
+          print "    if timeout 1 ssh ${host} true >/dev/null 2>&1; then VPG4_MPI_WORKER_READY=true; break; fi"
+          print "    sleep 1"
+          print "  done"
+          print "  if [ ${VPG4_MPI_WORKER_READY} != true ]; then echo MPI_worker_SSH_not_ready:${host} >&2; exit 1; fi"
+          print "done"
+          print "mpiexec --allow-run-as-root --hostfile /etc/volcano/mpiworker.host -np 2 mpi_hello_world`,"
+          replaced++
+          next
+        }
+        print
+      }
+      END {if(replaced!=1) exit 52}
+    ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+      die "cannot add MPI worker readiness to Candidate E2E: ${path#$CHECKOUT/}"
+    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+    changed=true
+  fi
+
+  path="$root/mpi_plugin.go"
+  if [[ -f "$path" ]] && ! grep -q 'VPG4_MPI_WORKERS' "$path"; then
+    awk '
+      BEGIN {replaced=0}
+      {
+        if ($0 ~ /mpiexec --allow-run-as-root --host \$\{MPI_HOST\} -np 2 mpi_hello_world > \/home\/re`/) {
+          print "VPG4_MPI_WORKERS=$(printf %s ${MPI_HOST} | tr , \047 \047)"
+          print "for host in ${VPG4_MPI_WORKERS}; do"
+          print "  VPG4_MPI_WORKER_READY=false"
+          print "  for attempt in $(seq 1 60); do"
+          print "    if timeout 1 ssh ${host} true >/dev/null 2>&1; then VPG4_MPI_WORKER_READY=true; break; fi"
+          print "    sleep 1"
+          print "  done"
+          print "  if [ ${VPG4_MPI_WORKER_READY} != true ]; then echo MPI_worker_SSH_not_ready:${host} >&2; exit 1; fi"
+          print "done"
+          print "mpiexec --allow-run-as-root --host ${MPI_HOST} -np 2 mpi_hello_world`,"
+          replaced++
+          next
+        }
+        print
+      }
+      END {if(replaced!=1) exit 53}
+    ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+      die "cannot add MPI plugin worker readiness to Candidate E2E: ${path#$CHECKOUT/}"
+    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+    changed=true
+  fi
+
+  [[ "$changed" == true ]]
+}
+
+# Ray is intentionally a long-running Job. The upstream test waits for its
+# Service before opening a phase watch, by which time a preloaded offline image
+# can already be Running. Verify the real final requirement instead of requiring
+# observation of the transient Pending event.
+patch_candidate_ray_running_wait() {
+  local path="$CHECKOUT/test/e2e/jobseq/ray_plugin.go" tmp="$WORK_DIR/patch-ray-wait.tmp"
+  [[ -f "$path" ]] || return 1
+  grep -q 'WaitJobStates(testCtx, job.*vcbatch.Running' "$path" && return 1
+  awk '
+    BEGIN {pending=0; replaced=0}
+    {
+      if (!pending && $0 ~ /err := e2eutil.WaitJobPhases\(testCtx, job, \[\]vcbatch.JobPhase\{/) {
+        held=$0
+        pending=1
+        next
+      }
+      if (pending) {
+        if ($0 ~ /vcbatch.Pending,[[:space:]]*vcbatch.Running\}\)/) {
+          print "\t\terr := e2eutil.WaitJobStates(testCtx, job, []vcbatch.JobPhase{vcbatch.Running}, e2eutil.TenMinute)"
+          replaced++
+        } else {
+          print held
+          print
+        }
+        pending=0
+        next
+      }
+      print
+    }
+    END {if(pending || replaced!=1) exit 54}
+  ' "$path" > "$tmp" || die "cannot make Candidate Ray E2E wait for its real final state"
+  mv "$tmp" "$path"
+  return 0
+}
+
+# Preserve the Candidate's normal pass/fail criteria while collecting the
+# evidence needed to diagnose real application failures before namespace
+# cleanup. Secrets are deliberately excluded.
+patch_candidate_e2e_failure_artifacts() {
+  local path="$CHECKOUT/test/e2e/util/util.go" tmp="$WORK_DIR/patch-e2e-artifacts.tmp"
+  local helper="$WORK_DIR/patch-e2e-artifacts.go"
+  [[ -f "$path" ]] || return 1
+  grep -q '^func dumpPodLogs' "$path" && return 1
+  grep -q '"pods".*dumpPods' "$path" || return 1
+  grep -q '^// dumpPodGroups dumps' "$path" || return 1
+
+  cat > "$helper" <<'EOF'
+// dumpPodLogs saves current and previous logs for every regular and init
+// container before the failed test namespace is removed.
+func dumpPodLogs(ctx *TestContext, path string) error {
+	pods, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list pods for logs: %v", err)
+	}
+	logsPath := filepath.Join(path, "pod-logs")
+	if err := os.MkdirAll(logsPath, 0755); err != nil {
+		return fmt.Errorf("failed to create pod log directory: %v", err)
+	}
+	for _, pod := range pods.Items {
+		containers := append([]v1.Container{}, pod.Spec.InitContainers...)
+		containers = append(containers, pod.Spec.Containers...)
+		statuses := append([]v1.ContainerStatus{}, pod.Status.InitContainerStatuses...)
+		statuses = append(statuses, pod.Status.ContainerStatuses...)
+		for _, container := range containers {
+			hasPrevious := false
+			for _, status := range statuses {
+				if status.Name == container.Name && status.RestartCount > 0 {
+					hasPrevious = true
+				}
+			}
+			for _, previous := range []bool{false, true} {
+				if previous && !hasPrevious {
+					continue
+				}
+				label := "current"
+				if previous {
+					label = "previous"
+				}
+				data, logErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).GetLogs(
+					pod.Name, &v1.PodLogOptions{Container: container.Name, Previous: previous, Timestamps: true},
+				).DoRaw(context.TODO())
+				if logErr != nil {
+					data = []byte(fmt.Sprintf("unable to collect log: %v\n", logErr))
+				}
+				name := fmt.Sprintf("%s--%s--%s.log", pod.Name, container.Name, label)
+				if err := os.WriteFile(filepath.Join(logsPath, name), data, 0644); err != nil {
+					klog.Errorf("Failed to write pod log %s: %v", name, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func dumpServices(ctx *TestContext, path string) error {
+	items, err := ctx.Kubeclient.CoreV1().Services(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list services: %v", err)
+	}
+	return writeResourceToFile(items, filepath.Join(path, "services.yaml"))
+}
+
+func dumpConfigMaps(ctx *TestContext, path string) error {
+	items, err := ctx.Kubeclient.CoreV1().ConfigMaps(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list configmaps: %v", err)
+	}
+	return writeResourceToFile(items, filepath.Join(path, "configmaps.yaml"))
+}
+
+func dumpEvents(ctx *TestContext, path string) error {
+	items, err := ctx.Kubeclient.CoreV1().Events(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list events: %v", err)
+	}
+	return writeResourceToFile(items, filepath.Join(path, "events.yaml"))
+}
+
+func dumpNetworkPolicies(ctx *TestContext, path string) error {
+	items, err := ctx.Kubeclient.NetworkingV1().NetworkPolicies(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list network policies: %v", err)
+	}
+	return writeResourceToFile(items, filepath.Join(path, "networkpolicies.yaml"))
+}
+
+func dumpEndpointSlices(ctx *TestContext, path string) error {
+	items, err := ctx.Kubeclient.DiscoveryV1().EndpointSlices(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list endpoint slices: %v", err)
+	}
+	return writeResourceToFile(items, filepath.Join(path, "endpointslices.yaml"))
+}
+
+EOF
+
+  awk '
+    BEGIN {inserted=0}
+    {
+      print
+      if ($0 ~ /"pods".*dumpPods/) {
+        print "\t\t\"pod logs\":        func() error { return dumpPodLogs(ctx, nsPath) },"
+        print "\t\t\"services\":        func() error { return dumpServices(ctx, nsPath) },"
+        print "\t\t\"configmaps\":      func() error { return dumpConfigMaps(ctx, nsPath) },"
+        print "\t\t\"events\":          func() error { return dumpEvents(ctx, nsPath) },"
+        print "\t\t\"networkpolicies\": func() error { return dumpNetworkPolicies(ctx, nsPath) },"
+        print "\t\t\"endpointslices\":   func() error { return dumpEndpointSlices(ctx, nsPath) },"
+        inserted++
+      }
+    }
+    END {if(inserted!=1) exit 55}
+  ' "$path" > "$tmp" || die "cannot register Candidate E2E failure artifact collectors"
+  mv "$tmp" "$path"
+
+  awk -v helper="$helper" '
+    BEGIN {inserted=0}
+    /^\/\/ dumpPodGroups dumps/ && !inserted {
+      while ((getline line < helper) > 0) print line
+      close(helper)
+      inserted++
+    }
+    {print}
+    END {if(inserted!=1) exit 56}
+  ' "$path" > "$tmp" || die "cannot add Candidate E2E failure artifact collectors"
+  mv "$tmp" "$path"
+  rm -f -- "$helper"
+  return 0
+}
+
+patch_candidate_phase_wait_diagnostics() {
+  local path="$CHECKOUT/test/e2e/util/job.go" tmp="$WORK_DIR/patch-phase-wait.tmp"
+  [[ -f "$path" ]] || return 1
+  grep -q 'VPG4: discard errors from already reached phases' "$path" && return 1
+  awk '
+    BEGIN {inside=0; inserted=0}
+    /^func WaitJobPhases\(/ {inside=1}
+    inside && /^[[:space:]]*index\+\+[[:space:]]*$/ {
+      print
+      print "\t\t\tadditionalError = nil // VPG4: discard errors from already reached phases"
+      inserted++
+      next
+    }
+    /^func WaitJobStates\(/ {inside=0}
+    {print}
+    END {if(inserted!=1) exit 57}
+  ' "$path" > "$tmp" || die "cannot improve Candidate phase-wait diagnostics"
+  mv "$tmp" "$path"
+  return 0
+}
+
 patch_e2e_environment() {
   local install="$CHECKOUT/hack/lib/install.sh" runner="$CHECKOUT/hack/run-e2e-kind.sh"
   local kind_config="$CHECKOUT/hack/e2e-kind-config.yaml"
@@ -1414,6 +1693,10 @@ patch_e2e_environment() {
   fi
   patch_candidate_ray_offline_images || true
   patch_candidate_e2e_local_image_tags || true
+  patch_candidate_jobseq_readiness || true
+  patch_candidate_ray_running_wait || true
+  patch_candidate_e2e_failure_artifacts || true
+  patch_candidate_phase_wait_diagnostics || true
   patch_candidate_e2e_cluster_identity || true
   git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
   [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "Candidate environment patch is empty"
@@ -1431,6 +1714,10 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   if patch_candidate_e2e_cluster_identity; then repaired_e2e_patch=true; fi
   if patch_candidate_ray_offline_images; then repaired_e2e_patch=true; fi
   if patch_candidate_e2e_local_image_tags; then repaired_e2e_patch=true; fi
+  if patch_candidate_jobseq_readiness; then repaired_e2e_patch=true; fi
+  if patch_candidate_ray_running_wait; then repaired_e2e_patch=true; fi
+  if patch_candidate_e2e_failure_artifacts; then repaired_e2e_patch=true; fi
+  if patch_candidate_phase_wait_diagnostics; then repaired_e2e_patch=true; fi
   if [[ "$repaired_e2e_patch" == true ]]; then
     git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
     [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "repaired Candidate E2E patch evidence is empty"
