@@ -39,17 +39,7 @@ volcano-v4-1.34.8-full.tar.gz.parts.sha256
 
 部署时把 `.part-000` 交给 `--bundle`；脚本会校验全部分卷并自动重组。以后只更新部署逻辑时，只替换 `volcano-v4-deploy.sh`，不需要重新制作或传输 full 包。
 
-### 2. 内网设置已验证的 Go Proxy
-
-每个新终端执行一次：
-
-```bash
-export GOPROXY=https://cmc.centralrepo.rnd.huawei.com/cbu-go GOPRIVATE= GONOPROXY=none GONOSUMDB='*' GOSUMDB=off
-```
-
-注意变量名是 `GOSUMDB`。以下命令都使用 `v1.15.0` 作为 Candidate，并显式把工作目录放在当前磁盘，而不是根分区的 `/tmp`。一个工作目录只能属于一个 Candidate 和一种完整的运行选择。
-
-### 3. 内网验证各个场景
+### 2. 内网验证各个场景
 
 一次运行全部独立 E2E 和全部 Benchmark：
 
@@ -99,7 +89,7 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --vo
 bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode both --e2e-type SCHEDULINGBASE --benchmark-scenario gang --work-dir ./work/v1.15.0-basic --output ./results/v1.15.0-basic
 ```
 
-### 4. 更换 Candidate Volcano
+### 3. 更换 Candidate Volcano
 
 同一个 full 包可以反复测试 tag、branch 或 40 位 commit。只修改 `--volcano-ref`，并为新 Candidate 使用新的工作目录和结果目录。例如从 `v1.15.0` 切换到 `release-1.15`：
 

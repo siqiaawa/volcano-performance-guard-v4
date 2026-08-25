@@ -6,7 +6,7 @@ set -Eeuo pipefail
 SCRIPT_VERSION="v4.3.0"
 RESUME_STATE_FORMAT="1"
 DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
-DEFAULT_GOPROXY="https://cmc.centralrepo.rnd.huawei.com/cbu-go,direct"
+DEFAULT_GOPROXY="direct"
 DEFAULT_GONOSUMDB="*"
 DEFAULT_GOSUMDB="off"
 
@@ -74,7 +74,7 @@ Input/output:
 Candidate selection:
   --volcano-ref REF           Required branch, tag or commit to test
   --volcano-repo URL          Default: official Volcano repository
-  --goproxy VALUE             Default: approved inner-server proxy
+  --goproxy VALUE             Default: GOPROXY environment, otherwise direct
   --gonosumdb VALUE           Default: *
   --gosumdb VALUE             Default: off
 
@@ -93,8 +93,9 @@ Run selection (must be covered by the bundle profile):
 The server itself only needs Bash, curl, git, Docker, tar, gzip, sha256sum,
 make and basic POSIX tools. Exact Kind, kubectl, Helm, jq and Go come from the
 bundle. The Candidate's complete Go module graph and selected Ginkgo are first
-downloaded on the inner host through its approved Go proxy. Docker builders
-then consume a temporary file proxy and never contact that HTTPS proxy. The
+downloaded on the inner host through its configured Go module source. Docker
+builders then consume a temporary file proxy and never contact that HTTPS
+proxy. The
 generic bundle contains no Volcano source or Go modules. Nothing is installed
 system-wide. A saved work directory resumes only when its bundle and complete
 run identity match. A saved cluster restarts the selected E2E suite or failed
