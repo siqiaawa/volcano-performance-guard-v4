@@ -3,7 +3,7 @@
 # Candidate, build it locally and invoke the Candidate's own E2E/Benchmark code.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v4.3.1"
+SCRIPT_VERSION="v4.3.0"
 RESUME_STATE_FORMAT="1"
 DEFAULT_VOLCANO_REPO="https://github.com/volcano-sh/volcano.git"
 DEFAULT_GOPROXY="https://cmc.centralrepo.rnd.huawei.com/cbu-go,direct"
