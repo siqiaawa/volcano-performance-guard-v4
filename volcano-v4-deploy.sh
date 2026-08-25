@@ -1336,7 +1336,7 @@ patch_candidate_e2e_local_image_tags() {
 # JobSeq pods can start much faster than they do in the upstream online CI. Do
 # not use image-pull latency as an implicit readiness barrier: wait for the
 # TensorFlow PS, give its non-chief worker time to start, and verify MPI worker
-# SSH ports before starting clients.
+# SSH authentication before starting OpenMPI over the Pod network.
 patch_candidate_jobseq_readiness() {
   local root="$CHECKOUT/test/e2e/jobseq" path tmp changed=false
   [[ -d "$root" ]] || return 1
@@ -1473,6 +1473,47 @@ patch_candidate_jobseq_readiness() {
     mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
     changed=true
   fi
+
+  # A listening port only proves that sshd has started. Make authentication
+  # non-interactive and bounded so mpiexec cannot wait forever at a password
+  # prompt. Launch every remote daemon from the master and pin OpenMPI to the
+  # Pod interface; this avoids topology-dependent rsh tree spawning and host
+  # interface selection in Kind clusters. StrictModes is disabled only for the
+  # short-lived E2E sshd because its authorized_keys comes from a Secret mount.
+  for path in "$root/mpi.go" "$root/mpi_plugin.go"; do
+    [[ -f "$path" ]] || continue
+    grep -q 'VPG4_MPI_WORKERS' "$path" || continue
+    grep -q 'VPG4_MPI_AUTH_READY' "$path" && continue
+    awk '
+      BEGIN {auth=0; launch=0}
+      {
+        gsub(/\/usr\/sbin\/sshd -D;/, "/usr/sbin/sshd -D -o StrictModes=no;")
+        gsub(/\/usr\/sbin\/sshd;/, "/usr/sbin/sshd -o StrictModes=no;")
+        if ($0 ~ /if \[ \$\{VPG4_MPI_WORKER_READY\} != true \]; then echo MPI_worker_SSH_not_ready:/) {
+          print
+          print "  VPG4_MPI_AUTH_READY=false"
+          print "  VPG4_MPI_SSH_ERROR=/tmp/vpg4-mpi-ssh-error"
+          print "  for attempt in $(seq 1 12); do"
+          print "    if timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 ${host} true >${VPG4_MPI_SSH_ERROR} 2>&1; then VPG4_MPI_AUTH_READY=true; break; fi"
+          print "    sleep 1"
+          print "  done"
+          print "  if [ ${VPG4_MPI_AUTH_READY} != true ]; then echo MPI_worker_SSH_authentication_failed:${host} >&2; cat ${VPG4_MPI_SSH_ERROR} >&2; exit 1; fi"
+          print "  rm -f ${VPG4_MPI_SSH_ERROR}"
+          auth++
+          next
+        }
+        if ($0 ~ /mpiexec --allow-run-as-root/ && $0 !~ /plm_rsh_no_tree_spawn/) {
+          sub(/mpiexec --allow-run-as-root /, "mpiexec --allow-run-as-root --mca plm_rsh_no_tree_spawn 1 --mca plm_rsh_args \047-o BatchMode=yes -o ConnectTimeout=5\047 --mca oob_tcp_if_include eth0 --mca btl_tcp_if_include eth0 ")
+          launch++
+        }
+        print
+      }
+      END {if(auth!=1 || launch!=1) exit 54}
+    ' "$path" > "$WORK_DIR/patch-jobseq-readiness.tmp" || \
+      die "cannot harden MPI SSH launch in Candidate E2E: ${path#$CHECKOUT/}"
+    mv "$WORK_DIR/patch-jobseq-readiness.tmp" "$path"
+    changed=true
+  done
 
   [[ "$changed" == true ]]
 }
