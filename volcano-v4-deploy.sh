@@ -101,9 +101,11 @@ system-wide. A saved work directory resumes only when its bundle and complete
 run identity match. A saved cluster restarts the selected E2E suite or failed
 Benchmark round; it cannot resume inside one Ginkgo spec or one go test process.
 When multiple E2E types, Benchmark scenarios, or Benchmark rounds are selected,
-a failed test batch is recorded and later batches still run. Fatal dependency,
-build, shared-infrastructure, or result-write failures still stop immediately. The final
-exit status remains nonzero when any test batch failed.
+a failed test batch is recorded and later batches still run. Fatal bundle,
+dependency, build, resume-identity, or result-write failures still stop
+immediately. Infrastructure failure reported from inside an E2E runner ends
+that batch before later selected batches continue. The final exit status remains
+nonzero when any test batch failed.
 EOF
 }
 
@@ -684,8 +686,10 @@ add_e2e_contract_key() {
 }
 
 resolve_candidate_e2e_contract() {
-  local type="$1" target_line rhs item dry_run runner prefix capture assignment key value file found=false index
-  local -a runner_lines=() prerequisites=() keys=() values=()
+  local type="$1" target_line rhs item dry_run runner prefix make_capture prefix_capture make_helper
+  local assignment key value file source
+  local -a runner_lines=() prerequisites=() environment_keys=()
+  local -A environment=()
   RESOLVED_E2E_ERROR=""
   [[ "$type" =~ ^[A-Z][A-Z0-9_]*$ ]] || { RESOLVED_E2E_ERROR="invalid E2E type: $type"; return 11; }
   e2e_make_target_for_type "$type"
@@ -718,35 +722,76 @@ resolve_candidate_e2e_contract() {
     *' hack/run-e2e-kind.sh') prefix="${runner% hack/run-e2e-kind.sh}" ;;
     *) RESOLVED_E2E_ERROR="unsupported upstream E2E recipe: $runner"; return 11 ;;
   esac
-  capture="$WORK_DIR/e2e-contract-${type,,}.env"
-  # The Candidate is built and executed later. Evaluate only its leading
-  # assignments in an empty environment so host credentials cannot leak.
-  if ! (cd "$CHECKOUT"; env -i PATH=/usr/bin:/bin bash -c "${prefix:+$prefix }env -0") > "$capture"; then
+  make_capture="$WORK_DIR/e2e-contract-${type,,}.make-env"
+  prefix_capture="$WORK_DIR/e2e-contract-${type,,}.recipe-env"
+  make_helper="$WORK_DIR/e2e-contract-${type,,}.capture.mk"
+  mkdir -p "$WORK_DIR/make-environment-home"
+  printf '.PHONY: __vpg4_capture_make_environment\n__vpg4_capture_make_environment:\n\t@env -0\n' > "$make_helper"
+  # The upstream runner is normally launched by Make. Capture the variables
+  # exported by the Candidate Makefile in an empty environment, then overlay
+  # the recipe's leading assignments. This preserves generic build-output
+  # contracts such as BIN_DIR without inheriting host credentials or proxies.
+  if ! (cd "$CHECKOUT"; env -i PATH="$PATH" HOME="$WORK_DIR/make-environment-home" \
+      GOROOT="$GOROOT" GOPATH="$GOPATH" GOMODCACHE="$GOMODCACHE" GOCACHE="$GOCACHE" GOTOOLCHAIN=local \
+      make --no-print-directory -s \
+      -f "$CHECKOUT/Makefile" -f "$make_helper" "${RESOLVED_E2E_MAKE_ARGS[@]}" \
+      __vpg4_capture_make_environment) > "$make_capture"; then
+    rm -f -- "$make_capture" "$prefix_capture" "$make_helper"
+    RESOLVED_E2E_ERROR="cannot capture Candidate Make environment for $RESOLVED_E2E_TARGET"
+    return 11
+  fi
+  if ! (cd "$CHECKOUT"; env -i PATH=/usr/bin:/bin bash -c "${prefix:+$prefix }env -0") > "$prefix_capture"; then
+    rm -f -- "$make_capture" "$prefix_capture" "$make_helper"
     RESOLVED_E2E_ERROR="cannot evaluate upstream E2E assignments for $RESOLVED_E2E_TARGET"
     return 11
   fi
-  while IFS= read -r -d '' assignment; do
-    key="${assignment%%=*}"; value="${assignment#*=}"
-    case "$key" in PWD|SHLVL|PATH|_) continue ;; esac
-    if [[ ! "$key" =~ ^[A-Z_][A-Z0-9_]*$ || "$value" == *$'\t'* || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
-      RESOLVED_E2E_ERROR="invalid upstream E2E environment assignment: $key"
-      return 11
-    fi
-    case "$key" in
-      VPG_*|CLUSTER_NAME|CLEANUP_CLUSTER|KIND_OPT|IMAGE_PREFIX|TAG|OS|ARTIFACTS_PATH|KUBECONFIG|SKIP_CLUSTER_SETUP|HOME|GOROOT|GOPATH|GOMODCACHE|GOCACHE|GOPROXY|GONOSUMDB|GOSUMDB|GOTOOLCHAIN)
-        RESOLVED_E2E_ERROR="upstream E2E contract attempts to override managed variable $key"; return 11 ;;
-    esac
-    keys+=("$key"); values+=("$value")
-  done < "$capture"
-  rm -f -- "$capture"
-  for ((index=0; index<${#keys[@]}; index++)); do
-    if [[ "${keys[$index]}" == E2E_TYPE ]]; then
-      found=true
-      [[ "${values[$index]}" == "$type" ]] || {
-        RESOLVED_E2E_ERROR="$RESOLVED_E2E_TARGET resolves E2E_TYPE=${values[$index]}, expected $type"; return 11; }
-    fi
+  for source in "$make_capture" "$prefix_capture"; do
+    while IFS= read -r -d '' assignment; do
+      [[ "$assignment" == *=* ]] || {
+        rm -f -- "$make_capture" "$prefix_capture" "$make_helper"
+        RESOLVED_E2E_ERROR="invalid output while capturing Candidate E2E environment"
+        return 11
+      }
+      key="${assignment%%=*}"; value="${assignment#*=}"
+      case "$key" in
+        PWD|OLDPWD|SHLVL|PATH|_|MAKEFLAGS|MFLAGS|MAKELEVEL|MAKEOVERRIDES|MAKE_TERMOUT|MAKE_TERMERR|GNUMAKEFLAGS) continue ;;
+      esac
+      if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        rm -f -- "$make_capture" "$prefix_capture" "$make_helper"
+        RESOLVED_E2E_ERROR="invalid upstream E2E environment assignment: $key"
+        return 11
+      fi
+      if [[ "$value" == *$'\t'* || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        # .EXPORT_ALL_VARIABLES also exposes multiline Make functions. They
+        # are not process settings and cannot be represented by the TSV
+        # contract. A multiline recipe assignment, however, is ambiguous and
+        # must still fail closed.
+        if [[ "$source" == "$make_capture" ]]; then continue; fi
+        rm -f -- "$make_capture" "$prefix_capture" "$make_helper"
+        RESOLVED_E2E_ERROR="invalid multiline upstream E2E environment assignment: $key"
+        return 11
+      fi
+      case "$key" in
+        VPG_*|CLUSTER_NAME|CLEANUP_CLUSTER|KIND_OPT|IMAGE_PREFIX|TAG|OS|ARTIFACTS_PATH|KUBECONFIG|SKIP_CLUSTER_SETUP|HOME|GOROOT|GOPATH|GOMODCACHE|GOCACHE|GOPROXY|GONOSUMDB|GOSUMDB|GOTOOLCHAIN|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)
+          if [[ "$source" == "$make_capture" ]]; then continue; fi
+          rm -f -- "$make_capture" "$prefix_capture" "$make_helper"
+          RESOLVED_E2E_ERROR="upstream E2E contract attempts to override managed variable $key"
+          return 11
+          ;;
+      esac
+      if [[ -z "${environment[$key]+defined}" ]]; then environment_keys+=("$key"); fi
+      environment[$key]="$value"
+    done < "$source"
   done
-  if [[ "$found" != true ]]; then keys+=(E2E_TYPE); values+=("$type"); fi
+  rm -f -- "$make_capture" "$prefix_capture" "$make_helper"
+  if [[ -n "${environment[E2E_TYPE]+defined}" ]]; then
+    [[ "${environment[E2E_TYPE]}" == "$type" ]] || {
+      RESOLVED_E2E_ERROR="$RESOLVED_E2E_TARGET resolves E2E_TYPE=${environment[E2E_TYPE]}, expected $type"
+      return 11
+    }
+  else
+    environment_keys+=(E2E_TYPE); environment[E2E_TYPE]="$type"
+  fi
   file="$(e2e_contract_path "$type")" || { RESOLVED_E2E_ERROR="invalid E2E contract path"; return 11; }
   : > "$file"; printf 'TARGET\t%s\n' "$RESOLVED_E2E_TARGET" >> "$file"
   for item in "${RESOLVED_E2E_MAKE_ARGS[@]}"; do printf 'MAKE_ARG\t%s\n' "$item" >> "$file"; done
@@ -756,9 +801,9 @@ resolve_candidate_e2e_contract() {
       RESOLVED_E2E_ERROR="unsupported prerequisite '$item' on $RESOLVED_E2E_TARGET"; return 11; }
     printf 'PREREQ\t%s\n' "$item" >> "$file"
   done
-  for ((index=0; index<${#keys[@]}; index++)); do
-    printf 'ENV\t%s\t%s\n' "${keys[$index]}" "${values[$index]}" >> "$file"
-    add_e2e_contract_key "${keys[$index]}"
+  for key in "${environment_keys[@]}"; do
+    printf 'ENV\t%s\t%s\n' "$key" "${environment[$key]}" >> "$file"
+    add_e2e_contract_key "$key"
   done
 }
 
@@ -1310,6 +1355,37 @@ patch_candidate_e2e_local_image_tags() {
   [[ "$changed" == true ]]
 }
 
+patch_candidate_kwok_fail_fast() {
+  local install="$CHECKOUT/hack/lib/install.sh" tmp="$WORK_DIR/patch-kwok-fail-fast.tmp" status
+  [[ -f "$install" ]] || return 1
+  grep -Fq 'VPG_KWOK_MANIFEST' "$install" || return 1
+  if grep -Fq 'kubectl apply -f "${VPG_KWOK_MANIFEST:?}" || exit $?' "$install" && \
+     grep -Fq 'kubectl apply -f "${VPG_KWOK_STAGE:?}" || exit $?' "$install" && \
+     grep -Fq 'kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s || exit $?' "$install"; then
+    return 1
+  fi
+  set +e
+  awk '
+    BEGIN {changed=0}
+    {
+      if ($0 == "  kubectl apply -f \"${VPG_KWOK_MANIFEST:?}\"") {print $0 " || exit $?"; changed++; next}
+      if ($0 == "  kubectl apply -f \"${VPG_KWOK_STAGE:?}\"") {print $0 " || exit $?"; changed++; next}
+      if ($0 == "  kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s") {
+        print $0 " || exit $?"; changed++; next
+      }
+      print
+    }
+    END {if(changed==0) exit 3; if(changed!=3) exit 4}
+  ' "$install" > "$tmp"
+  status=$?
+  set -e
+  case "$status" in
+    0) mv "$tmp" "$install"; return 0 ;;
+    3) rm -f -- "$tmp"; return 1 ;;
+    *) rm -f -- "$tmp"; die "cannot make Candidate KWOK setup fail fast" ;;
+  esac
+}
+
 patch_e2e_environment() {
   local install="$CHECKOUT/hack/lib/install.sh" runner="$CHECKOUT/hack/run-e2e-kind.sh"
   local kind_config="$CHECKOUT/hack/e2e-kind-config.yaml"
@@ -1319,9 +1395,9 @@ patch_e2e_environment() {
     BEGIN{inside=0; replaced=0}
     /^[[:space:]]*(function[[:space:]]+)?install-kwok-with-helm([[:space:]]*\(\))?[[:space:]]*\{/ {
       print "install-kwok-with-helm() {"
-      print "  kubectl apply -f \"${VPG_KWOK_MANIFEST:?}\""
-      print "  kubectl apply -f \"${VPG_KWOK_STAGE:?}\""
-      print "  kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s"
+      print "  kubectl apply -f \"${VPG_KWOK_MANIFEST:?}\" || exit $?"
+      print "  kubectl apply -f \"${VPG_KWOK_STAGE:?}\" || exit $?"
+      print "  kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s || exit $?"
       print "  kubectl delete stage pod-complete --ignore-not-found >/dev/null 2>&1 || true"
       print "}"
       inside=1; replaced++; next
@@ -1407,6 +1483,7 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   repaired_e2e_patch=false
   if patch_candidate_e2e_cluster_identity; then repaired_e2e_patch=true; fi
   if patch_candidate_e2e_local_image_tags; then repaired_e2e_patch=true; fi
+  if patch_candidate_kwok_fail_fast; then repaired_e2e_patch=true; fi
   if [[ "$repaired_e2e_patch" == true ]]; then
     git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
     [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "repaired Candidate E2E patch evidence is empty"

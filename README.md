@@ -413,7 +413,7 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 
 ### E2E 参数自动跟随 Candidate
 
-部署脚本不会把 `FEATURE_GATES`、`IGNORED_PROVISIONERS` 等参数按 Volcano 版本硬编码。Candidate checkout 完成后，脚本对每个选中的 TYPE 查找对应的上游 Make 目标，用 `make -n` 取得该目标实际调用 `hack/run-e2e-kind.sh` 时的环境赋值，并在创建 Kind 前写入 `candidate-e2e-contracts.txt`。
+部署脚本不会把 `FEATURE_GATES`、`IGNORED_PROVISIONERS` 等参数按 Volcano 版本硬编码。Candidate checkout 完成后，脚本对每个选中的 TYPE 查找对应的上游 Make 目标，用 `make -n` 取得该目标实际调用 `hack/run-e2e-kind.sh` 时的环境赋值，同时从隔离的 Make 环境继承 Candidate 导出的单行运行变量，并在创建 Kind 前写入 `candidate-e2e-contracts.txt`。宿主机凭据、代理、Go 缓存和部署脚本管理的集群变量不会进入该契约；仅供 Make 内部使用的多行函数也会被忽略。
 
 例如同一个脚本会自动得到：
 
@@ -422,10 +422,12 @@ v1.12.0 SCHEDULINGBASE -> E2E_TYPE=SCHEDULINGBASE
 v1.15.0 SCHEDULINGBASE -> E2E_TYPE=SCHEDULINGBASE, IGNORED_PROVISIONERS=kubernetes.io/no-provisioner
 v1.14.0 DRA            -> FEATURE_GATES=DynamicResourceAllocation=true
 v1.15.0 DRA            -> FEATURE_GATES=DynamicResourceAllocation=true,DRAConsumableCapacity=true
-v1.15.0 VCCTL          -> 先构建上游 vcctl 前置目标
+v1.15.0 VCCTL          -> 构建上游 vcctl 前置目标，并继承其 Make 输出目录
 ```
 
-每个独立 E2E 开始前都会先清空上一轮解析出的测试变量，再加载本轮契约，因此 DRA 或 SchedulingGates 的 Feature Gate 不会泄漏到后续测试。对于较早的 Candidate，`FULL` 中该版本尚未定义的独立 Make 目标会在预检阶段记录并跳过；显式选择一个 Candidate 不存在的 TYPE 则会直接报错。
+每个独立 E2E 开始前都会先清空上一轮解析出的测试变量，再加载本轮契约，因此 DRA 或 SchedulingGates 的 Feature Gate 不会泄漏到后续测试。带前置构建目标的测试会先执行 Candidate 自己声明的前置目标，再以同一份 Make 输出目录环境调用上游 runner；这不是对 VCCTL 或其他测试名称的硬编码。对于较早的 Candidate，`FULL` 中该版本尚未定义的独立 Make 目标会在预检阶段记录并跳过；显式选择一个 Candidate 不存在的 TYPE 则会直接报错。
+
+KWOK manifest 应用或 `kwok-controller` 就绪等待失败属于整批测试共享的基础设施失败。部署脚本会立即结束当前批次并记录失败，再按所选 `FULL` 流程继续下一批，而不会在未就绪的 KWOK 集群上制造后续误报。这一判断只检查通用基础设施状态，不修改任何具体测试用例的等待时间、命令或通过条件。
 
 普通参数变化、参数新增或前置目标变化不要求重新制作外网包；只有上游改掉 Make 目标或 `hack/run-e2e-kind.sh` 的入口结构时，部署脚本才会在预检阶段 fail-closed，并需要增加小型兼容适配。`e2e:ALL` 保留 Candidate 自己的一次性 `E2E_TYPE=ALL` 语义，`FULL` 则逐个调用当前 Candidate 已定义的独立上游目标。
 
