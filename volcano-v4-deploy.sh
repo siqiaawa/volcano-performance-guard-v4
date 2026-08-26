@@ -72,11 +72,15 @@ Input/output:
   --keep-cluster              Keep/reuse the only Kind cluster and its work directory
 
 Candidate selection:
-  --volcano-ref REF           Required branch, tag or commit to test
+  --volcano-ref REF           Required branch, tag or commit except cluster-only
   --volcano-repo URL          Default: official Volcano repository
   --goproxy VALUE             Default: GOPROXY environment, otherwise direct
   --gonosumdb VALUE           Default: *
   --gosumdb VALUE             Default: off
+
+Manual operation:
+  --cluster-only              Create and keep a normal Kind cluster; no Candidate
+  --deploy-only               Build and install Candidate Volcano, then keep it
 
 Run selection (must be covered by the bundle profile):
   --mode e2e|benchmark|both
@@ -90,16 +94,20 @@ Run selection (must be covered by the bundle profile):
   --list-capabilities         Verify metadata and print runnable entries only
   -h, --help
 
-The server itself only needs Bash, curl, git, Docker, tar, gzip, sha256sum,
-make and basic POSIX tools. Exact Kind, kubectl, Helm, jq and Go come from the
-bundle. The Candidate's complete Go module graph and selected Ginkgo are first
-downloaded on the inner host through its configured Go module source. Docker
-builders then consume a temporary file proxy and never contact that HTTPS
-proxy. The
-generic bundle contains no Volcano source or Go modules. Nothing is installed
-system-wide. A saved work directory resumes only when its bundle and complete
+Normal tests and deploy-only need Bash, curl, git, Docker, tar, gzip,
+sha256sum, make and basic POSIX tools. cluster-only does not need git or make.
+Exact Kind, kubectl, Helm, jq and Go come from the bundle. The Candidate's
+complete Go module graph and selected Ginkgo are first downloaded on the inner
+host through its configured Go module source. Docker builders then consume a
+temporary file proxy and never contact that HTTPS proxy. The generic bundle
+contains no Volcano source or Go modules. Nothing is installed system-wide. A
+saved work directory resumes only when its bundle and complete
 run identity match. A saved cluster restarts the selected E2E suite or failed
 Benchmark round; it cannot resume inside one Ginkgo spec or one go test process.
+The two manual-operation modes always keep their work directory and cluster,
+write manual-env.sh, and do not run E2E or Benchmark. cluster-only does not
+fetch Volcano or download Go modules. deploy-only installs the selected
+Candidate with its Helm chart and stops after the deployment becomes ready.
 When multiple E2E types, Benchmark scenarios, or Benchmark rounds are selected,
 a failed test batch is recorded and later batches still run. Fatal bundle,
 dependency, build, resume-identity, or result-write failures still stop
@@ -111,6 +119,7 @@ EOF
 
 BUNDLE_INPUT=""; BUNDLE_URL=""; OUTPUT_DIR=""; WORK_DIR=""
 KEEP_WORK_DIR=false; KEEP_CLUSTER=false; LIST_CAPABILITIES=false; RESUME_WORK=false
+MANUAL_ACTION=""
 MODE_OVERRIDE=""; E2E_TYPE_OVERRIDE=""; BENCHMARK_SCENARIO_OVERRIDE=""
 BENCHMARK_CONFIG_OVERRIDE=""; BENCHMARK_ROUNDS=1; PODS=1000
 SCHEDULER_NAME="agent-scheduler"; CLUSTER_PREFIX="volcano-v4"
@@ -127,6 +136,14 @@ while [[ $# -gt 0 ]]; do
     --work-dir) WORK_DIR="${2:-}"; shift 2 ;;
     --keep-work-dir) KEEP_WORK_DIR=true; shift ;;
     --keep-cluster) KEEP_CLUSTER=true; shift ;;
+    --cluster-only)
+      [[ -z "$MANUAL_ACTION" || "$MANUAL_ACTION" == cluster-only ]] || die "use only one manual operation"
+      MANUAL_ACTION=cluster-only; shift
+      ;;
+    --deploy-only)
+      [[ -z "$MANUAL_ACTION" || "$MANUAL_ACTION" == deploy-only ]] || die "use only one manual operation"
+      MANUAL_ACTION=deploy-only; shift
+      ;;
     --volcano-repo) VOLCANO_REPO="${2:-}"; shift 2 ;;
     --volcano-ref) VOLCANO_REF="${2:-}"; shift 2 ;;
     --mode) MODE_OVERRIDE="${2:-}"; shift 2 ;;
@@ -155,10 +172,23 @@ valid_text "$GOPROXY_VALUE" || die "invalid --goproxy"
 valid_text "$GONOSUMDB_VALUE" || die "invalid --gonosumdb"
 valid_text "$GOSUMDB_VALUE" || die "invalid --gosumdb"
 valid_text "$VOLCANO_REPO" || die "invalid --volcano-repo"
-valid_text "$VOLCANO_REF" || die "--volcano-ref is required"
 [[ -z "$MODE_OVERRIDE" ]] || valid_mode "$MODE_OVERRIDE" || die "invalid --mode"
+if [[ -n "$MANUAL_ACTION" ]]; then
+  [[ "$LIST_CAPABILITIES" != true ]] || die "--list-capabilities cannot be combined with a manual operation"
+  [[ -z "$MODE_OVERRIDE" && -z "$E2E_TYPE_OVERRIDE" && -z "$BENCHMARK_SCENARIO_OVERRIDE" && -z "$BENCHMARK_CONFIG_OVERRIDE" ]] || \
+    die "E2E/Benchmark run selection cannot be combined with a manual operation"
+  [[ "$BENCHMARK_ROUNDS" == 1 && "$PODS" == 1000 && "$SCHEDULER_NAME" == agent-scheduler ]] || \
+    die "Benchmark tuning options cannot be combined with a manual operation"
+  KEEP_CLUSTER=true; KEEP_WORK_DIR=true
+fi
+if [[ "$MANUAL_ACTION" == cluster-only ]]; then
+  [[ -z "$VOLCANO_REF" ]] || die "--volcano-ref is not used with --cluster-only"
+else
+  valid_text "$VOLCANO_REF" || die "--volcano-ref is required"
+fi
 
-for command in curl git tar gzip sha256sum awk sed grep sort mktemp; do need "$command"; done
+for command in curl tar gzip sha256sum awk sed grep sort mktemp; do need "$command"; done
+[[ "$MANUAL_ACTION" == cluster-only ]] || need git
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die "deployment requires Linux x86_64"
 
 configure_build_proxy() {
@@ -188,7 +218,16 @@ configure_build_proxy() {
     log "no host HTTP or Git proxy was detected for Candidate builds"
   fi
 }
-configure_build_proxy
+if [[ "$MANUAL_ACTION" == cluster-only ]]; then
+  VPG_HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-}}"
+  VPG_HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-}}"
+  VPG_NO_PROXY="${NO_PROXY:-${no_proxy:-}}"
+  VPG_BUILD_PROXY_SOURCE="$([[ -n "$VPG_HTTP_PROXY" || -n "$VPG_HTTPS_PROXY" ]] && printf environment || printf none)"
+  export HTTP_PROXY="$VPG_HTTP_PROXY" HTTPS_PROXY="$VPG_HTTPS_PROXY" NO_PROXY="$VPG_NO_PROXY"
+  log "cluster-only skips Candidate build proxy discovery"
+else
+  configure_build_proxy
+fi
 
 AUTO_WORK=false
 if [[ -z "$WORK_DIR" ]]; then
@@ -376,9 +415,16 @@ if [[ "$PACKAGED_MODE" != both && "$MODE" != "$PACKAGED_MODE" ]]; then die "requ
 [[ "$MODE" == benchmark || ${#E2E_CAPS[@]} -gt 0 ]] || die "bundle has no E2E capability"
 [[ "$MODE" == e2e || ${#BENCHMARK_CAP_SCENARIOS[@]} -gt 0 ]] || die "bundle has no Benchmark capability"
 
-RUN_ID="$(hash_values "$SCRIPT_VERSION" "$BUNDLE_ID" "$VOLCANO_REPO" "$VOLCANO_REF" "$MODE" \
-  "$E2E_TYPE_OVERRIDE" "$BENCHMARK_SCENARIO_OVERRIDE" "$BENCHMARK_CONFIG_OVERRIDE" \
-  "$BENCHMARK_ROUNDS" "$PODS" "$SCHEDULER_NAME" "$CLUSTER_PREFIX")"
+if [[ -n "$MANUAL_ACTION" ]]; then
+  RUN_ID="$(hash_values "$SCRIPT_VERSION" "$BUNDLE_ID" "manual-action" "$MANUAL_ACTION" \
+    "$VOLCANO_REPO" "$VOLCANO_REF" "$CLUSTER_PREFIX")"
+else
+  # Preserve the existing test-run identity so work directories saved by the
+  # previous v4.3.0 script remain resumable.
+  RUN_ID="$(hash_values "$SCRIPT_VERSION" "$BUNDLE_ID" "$VOLCANO_REPO" "$VOLCANO_REF" "$MODE" \
+    "$E2E_TYPE_OVERRIDE" "$BENCHMARK_SCENARIO_OVERRIDE" "$BENCHMARK_CONFIG_OVERRIDE" \
+    "$BENCHMARK_ROUNDS" "$PODS" "$SCHEDULER_NAME" "$CLUSTER_PREFIX")"
+fi
 if [[ "$RESUME_WORK" == true ]]; then
   saved_run_id="$(state_get RUN_ID)"
   if [[ -z "$saved_run_id" ]]; then
@@ -397,6 +443,7 @@ else
   state_set VOLCANO_REF_HASH "$(hash_values "$VOLCANO_REF")"
   state_set PROFILE "$PROFILE"
   state_set MODE "$MODE"
+  state_set ACTION "${MANUAL_ACTION:-test}"
   state_set KUBERNETES_VERSION "$K8S_VERSION"
 fi
 state_set BUNDLE_ROOT "$BUNDLE_ROOT"
@@ -424,7 +471,8 @@ EOF
   exit 0
 fi
 
-need docker; need make; need tee
+need docker; need tee
+[[ "$MANUAL_ACTION" == cluster-only ]] || need make
 docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
 
 TOOLS_DIR="$WORK_DIR/tools"; BIN_DIR="$TOOLS_DIR/bin"; RESOURCES_DIR="$WORK_DIR/resources"
@@ -630,6 +678,136 @@ bundle_has_image_ref() {
 }
 resource_for_key() { local wanted="$1" i; for ((i=0;i<${#RESOURCE_KEYS[@]};i++)); do [[ "${RESOURCE_KEYS[$i]}" != "$wanted" ]] || { printf '%s\n' "$RESOURCES_DIR/${RESOURCE_PATHS[$i]}"; return; }; done; return 1; }
 
+cluster_exists() { kind get clusters 2>/dev/null | grep -Fxq "$1"; }
+
+manual_cluster_name() {
+  local suffix="$1" name
+  suffix="${suffix//./-}"
+  name="${CLUSTER_PREFIX}-${suffix}"
+  name="${name:0:27}"
+  printf '%s\n' "${name%-}"
+}
+
+record_manual_cluster_identity() {
+  local kubeconfig="$1" purpose="$2" commit="${CANDIDATE_COMMIT:-}"
+  kubectl --kubeconfig "$kubeconfig" -n kube-system create configmap vpg4-resume-state \
+    --from-literal="run-id=$RUN_ID" --from-literal="candidate-commit=$commit" \
+    --from-literal="purpose=$purpose" --dry-run=client -o yaml | \
+    kubectl --kubeconfig "$kubeconfig" apply -f - >/dev/null
+}
+
+validate_manual_cluster() {
+  local name="$1" purpose="$2" kubeconfig="$3" observed identity commit="${CANDIDATE_COMMIT:-}"
+  [[ "$RESUME_WORK" == true ]] || die "manual cluster already exists: $name; use its saved --work-dir or delete it explicitly"
+  [[ "$(state_get ACTIVE_CLUSTER)" == "$name" && "$(state_get ACTIVE_PURPOSE)" == "$purpose" ]] || \
+    die "saved manual-cluster identity does not match $name"
+  kind get kubeconfig --name "$name" > "$kubeconfig"
+  chmod 0600 "$kubeconfig"
+  observed="$(kubectl --kubeconfig "$kubeconfig" version -o json | jq -r '.serverVersion.gitVersion')"
+  [[ "$observed" == "$K8S_VERSION" ]] || die "saved cluster Kubernetes mismatch: expected $K8S_VERSION, got $observed"
+  identity="$(kubectl --kubeconfig "$kubeconfig" -n kube-system get configmap vpg4-resume-state -o json)" || \
+    die "saved manual cluster has no v4 identity: $name"
+  jq -e --arg run "$RUN_ID" --arg commit "$commit" --arg purpose "$purpose" \
+    '.data["run-id"]==$run and .data["candidate-commit"]==$commit and .data.purpose==$purpose' \
+    <<< "$identity" >/dev/null || die "saved manual cluster belongs to a different operation"
+  log "validated and reusing manual Kind cluster: $name"
+}
+
+create_manual_cluster() {
+  local name="$1" purpose="$2" kubeconfig="$3" config observed saved_active
+  MANUAL_CLUSTER_REUSED=false
+  config="$WORK_DIR/kind-${MANUAL_ACTION}.yaml"
+  cat > "$config" <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+- role: worker
+- role: worker
+EOF
+  CURRENT_CLUSTER="$name"; CLUSTER_CREATED=true
+  if cluster_exists "$name"; then
+    validate_manual_cluster "$name" "$purpose" "$kubeconfig"
+    MANUAL_CLUSTER_REUSED=true
+  else
+    saved_active="$(state_get ACTIVE_CLUSTER 2>/dev/null || true)"
+    [[ -z "$saved_active" || "$saved_active" == "$name" ]] || \
+      die "saved work directory belongs to another manual cluster: $saved_active"
+    if [[ "$saved_active" == "$name" ]]; then
+      log "saved manual cluster is absent; recreating the same verified cluster: $name"
+    fi
+    state_set ACTIVE_CLUSTER "$name"; state_set ACTIVE_PURPOSE "$purpose"
+    log "creating persistent manual Kind cluster: $name"
+    kind create cluster --name "$name" --image "$NODE_IMAGE" --config "$config" --wait 300s \
+      2>&1 | tee "$OUTPUT_DIR/kind-create-${MANUAL_ACTION}.log"
+    kind get kubeconfig --name "$name" > "$kubeconfig"
+    chmod 0600 "$kubeconfig"
+    observed="$(kubectl --kubeconfig "$kubeconfig" version -o json | jq -r '.serverVersion.gitVersion')"
+    [[ "$observed" == "$K8S_VERSION" ]] || die "Kubernetes version mismatch: expected $K8S_VERSION, got $observed"
+    record_manual_cluster_identity "$kubeconfig" "$purpose"
+  fi
+  KUBECONFIG="$kubeconfig"; export KUBECONFIG
+}
+
+write_manual_access() {
+  local name="$1" kubeconfig="$2" env_file access_file kind_dir
+  env_file="$OUTPUT_DIR/manual-env.sh"; access_file="$OUTPUT_DIR/manual-access.txt"
+  kind_dir="$(dirname "$KIND_BINARY")"
+  {
+    printf '# Generated by volcano-v4-deploy.sh; source this file in Bash.\n'
+    printf 'export VPG4_WORK_DIR=%q\n' "$WORK_DIR"
+    printf 'export VPG4_KIND_CLUSTER=%q\n' "$name"
+    printf 'export KUBECONFIG=%q\n' "$kubeconfig"
+    printf 'export GOROOT=%q\n' "$GOROOT"
+    printf 'export GOPATH=%q\n' "$GOPATH"
+    printf 'export PATH=%q:%q:%q:%q:$PATH\n' "$GOROOT/bin" "$GOPATH/bin" "$kind_dir" "$BIN_DIR"
+  } > "$env_file"
+  chmod 0644 "$env_file"
+  {
+    printf 'source %q\n' "$env_file"
+    printf 'kubectl get nodes -o wide\n'
+    [[ "$MANUAL_ACTION" != deploy-only ]] || printf 'kubectl -n volcano-system get pods -o wide\n'
+    printf 'kind delete cluster --name %q\n' "$name"
+  } > "$access_file"
+  state_set MANUAL_ENV_FILE "$env_file"
+  log "manual environment: $env_file"
+  log "run: source $(printf '%q' "$env_file")"
+}
+
+finish_manual_action() {
+  local name="$1" kubeconfig="$2" commit="${CANDIDATE_COMMIT:-}"
+  write_manual_access "$name" "$kubeconfig"
+  cat > "$OUTPUT_DIR/summary.txt" <<EOF
+status=ready
+script_version=$SCRIPT_VERSION
+action=$MANUAL_ACTION
+bundle_scope=$BUNDLE_SCOPE
+profile=$PROFILE
+kubernetes_version=$K8S_VERSION
+kind_version=$KIND_VERSION
+default_go_toolchain=$GO_TOOLCHAIN
+selected_go_toolchain=$SELECTED_GO_TOOLCHAIN
+candidate_repository=$([[ "$MANUAL_ACTION" == deploy-only ]] && printf '%s' "$VOLCANO_REPO" || true)
+candidate_requested_ref=$VOLCANO_REF
+candidate_commit=$commit
+cluster_name=$name
+kubeconfig=$kubeconfig
+work_directory=$WORK_DIR
+manual_environment=$OUTPUT_DIR/manual-env.sh
+finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+  mark_stage "manual-${MANUAL_ACTION}-ready"
+  log "$MANUAL_ACTION completed; cluster $name is ready for normal Kind/kubectl use"
+  exit 0
+}
+
+if [[ "$MANUAL_ACTION" == cluster-only ]]; then
+  manual_name="$(manual_cluster_name "kind-${K8S_VERSION#v}")"
+  manual_kubeconfig="$OUTPUT_DIR/kubeconfig"
+  create_manual_cluster "$manual_name" cluster-only "$manual_kubeconfig"
+  finish_manual_action "$manual_name" "$manual_kubeconfig"
+fi
+
 CHECKOUT="$WORK_DIR/volcano"
 if stage_done candidate-checkout; then
   CANDIDATE_COMMIT="$(state_get CANDIDATE_COMMIT)"
@@ -723,7 +901,7 @@ sha256sum "$VPG_INNER_GO_MODULE_ARCHIVE" | awk '{print $1 "  inner-go-modules.ta
   > "$OUTPUT_DIR/inner-go-modules.sha256"
 log "prepared the inner-host Go module file proxy for Candidate Docker builds"
 
-if [[ "$MODE" != benchmark ]]; then
+if [[ "$MANUAL_ACTION" != deploy-only && "$MODE" != benchmark ]]; then
   GINKGO_VERSION="$(awk '$1=="github.com/onsi/ginkgo/v2" {print $2;exit} $1=="require"&&$2=="github.com/onsi/ginkgo/v2" {print $3;exit}' "$CHECKOUT/go.mod")"
   [[ "$GINKGO_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "cannot resolve Candidate Ginkgo version"
   if stage_done ginkgo; then
@@ -994,7 +1172,9 @@ if [[ "$MODE" == both ]]; then
   [[ -n "$E2E_TYPE_OVERRIDE" ]] || E2E_SELECTION=FULL
   [[ -n "$BENCHMARK_SCENARIO_OVERRIDE" ]] || BENCHMARK_SELECTION=FULL
 fi
-if [[ "$MODE" != benchmark ]]; then
+if [[ "$MANUAL_ACTION" == deploy-only ]]; then
+  E2E_RUNS=()
+elif [[ "$MODE" != benchmark ]]; then
   if [[ "$E2E_SELECTION" == FULL ]]; then E2E_RUNS=("${E2E_CAPS[@]}")
   else
     found=false; for value in "${E2E_CAPS[@]}"; do [[ "$value" != "$E2E_SELECTION" ]] || found=true; done
@@ -1028,7 +1208,9 @@ if (( K8S_MINOR < 34 && ${#E2E_RUNS[@]} > 0 )); then
 fi
 
 BENCHMARK_RUN_SCENARIOS=(); BENCHMARK_RUN_CONFIGS=()
-if [[ "$MODE" != e2e ]]; then
+if [[ "$MANUAL_ACTION" == deploy-only ]]; then
+  BENCHMARK_RUN_SCENARIOS=(); BENCHMARK_RUN_CONFIGS=()
+elif [[ "$MODE" != e2e ]]; then
   if [[ "$BENCHMARK_SELECTION" == FULL ]]; then
     [[ -z "$BENCHMARK_CONFIG_OVERRIDE" ]] || die "--benchmark-config cannot be combined with FULL"
     BENCHMARK_RUN_SCENARIOS=("${BENCHMARK_CAP_SCENARIOS[@]}"); BENCHMARK_RUN_CONFIGS=("${BENCHMARK_CAP_CONFIGS[@]}")
@@ -1042,7 +1224,8 @@ if [[ "$MODE" != e2e ]]; then
     [[ -z "$BENCHMARK_CONFIG_OVERRIDE" ]] || BENCHMARK_RUN_CONFIGS[0]="$BENCHMARK_CONFIG_OVERRIDE"
   fi
 else BENCHMARK_RUN_SCENARIOS=(); fi
-[[ "$KEEP_CLUSTER" != true || $(( ${#E2E_RUNS[@]} + ${#BENCHMARK_RUN_SCENARIOS[@]} )) -eq 1 ]] || die "--keep-cluster requires exactly one run"
+[[ -n "$MANUAL_ACTION" || "$KEEP_CLUSTER" != true || $(( ${#E2E_RUNS[@]} + ${#BENCHMARK_RUN_SCENARIOS[@]} )) -eq 1 ]] || \
+  die "--keep-cluster requires exactly one run"
 
 # Volcano imports parts of the Kubernetes E2E framework. Some runtime images
 # are therefore selected by k8s.io/kubernetes rather than by Volcano source
@@ -1318,7 +1501,6 @@ cluster_name() {
   name="${name:0:max_base}${suffix}"
   printf '%s\n' "${name%-}"
 }
-cluster_exists() { kind get clusters 2>/dev/null | grep -Fxq "$1"; }
 record_cluster_identity() {
   local kubeconfig="$1" purpose="$2"
   kubectl --kubeconfig "$kubeconfig" -n kube-system create configmap vpg4-resume-state \
@@ -1718,7 +1900,7 @@ create_benchmark_cluster() {
 }
 
 install_candidate() {
-  local number="$1"
+  local number="$1" log_file="${2:-$OUTPUT_DIR/helm-install-benchmark-$1.log}"
   helm upgrade --install volcano "$CHECKOUT/installer/helm/chart/volcano" --namespace volcano-system \
     --create-namespace --set basic.image_pull_policy=IfNotPresent \
     --set "basic.image_tag_version=$CANDIDATE_COMMIT" \
@@ -1726,8 +1908,36 @@ install_candidate() {
     --set "custom.agent_scheduler_enable=$BUILD_AGENT" \
     --set custom.scheduler_kube_api_qps=5000 --set custom.scheduler_kube_api_burst=10000 \
     --set custom.controller_kube_api_qps=5000 --set custom.controller_kube_api_burst=10000 \
-    --wait --timeout 300s 2>&1 | tee "$OUTPUT_DIR/helm-install-benchmark-$number.log"
+    --wait --timeout 300s 2>&1 | tee "$log_file"
 }
+
+if [[ "$MANUAL_ACTION" == deploy-only ]]; then
+  manual_name="$(manual_cluster_name "volcano-${CANDIDATE_COMMIT:0:8}")"
+  manual_kubeconfig="$OUTPUT_DIR/kubeconfig"
+  manual_images="$WORK_DIR/runtime-deploy-only.txt"
+  create_manual_cluster "$manual_name" deploy-only "$manual_kubeconfig"
+  if [[ "$MANUAL_CLUSTER_REUSED" == true ]] && stage_done manual-deploy-images; then
+    log "reusing Candidate images already loaded into the manual cluster"
+  else
+    printf '%s\n' "${CANDIDATE_IMAGES[@]}" > "$manual_images"
+    load_image_list "$manual_name" "$manual_images" 2>&1 | tee "$OUTPUT_DIR/kind-load-deploy-only.log"
+    mark_stage manual-deploy-images
+  fi
+  if [[ "$MANUAL_CLUSTER_REUSED" == true ]] && stage_done manual-deploy-install; then
+    helm status volcano -n volcano-system --kubeconfig "$manual_kubeconfig" -o json | \
+      jq -e '.info.status=="deployed"' >/dev/null || die "saved manual Volcano release is not deployed"
+    helm get values volcano -n volcano-system --kubeconfig "$manual_kubeconfig" --all -o json | \
+      jq -e --arg commit "$CANDIDATE_COMMIT" '.basic.image_tag_version==$commit' >/dev/null || \
+      die "saved manual Volcano release uses a different Candidate"
+    log "validated and reusing the manual Volcano installation"
+  else
+    install_candidate manual "$OUTPUT_DIR/helm-install-deploy-only.log"
+    mark_stage manual-deploy-install
+  fi
+  kubectl --kubeconfig "$manual_kubeconfig" -n volcano-system get pods -o wide \
+    2>&1 | tee "$OUTPUT_DIR/volcano-system-pods.log"
+  finish_manual_action "$manual_name" "$manual_kubeconfig"
+fi
 
 prepare_monitoring() {
   local name="$1" number="$2" manifest="$CHECKOUT/installer/volcano-monitoring.yaml"

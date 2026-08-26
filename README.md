@@ -53,40 +53,15 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --vo
 bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode e2e --work-dir ./work/v1.15.0-e2e-full --output ./results/v1.15.0-e2e-full
 ```
 
-只运行一个 E2E TYPE；把 `SCHEDULINGBASE` 换成“Profile 选择”列出的其他 TYPE 即可：
-
-```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode e2e --e2e-type SCHEDULINGBASE --work-dir ./work/v1.15.0-e2e-schedulingbase --output ./results/v1.15.0-e2e-schedulingbase
-```
-
 只运行全部 Benchmark（Gang comprehensive、Gang net-topo 和 Pod）：
 
 ```bash
 bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode benchmark --work-dir ./work/v1.15.0-benchmark-full --output ./results/v1.15.0-benchmark-full
-```
 
-只运行基础 Gang Benchmark：
-
-```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode benchmark --benchmark-scenario gang --work-dir ./work/v1.15.0-benchmark-gang --output ./results/v1.15.0-benchmark-gang
-```
-
-只运行 Pod Benchmark：
+只运行一个 E2E TYPE；把 `SCHEDULINGBASE` 换成“Profile 选择”列出的其他 TYPE 即可：
 
 ```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode benchmark --benchmark-scenario pod --work-dir ./work/v1.15.0-benchmark-pod --output ./results/v1.15.0-benchmark-pod
-```
-
-只运行网络拓扑 Gang Benchmark：
-
-```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode benchmark --benchmark-scenario gang --benchmark-config benchmark/testcases/gang/cases/net-topo.yaml --work-dir ./work/v1.15.0-benchmark-net-topo --output ./results/v1.15.0-benchmark-net-topo
-```
-
-一次只验证一个 E2E TYPE 和一个 Benchmark 场景：
-
-```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode both --e2e-type SCHEDULINGBASE --benchmark-scenario gang --work-dir ./work/v1.15.0-basic --output ./results/v1.15.0-basic
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode e2e --e2e-type SCHEDULINGBASE --work-dir ./work/v1.15.0-e2e-schedulingbase --output ./results/v1.15.0-e2e-schedulingbase
 ```
 
 ### 3. 更换 Candidate Volcano
@@ -105,96 +80,129 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --vo
 
 使用内部 Git 镜像时，在上述命令中增加 `--volcano-repo https://内部Git服务/volcano.git`。
 
-## 调试方法
+## 常用场景
 
-结果目录包含准确 Candidate commit、工具/Go 环境、Bundle 和 Docker load 日志、Candidate build 日志、`candidate-e2e-contracts.txt`、环境补丁、E2E artifacts 或 Benchmark results，以及最终 `summary.txt`。`candidate-e2e-contracts.txt` 会列出每轮的上游 Make 目标、Make 参数、非镜像前置目标和最终注入的环境变量。
+### 外网打包脚本
 
-`FULL`、`both` 或多轮 Benchmark 不会因为一个测试批次返回非零状态就停止：独立 E2E TYPE 失败后继续下一个 TYPE，Benchmark round 失败后继续下一 round 和下一个场景。每批结果会立即打印为 `RESULT PASS` 或 `RESULT FAIL`，最后再次输出完整批次清单，并写入 `run-results.tsv`。`summary.txt` 中的 `status`、`run_result_count` 和 `run_failure_count` 给出整体结论；只要存在失败批次，脚本在全部可运行批次完成后仍以非零状态退出，不会把部分失败误报为整体成功。
+#### 更换 Kubernetes 版本
 
-上述继续策略以独立 E2E TYPE 和 Benchmark round 为边界。Bundle 校验、依赖下载、Candidate 构建、E2E 契约解析、Benchmark 共享基础设施或结果文件写入失败仍会立即停止；某个 E2E TYPE 自己的 Kind 创建、安装或测试命令失败会记为该批失败并继续下一个独立 TYPE。用户按 `Ctrl+C` 或进程收到终止信号时不会继续后续批次。
-
-保留临时 checkout、Go cache 和构建现场，以便失败后恢复：
+选择 `config/versions.tsv` 已维护的 Kubernetes 版本时，只需要修改 `--k8s-version`；脚本会自动选择对应的 Kind、kubectl 和 `kindest/node` 镜像。下面以 Kubernetes `v1.35.5` 和完整 E2E+Benchmark 的 `full` 包为例：
 
 ```bash
-bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --output ./results --keep-work-dir
+bash volcano-v4-package.sh --k8s-version v1.35.5 --profile full --output ./release-assets --split-size 1900M
 ```
 
-失败日志最后会显示准确工作目录，例如：
+### 内网部署脚本
 
-```text
-[vpg4-deploy] kept work directory: /tmp/volcano-v4-deploy.ABC123
-```
+#### 保留工作目录并继续运行
 
-使用同一个 Candidate 和运行选择恢复时，把这个已保存目录交给 `--work-dir`。Bundle 和结果目录会从恢复状态中读取，不必重复填写：
+直接指定 `--work-dir` 时，该目录无论成功或失败都会保留，不需要再加 `--keep-work-dir`：
 
 ```bash
-bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --work-dir ./work/v1.15.0-full --output ./results/v1.15.0-full
 ```
 
-恢复会复用已经完成并验证过的 Candidate checkout、Go module cache、Ginkgo 和 Candidate 镜像构建；完整 E2E/Benchmark 中已经成功的独立 E2E 类型和 Benchmark round 会跳过，失败批次没有完成标记，因此会重新执行。Bundle、Candidate、profile/mode、测试选择、轮数或集群前缀只要有一项不同，脚本就拒绝混用该工作目录。显式指定过 `--mode`、`--e2e-type`、`--benchmark-scenario`、`--benchmark-config`、`--benchmark-rounds`、`--pods`、`--scheduler-name` 或 `--cluster-prefix` 时，恢复命令必须重复相同参数。
-
-Candidate 身份以仓库地址和精确 commit 为准。`go mod download all` 可能补写 `go.sum`，离线构建适配也会修改 Dockerfile；这些未提交的工作树变化不会阻断后续构建，脚本会把构建补丁前的状态保存到结果目录供追溯。
-
-保留 Kind 集群时，脚本会自动同时保留工作目录：
+使用同一个 Candidate 继续该工作目录时，Bundle 和结果目录会从保存状态读取。已成功完成的批次会跳过，未完成或失败的批次会重新执行：
 
 ```bash
-bash volcano-v4-deploy.sh --bundle ./bundle.tar.gz --volcano-ref v1.15.0 --output ./results --keep-cluster
+bash volcano-v4-deploy.sh --work-dir ./work/v1.15.0-full --volcano-ref v1.15.0
 ```
 
-恢复这个集群时同时给出保存目录和 `--keep-cluster`：
+#### 保留并复用 Kind 集群
+
+`--keep-cluster` 会同时保留工作目录和本次 Kind 集群。由于每个 E2E TYPE 或 Benchmark 场景都会重新创建kind集群，必须显式选择单个场景，不能直接运行 `FULL` 多批任务：
 
 ```bash
-bash volcano-v4-deploy.sh --work-dir /tmp/volcano-v4-deploy.ABC123 --volcano-ref v1.15.0 --keep-cluster
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode e2e --e2e-type SCHEDULINGBASE --work-dir ./work/v1.15.0-e2e-schedulingbase --output ./results/v1.15.0-e2e-schedulingbase --keep-cluster
 ```
 
-脚本会核对本地 run identity、集群内 `vpg4-resume-state` ConfigMap、Kubernetes 版本、Candidate commit 和 Helm release 后才复用集群。E2E 会在原集群中从所选 E2E 类型的开头重新运行，不能从单个 Ginkgo spec 中间继续；Benchmark 会清理未完成工作负载，并从第一个没有成功标记的 round 继续。保存集群不会重新安装 Volcano，因此首次切换到包含新 E2E 契约解析的部署脚本时，应新建一次集群；保存工作目录、Go cache 和 Candidate 镜像仍可继续复用。
+重新进入同一个失败批次时，重复相同运行选择并继续传入 `--keep-cluster`；脚本验证 Bundle、Candidate、Kubernetes 和集群身份后复用集群，并从该 E2E TYPE 或失败的 Benchmark round 开头重新运行：
 
-`--keep-cluster` 仍只允许一次执行中恰好有一个 E2E 类型或一个 Benchmark 场景；`FULL` 等多运行选择应使用 `--keep-work-dir` 恢复，脚本会跳过已经成功的运行，但不会同时保留多个集群。
+```bash
+bash volcano-v4-deploy.sh --work-dir ./work/v1.15.0-e2e-schedulingbase --volcano-ref v1.15.0 --mode e2e --e2e-type SCHEDULINGBASE --keep-cluster
+```
 
-只有新脚本创建且包含 `.vpg4-state/run.env` 的工作目录可以恢复；此前旧版本仅由 `--keep-work-dir` 留下的诊断目录没有阶段身份，仍需新开一次运行。
+#### 仅创建 Kind 集群
 
-默认会删除本次脚本创建的临时目录和 Kind 集群，不会清理整机 Docker 数据。
+`--cluster-only` 只校验并解压 Bundle、加载镜像并创建一个包含一个 control-plane 和两个 worker 的普通 Kind 集群，不拉取 Volcano、不下载 Go modules，也不运行测试。该模式自动保留工作目录和集群：
 
+```bash
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --cluster-only --work-dir ./work/kind-1.34.8 --output ./results/kind-1.34.8
+```
+
+创建完成后加载脚本生成的环境，即可按普通 Kind/Kubernetes 流程使用：
+
+```bash
+source ./results/kind-1.34.8/manual-env.sh && kubectl get nodes -o wide
+```
+
+重新验证并进入保存的同一个集群：
+
+```bash
+bash volcano-v4-deploy.sh --work-dir ./work/kind-1.34.8 --cluster-only
+```
+
+#### 仅安装 Volcano
+
+`--deploy-only` 拉取指定 Candidate、下载其 Go modules、构建组件镜像，创建相同的普通 Kind 集群并使用 Candidate 自己的 Helm Chart 安装 Volcano；安装就绪后停止，不运行 E2E 或 Benchmark。该模式也自动保留工作目录和集群：
+
+```bash
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --deploy-only --work-dir ./work/v1.15.0-deploy --output ./results/v1.15.0-deploy
+```
+
+加载环境后可以按普通 Volcano/Kubernetes 流程使用 kubectl、Helm、vcjob、queue 等资源：
+
+```bash
+source ./results/v1.15.0-deploy/manual-env.sh && kubectl -n volcano-system get pods -o wide
+```
+
+重新验证并进入保存的同一个 Volcano 集群：
+
+```bash
+bash volcano-v4-deploy.sh --work-dir ./work/v1.15.0-deploy --volcano-ref v1.15.0 --deploy-only
+```
+
+两个模式都会在结果目录生成 `manual-env.sh`、`manual-access.txt`、`kubeconfig` 和 `summary.txt`。使用结束后先 `source manual-env.sh`，再执行 `kind delete cluster --name "$VPG4_KIND_CLUSTER"` 即可删除该项目集群；脚本不会清理宿主机的其他集群或镜像。删除后再次使用原命令和同一工作目录时会重建同名集群；`--deploy-only` 会复用已完成的源码、依赖和镜像构建，再向新集群重新加载组件镜像并安装 Volcano。
+
+### 使用包内工具
+
+部署工作目录完成 Bundle 工具解压后，可以直接把包内 Kind、kubectl、Helm、jq 和默认 Go 加入当前终端的 `PATH`，不会安装到系统目录：
+
+```bash
+export PATH="$PWD/work/v1.15.0-full/tools/bin:$PWD/work/v1.15.0-full/tools/go/bin:$PATH"
+```
+
+检查实际使用的包内版本：
+
+```bash
+kind version && kubectl version --client && helm version --short && jq --version && go version
+```
 
 ## 外网打包脚本说明
 
 `volcano-v4-package.sh` 只在能够访问公共下载地址和镜像仓库的 Linux x86_64 外网机器运行。它下载并校验通用工具、基础镜像、测试镜像和固定资源，但不会接收 Volcano ref，也不会拉取 Volcano 源码、Go modules 或构建最终 Candidate 镜像。
 
-### 基本语法和必选参数
+### 参数说明
 
-```bash
-bash volcano-v4-package.sh --k8s-version vX.Y.Z --profile PROFILE --output DIR
-```
-
-| 参数                   | 含义                                                        |
-| ---------------------- | ----------------------------------------------------------- |
-| `--k8s-version vX.Y.Z` | Kind 集群使用的精确 Kubernetes 版本，必须包含 patch 版本    |
-| `--profile PROFILE`    | 从 `config/profiles.tsv` 选择要打进包里的测试能力和依赖集合 |
-| `--output DIR`         | 外网产物目录；目录可以存在，但同名目标包不能已经存在        |
-
-推荐的完整包命令是：
-
-```bash
-bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./release-assets --split-size 1900M
-```
-
-打包命令没有也不接受 `--volcano-ref`。Candidate 的 tag、branch 或 commit 只在内网交给 `volcano-v4-deploy.sh`；只要包内 Kubernetes/Kind、工具、基础镜像、测试运行镜像和固定资源仍覆盖新的 Candidate，同一个外网包就可以一直复用。
-
-### 外网打包机要求
-
-外网打包机需要 Bash、curl、Docker、tar、gzip、sha256sum、awk、sed、grep、sort 和 mktemp；使用 `--split-size` 时还需要 split，使用 `--publish` 时还需要已经登录目标仓库的 GitHub CLI `gh`。外网不需要 Git、Volcano 源码、Python 或本机 Go。
-
-Docker daemon 必须能够拉取 Profile 选择的全部 `linux/amd64` 镜像，主机还要能够访问 Kind、Kubernetes、Helm、jq、Go 和 KWOK 的官方下载地址。打包脚本会校验下载文件的 SHA256、镜像平台和镜像身份。
-
-临时 staging 固定创建在 `/tmp/volcano-v4-package.*`，因此 `/tmp` 所在文件系统必须能容纳解出的工具和压缩后的 `images.tar.gz`。`--output` 所在文件系统必须能容纳最终包；使用分卷时完整 `.tar.gz` 不会被删除，输出目录还会再保存一份等量分卷，因此应预留约两倍最终包大小。
+| 参数                                              | 含义                                                                            |
+| ------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `--k8s-version VERSION`                           | 指定包内 Kubernetes 和 kubectl 的精确版本，并从配置中选择对应的 Kind 和节点镜像 |
+| `--profile PROFILE`                               | 指定要打包的 E2E、Benchmark 能力和依赖集合                                      |
+| `--output DIR`                                    | 指定完整包、校验文件和可选分卷的输出目录                                        |
+| `--config-dir DIR`                                | 使用另一套包含 `versions.tsv` 和 `profiles.tsv` 的配置目录                      |
+| `--kind-version VERSION`、`--node-image IMAGE`    | 为配置中未维护的 Kubernetes 版本指定 Kind 和节点镜像，两项必须同时使用          |
+| `--helm-version VERSION`                          | 临时指定包内 Helm 版本                                                          |
+| `--go-version VERSION`、`--go-sha256 SHA256`      | 向包内增加并选择一个宿主 Go 工具链，两项必须同时使用                            |
+| `--set-image KEY=IMAGE`                           | 修改当前 Profile 中某个镜像 Key 的外网拉取来源，保存后的内网镜像名不变          |
+| `--add-image IMAGE`                               | 临时向本次包增加一个配置中没有的精确镜像                                        |
+| `--list-profiles`                                 | 显示配置中维护的全部 Profile 后退出，不进行下载                                 |
+| `--list-images`                                   | 显示本次配置将选择的工具版本和镜像，不进行下载                                  |
+| `--split-size SIZE`                               | 按指定大小生成 `.part-NNN` 分卷和 `.parts.sha256`，例如 `1900M`                 |
+| `--publish OWNER/REPOSITORY`、`--release-tag TAG` | 使用已登录的 `gh` 将产物上传到指定仓库的 Release，两项必须同时使用              |
+| `--keep-work-dir`                                 | 保留外网打包临时目录，用于排查下载、镜像保存或归档问题                          |
+| `-h`、`--help`                                    | 显示脚本帮助信息                                                                |
 
 ### Profile 决定包内能力和依赖
-
-查看全部 Profile，不下载工具或镜像：
-
-```bash
-bash volcano-v4-package.sh --list-profiles
-```
 
 当前可用 Profile 以 `--list-profiles` 的实际输出为准；常用选择如下：
 
@@ -224,47 +232,6 @@ SCHEDULERSHARDING_NONE SCHEDULERSHARDING_SOFT SCHEDULERSHARDING_HARD
 
 由于 `full` 包包含 DRA，给 Volcano v1.15.x 使用时选择 Kubernetes `v1.34+`；Kubernetes `v1.32-v1.33` 只适合不启用 DRA 的较小 Profile。
 
-### 下载前预览包内容
-
-查看 `full` 包将选择的 Kubernetes、Kind、Go 和全部镜像引用，不执行下载：
-
-```bash
-bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --list-images
-```
-
-`--list-images` 会应用当前 TSV 配置和命令行镜像覆盖，因此适合在正式打包前审计最终依赖清单。它不要求 `--output`，也不要求 Docker daemon 正在运行。
-
-### 覆盖版本、镜像和配置
-
-| 参数                                        | 使用场景                                                                     |
-| ------------------------------------------- | ---------------------------------------------------------------------------- |
-| `--config-dir DIR`                          | 使用另一套同时包含 `versions.tsv` 和 `profiles.tsv` 的配置目录               |
-| `--kind-version VERSION --node-image IMAGE` | 使用 `config/versions.tsv` 尚未维护的 Kubernetes/Kind 组合；两项必须一起指定 |
-| `--helm-version VERSION`                    | 临时覆盖 `versions.tsv` 中的 Helm 版本                                       |
-| `--go-version goX.Y.Z --go-sha256 SHA256`   | 向包中增加该 Go toolchain 并将它设为默认；版本与官方 SHA256 必须一起指定    |
-| `--set-image KEY=IMAGE`                     | 从外网可访问的镜像或镜像代理拉取某个已选 Key，但仍按配置中的内网引用保存     |
-| `--add-image IMAGE`                         | 向本次包临时增加一个配置中没有的精确基础镜像或测试运行镜像                   |
-
-未列出的 Kubernetes 版本必须使用准确且最好带 digest 的节点镜像，例如：
-
-```bash
-bash volcano-v4-package.sh --k8s-version v1.30.0 --profile e2e-basic --kind-version v0.29.0 --node-image kindest/node:v1.30.0@sha256:准确摘要 --output ./release-assets
-```
-
-Candidate 要求新的宿主 Go toolchain 和新的 Docker builder 基础镜像时，两者要分别指定：
-
-```bash
-bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --go-version goX.Y.Z --go-sha256 官方linux-amd64压缩包SHA256 --add-image golang:X.Y.Z --output ./release-assets --split-size 1900M
-```
-
-外网只能从镜像代理访问 KWOK 时，覆盖拉取来源但保留内网需要的原始标签：
-
-```bash
-bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --set-image kwok=registry.example.com/kwok:v0.7.0 --output ./release-assets --split-size 1900M
-```
-
-`--set-image` 的 Key 必须已经被当前 Profile 选中。`--add-image` 用于临时补充依赖，不会永久修改 TSV；需要长期支持时应更新 `config/profiles.tsv`。jq、KWOK 等没有独立命令行覆盖项的默认值通过 `config/versions.tsv` 或 `--config-dir` 维护。
-
 ### 包的准确内容和边界
 
 每个外网包的顶层目录只包含：
@@ -282,8 +249,6 @@ SHA256SUMS
 - `tools.tar.gz`：当前 Kubernetes 组合指定的唯一 Kind、多个隔离的完整 Go toolchain、kubectl、Helm 和 jq；
 - `resources.tar.gz`：KWOK manifest、stage 等固定小资源；
 - `SHA256SUMS`：上述四个内容文件的 SHA256。
-
-外网包明确不包含 Volcano 源码、Go module cache、Ginkgo、最终 Candidate 组件镜像、`volcano-v4-deploy.sh` 或测试结果。部署脚本独立传输，因此修复内网部署逻辑通常只需要替换脚本，不需要重新传输大包。
 
 ### 输出、校验、分卷和 Release
 
@@ -344,15 +309,15 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 
 默认通用工具：
 
-| 工具         | 打包版本/来源                                       |
-| ------------ | --------------------------------------------------- |
-| Kind         | 仅包含当前 `--k8s-version` 映射或命令行明确指定的一个版本 |
-| kubectl      | 与当前 Bundle 的 Kubernetes 相同                    |
-| Helm         | `v3.21.4`                                           |
-| jq           | `jq-1.8.2`，校验 SHA256                             |
-| KWOK         | `v0.7.0`                                            |
+| 工具         | 打包版本/来源                                                   |
+| ------------ | --------------------------------------------------------------- |
+| Kind         | 仅包含当前 `--k8s-version` 映射或命令行明确指定的一个版本       |
+| kubectl      | 与当前 Bundle 的 Kubernetes 相同                                |
+| Helm         | `v3.21.4`                                                       |
+| jq           | `jq-1.8.2`，校验 SHA256                                         |
+| KWOK         | `v0.7.0`                                                        |
 | Go toolchain | `go1.23.7`、`go1.24.0`、`go1.25.0`、`go1.26.0`，默认 `go1.25.0` |
-| Ginkgo       | 不打包；内网按 Candidate `go.mod` 安装              |
+| Ginkgo       | 不打包；内网按 Candidate `go.mod` 安装                          |
 
 部署脚本启动时仍使用默认 `go1.25.0`，拉取 Candidate 后再读取其 `toolchain` 或 `go` 声明，在包内选择相同 Go 主次版本且不低于最低要求的最小补丁版本。Candidate 要求 `go1.24.0` 时使用包内 `go1.24.0`；最低要求为 `go1.26.0` 时，默认 `go1.25.0` 不再满足要求，脚本会自动切换到 `go1.26.0`。若对应主次版本不存在，脚本会在下载 Go modules 和构建前直接报错；此时应在 `versions.tsv` 增加 `GO|版本|官方SHA256|-` 后重新打包，或者使用前文的 `--go-version` 与 `--go-sha256` 临时补充。
 
@@ -417,6 +382,34 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 
 ## 内网部署脚本说明
 
+### 参数说明
+
+| 参数                          | 含义                                                                                   |
+| ----------------------------- | -------------------------------------------------------------------------------------- |
+| `--bundle PATH`               | 指定完整 `.tar.gz`、已解压 Bundle 目录或 `.part-000`；从已解压 Bundle 内运行时可以省略 |
+| `--bundle-url URL`            | 使用 `curl` 下载一个未分卷的 Bundle；不能用于分卷包                                    |
+| `--output DIR`                | 指定测试结果目录；未指定时使用带时间戳的默认目录                                       |
+| `--work-dir DIR`              | 指定新的工作目录，或恢复一个此前保存且身份匹配的工作目录                               |
+| `--keep-work-dir`             | 保留脚本自动创建的工作目录，供后续恢复或排查问题                                       |
+| `--keep-cluster`              | 保留并复用当前工作目录唯一的 Kind 集群                                                 |
+| `--cluster-only`              | 创建并保留普通双 worker Kind 集群，不拉取 Candidate，也不运行测试                      |
+| `--deploy-only`               | 构建并安装指定 Candidate Volcano，保留集群但不运行 E2E 或 Benchmark                     |
+| `--volcano-ref REF`           | 指定 Volcano tag、branch 或 commit；除 `--cluster-only` 外均为必填                      |
+| `--volcano-repo URL`          | 指定 Volcano Git 仓库；默认使用官方仓库                                                |
+| `--goproxy VALUE`             | 指定内网下载 Candidate Go modules 使用的 Go Proxy                                      |
+| `--gonosumdb VALUE`           | 指定 `GONOSUMDB`；默认 `*`                                                             |
+| `--gosumdb VALUE`             | 指定 `GOSUMDB`；默认 `off`                                                             |
+| `--mode e2e\|benchmark\|both` | 选择运行 E2E、Benchmark 或两者，必须在 Bundle Profile 的覆盖范围内                     |
+| `--e2e-type TYPE`             | 指定一个 E2E TYPE 或 `FULL`                                                            |
+| `--benchmark-scenario NAME`   | 指定 `gang`、`pod` 或 `FULL` Benchmark                                                 |
+| `--benchmark-config PATH`     | 为单次 Benchmark 指定 Candidate 内相对路径或绝对路径的 YAML                            |
+| `--benchmark-rounds N`        | 指定每个 Benchmark 的运行轮数；默认 `1`                                                |
+| `--pods N`                    | 指定生成式 Pod Benchmark 的 Pod 数量；默认 `1000`                                      |
+| `--scheduler-name NAME`       | 指定生成式 Pod Benchmark 使用的调度器；默认 `agent-scheduler`                          |
+| `--cluster-prefix NAME`       | 指定 Kind 集群名称前缀；默认 `volcano-v4`                                              |
+| `--list-capabilities`         | 校验 Bundle 元数据并显示当前包可运行的 E2E 和 Benchmark，不执行测试                    |
+| `-h`、`--help`                | 显示脚本帮助信息                                                                       |
+
 ### E2E 参数自动跟随 Candidate
 
 部署脚本不会把 `FEATURE_GATES`、`IGNORED_PROVISIONERS` 等参数按 Volcano 版本硬编码。Candidate checkout 完成后，脚本对每个选中的 TYPE 查找对应的上游 Make 目标，用 `make -n` 取得该目标实际调用 `hack/run-e2e-kind.sh` 时的环境赋值，同时从隔离的 Make 环境继承 Candidate 导出的单行运行变量，并在创建 Kind 前写入 `candidate-e2e-contracts.txt`。宿主机凭据、代理、Go 缓存和部署脚本管理的集群变量不会进入该契约；仅供 Make 内部使用的多行函数也会被忽略。
@@ -437,19 +430,9 @@ KWOK manifest 应用或 `kwok-controller` 就绪等待失败属于整批测试�
 
 普通参数变化、参数新增或前置目标变化不要求重新制作外网包；只有上游改掉 Make 目标或 `hack/run-e2e-kind.sh` 的入口结构时，部署脚本才会在预检阶段 fail-closed，并需要增加小型兼容适配。`e2e:ALL` 保留 Candidate 自己的一次性 `E2E_TYPE=ALL` 语义，`FULL` 则逐个调用当前 Candidate 已定义的独立上游目标。
 
-### Kubernetes v1.32-v1.33 注意事项
-
-Volcano v1.15.0 的 Kind 配置包含 Kubernetes v1.34 才提供的 `DRAConsumableCapacity` 和 MutatingAdmissionPolicy beta API。对 v1.32-v1.33 的非 DRA E2E，部署脚本会在临时 checkout 中做最小兼容调整并把 diff 保存为 `candidate-environment.patch`。DRA 判断来自当前 Candidate 的 Make 契约和 Kind 配置，不再假定所有 Volcano 版本都使用 v1.15.0 的 Feature Gate。
-
-当当前 Candidate 实际启用了 `DRAConsumableCapacity` 时，以下选择不会被降级模拟，而会直接拒绝，必须改用 Kubernetes v1.34+：
-
-- `--e2e-type DRA`；
-- 上游 `ALL`；
-- 包含 DRA 独立目标的 `e2e-full` 或 `full`。
-
 ### 内网服务器和网络要求
 
-内网执行机需要 Linux x86_64、Bash、curl、git、Docker、tar、gzip、sha256sum、awk、sed、grep、sort、mktemp、make 和 tee；能够访问 Volcano Git 仓库和公司 Go Proxy。无需预装 Python、Kind、kubectl、Helm、jq、Go 或 Ginkgo。
+完整测试和 `--deploy-only` 需要 Linux x86_64、Bash、curl、git、Docker、tar、gzip、sha256sum、awk、sed、grep、sort、mktemp、make 和 tee，并能够访问 Volcano Git 仓库和公司 Go Proxy。`--cluster-only` 不拉取 Candidate，不需要 git、make 或 Go Proxy。所有模式都无需预装 Python、Kind、kubectl、Helm、jq 或 Go；这些工具来自 Bundle。
 
 终端已经 `export HTTP_PROXY/HTTPS_PROXY` 时，脚本会传入 Candidate 的 Docker build。没有这些环境变量时，脚本会读取对 GitHub 生效的 Git `http.proxy`。
 
