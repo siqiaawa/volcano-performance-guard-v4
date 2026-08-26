@@ -232,6 +232,8 @@ printf 'source=%s\nhttp_configured=%s\nhttps_configured=%s\nresume=%s\n' \
 CURRENT_CLUSTER=""; CLUSTER_CREATED=false
 cleanup() {
   status=$?
+  # Cleanup is project-scoped: the active Kind cluster and an automatic work
+  # directory only. Never prune host Docker images or containerd storage.
   if [[ "$CLUSTER_CREATED" == true && "$KEEP_CLUSTER" != true && -n "$CURRENT_CLUSTER" ]] && command -v kind >/dev/null 2>&1; then
     log "deleting project cluster after interruption: $CURRENT_CLUSTER"
     kind delete cluster --name "$CURRENT_CLUSTER" >"$OUTPUT_DIR/kind-delete-trap.log" 2>&1 || true
@@ -447,13 +449,89 @@ for ((index=0; index<${#RESOURCE_KEYS[@]}; index++)); do
   [[ "$(sha256sum "$RESOURCES_DIR/$path"|awk '{print $1}')" == "$expected" ]] || die "resource checksum mismatch: $key"
 done
 
-[[ -d "$TOOLS_DIR/go/bin" && -d "$TOOLS_DIR/go/pkg/tool/linux_amd64" ]] || die "packaged Go toolchain is incomplete"
-chmod 0755 "$BIN_DIR/kind" "$BIN_DIR/kubectl" "$BIN_DIR/helm" "$BIN_DIR/jq" \
-  "$TOOLS_DIR/go/bin/"* "$TOOLS_DIR/go/pkg/tool/linux_amd64/"*
-export GOROOT="$TOOLS_DIR/go" GOTOOLCHAIN=local GOPATH="$WORK_DIR/gopath"
+AVAILABLE_KIND_VERSIONS=(); AVAILABLE_KIND_PATHS=()
+AVAILABLE_GO_VERSIONS=(); AVAILABLE_GO_PATHS=()
+add_packaged_toolchain() {
+  local type="$1" version="$2" path="$3" existing
+  case "$type" in
+    KIND)
+      for existing in "${AVAILABLE_KIND_VERSIONS[@]}"; do [[ "$existing" != "$version" ]] || die "duplicate packaged KIND version: $version"; done
+      AVAILABLE_KIND_VERSIONS+=("$version"); AVAILABLE_KIND_PATHS+=("$path")
+      ;;
+    GO)
+      for existing in "${AVAILABLE_GO_VERSIONS[@]}"; do [[ "$existing" != "$version" ]] || die "duplicate packaged GO version: $version"; done
+      AVAILABLE_GO_VERSIONS+=("$version"); AVAILABLE_GO_PATHS+=("$path")
+      ;;
+    *) die "unknown packaged toolchain type: $type" ;;
+  esac
+}
+TOOLCHAIN_MANIFEST="$TOOLS_DIR/toolchains.tsv"
+MULTI_TOOLCHAIN_MANIFEST=false
+if [[ -f "$TOOLCHAIN_MANIFEST" ]]; then
+  MULTI_TOOLCHAIN_MANIFEST=true
+  while IFS='|' read -r type version path expected extra; do
+    [[ -n "$type" && "$type" != \#* ]] || continue
+    [[ -z "$extra" ]] || die "invalid toolchains.tsv record"
+    case "$type" in
+      KIND) valid_semver "$version" || die "invalid packaged Kind version: $version" ;;
+      GO) [[ "$version" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid packaged Go version: $version" ;;
+      *) die "unknown toolchains.tsv type: $type" ;;
+    esac
+    [[ -n "$path" && "$path" != /* && "$path" != ../* && "$path" != *'/../'* ]] || die "unsafe toolchain path: $path"
+    [[ "$expected" =~ ^[0-9a-f]{64}$ && -f "$TOOLS_DIR/$path" ]] || die "invalid packaged toolchain: $type $version"
+    [[ "$(sha256sum "$TOOLS_DIR/$path" | awk '{print $1}')" == "$expected" ]] || die "toolchain checksum mismatch: $type $version"
+    add_packaged_toolchain "$type" "$version" "$path"
+  done < "$TOOLCHAIN_MANIFEST"
+else
+  # v4.3.0 bundles made before the multi-tool manifest remain usable.
+  for ((index=0; index<${#TOOL_KEYS[@]}; index++)); do
+    case "${TOOL_KEYS[$index]}" in
+      kind) add_packaged_toolchain KIND "${TOOL_VERSIONS[$index]}" "${TOOL_PATHS[$index]}" ;;
+      go) add_packaged_toolchain GO "${TOOL_VERSIONS[$index]}" "${TOOL_PATHS[$index]}" ;;
+    esac
+  done
+fi
+
+packaged_toolchain_path() {
+  local type="$1" wanted="$2" index
+  case "$type" in
+    KIND)
+      for ((index=0; index<${#AVAILABLE_KIND_VERSIONS[@]}; index++)); do
+        [[ "${AVAILABLE_KIND_VERSIONS[$index]}" != "$wanted" ]] || { printf '%s\n' "${AVAILABLE_KIND_PATHS[$index]}"; return; }
+      done
+      ;;
+    GO)
+      for ((index=0; index<${#AVAILABLE_GO_VERSIONS[@]}; index++)); do
+        [[ "${AVAILABLE_GO_VERSIONS[$index]}" != "$wanted" ]] || { printf '%s\n' "${AVAILABLE_GO_PATHS[$index]}"; return; }
+      done
+      ;;
+  esac
+  return 1
+}
+
+KIND_RELATIVE_PATH="$(packaged_toolchain_path KIND "$KIND_VERSION")" || die "bundle does not contain selected Kind $KIND_VERSION"
+DEFAULT_GO_RELATIVE_PATH="$(packaged_toolchain_path GO "$GO_TOOLCHAIN")" || die "bundle does not contain default Go $GO_TOOLCHAIN"
+KIND_BINARY="$TOOLS_DIR/$KIND_RELATIVE_PATH"
+for path in "${AVAILABLE_KIND_PATHS[@]}"; do chmod 0755 "$TOOLS_DIR/$path"; done
+for path in "${AVAILABLE_GO_PATHS[@]}"; do
+  go_root="$TOOLS_DIR/$(dirname "$(dirname "$path")")"
+  [[ -d "$go_root/bin" && -d "$go_root/pkg/tool/linux_amd64" ]] || die "packaged Go toolchain is incomplete: $path"
+  chmod 0755 "$go_root/bin/"* "$go_root/pkg/tool/linux_amd64/"*
+done
+chmod 0755 "$BIN_DIR/kubectl" "$BIN_DIR/helm" "$BIN_DIR/jq"
+
+VPG_BASE_PATH="$PATH"
+export GOTOOLCHAIN=local GOPATH="$WORK_DIR/gopath"
 export GOMODCACHE="$WORK_DIR/go-mod-cache" GOCACHE="$WORK_DIR/go-build-cache"
 export GOPROXY="$GOPROXY_VALUE" GONOSUMDB="$GONOSUMDB_VALUE" GOSUMDB="$GOSUMDB_VALUE"
-export PATH="$GOROOT/bin:$GOPATH/bin:$BIN_DIR:$PATH"
+activate_go_toolchain() {
+  local version="$1" relative_path="$2"
+  SELECTED_GO_TOOLCHAIN="$version"
+  GOROOT="$TOOLS_DIR/$(dirname "$(dirname "$relative_path")")"
+  export SELECTED_GO_TOOLCHAIN GOROOT
+  export PATH="$GOROOT/bin:$GOPATH/bin:$(dirname "$KIND_BINARY"):$BIN_DIR:$VPG_BASE_PATH"
+}
+activate_go_toolchain "$GO_TOOLCHAIN" "$DEFAULT_GO_RELATIVE_PATH"
 
 kind version | tee "$OUTPUT_DIR/kind-version.log"
 kind version | grep -F "$KIND_VERSION" >/dev/null || die "Kind version mismatch"
@@ -462,10 +540,8 @@ kubectl version --client -o json > "$OUTPUT_DIR/kubectl-version.json"
 helm version --short | tee "$OUTPUT_DIR/helm-version.log"
 helm version --short | grep -F "$HELM_VERSION" >/dev/null || die "Helm version mismatch"
 [[ "$(jq --version)" == "$JQ_VERSION" ]] || die "jq version mismatch"
-go version | tee "$OUTPUT_DIR/go-version.log"
+go version | tee "$OUTPUT_DIR/go-default-version.log"
 go version | grep -F " $GO_TOOLCHAIN " >/dev/null || die "Go version mismatch"
-go tool compile -V=full | tee "$OUTPUT_DIR/go-compile-version.log"
-go env GOPROXY GONOSUMDB GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
 
 # Classic Docker stores report the image config digest as .Id. Docker 29 with
 # the containerd image store can instead report a host-local OCI descriptor
@@ -586,11 +662,40 @@ printf '%s\n' "$CANDIDATE_COMMIT" > "$OUTPUT_DIR/candidate-commit.txt"
 
 CANDIDATE_GO="$(awk '$1=="toolchain"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
 [[ -n "$CANDIDATE_GO" ]] || CANDIDATE_GO="go$(awk '$1=="go"&&NF==2 {print $2;exit}' "$CHECKOUT/go.mod")"
-go_version_at_least "$GO_TOOLCHAIN" "$CANDIDATE_GO" || \
-  die "Candidate needs $CANDIDATE_GO but generic bundle contains older $GO_TOOLCHAIN; create a new generic bundle with --go-version $CANDIDATE_GO"
-if [[ "$CANDIDATE_GO" != "$GO_TOOLCHAIN" ]]; then
-  log "using backward-compatible bundled $GO_TOOLCHAIN for Candidate minimum $CANDIDATE_GO"
-fi
+select_candidate_go_toolchain() {
+  local candidate="$1" candidate_major candidate_minor version path index
+  local selected_version="" selected_path=""
+  [[ "$candidate" =~ ^go([0-9]+)\.([0-9]+)(\.([0-9]+))?$ ]] || die "invalid Candidate Go version: $candidate"
+  candidate_major="${BASH_REMATCH[1]}"; candidate_minor="${BASH_REMATCH[2]}"
+  for ((index=0; index<${#AVAILABLE_GO_VERSIONS[@]}; index++)); do
+    version="${AVAILABLE_GO_VERSIONS[$index]}"; path="${AVAILABLE_GO_PATHS[$index]}"
+    [[ "$version" =~ ^go([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || continue
+    [[ "${BASH_REMATCH[1]}" == "$candidate_major" && "${BASH_REMATCH[2]}" == "$candidate_minor" ]] || continue
+    go_version_at_least "$version" "$candidate" || continue
+    if [[ -z "$selected_version" ]] || go_version_at_least "$selected_version" "$version"; then
+      selected_version="$version"; selected_path="$path"
+    fi
+  done
+  if [[ -z "$selected_version" && "$MULTI_TOOLCHAIN_MANIFEST" != true ]] && \
+     go_version_at_least "$GO_TOOLCHAIN" "$candidate"; then
+    selected_version="$GO_TOOLCHAIN"; selected_path="$DEFAULT_GO_RELATIVE_PATH"
+    log "legacy bundle has one Go toolchain; using backward-compatible $selected_version for Candidate minimum $candidate"
+  fi
+  [[ -n "$selected_version" ]] || \
+    die "bundle has no Go toolchain in Candidate-required line $candidate; add it to config/versions.tsv and rebuild the generic bundle"
+  activate_go_toolchain "$selected_version" "$selected_path"
+  log "selected packaged Go $SELECTED_GO_TOOLCHAIN for Candidate minimum $candidate"
+}
+select_candidate_go_toolchain "$CANDIDATE_GO"
+state_set SELECTED_GO_TOOLCHAIN "$SELECTED_GO_TOOLCHAIN"
+printf 'kind=%s\navailable_kind=%s\ndefault_go=%s\nselected_go=%s\navailable_go=%s\n' \
+  "$KIND_VERSION" "$(IFS=,; printf '%s' "${AVAILABLE_KIND_VERSIONS[*]}")" "$GO_TOOLCHAIN" \
+  "$SELECTED_GO_TOOLCHAIN" "$(IFS=,; printf '%s' "${AVAILABLE_GO_VERSIONS[*]}")" \
+  > "$OUTPUT_DIR/selected-toolchains.txt"
+go version | tee "$OUTPUT_DIR/go-version.log"
+go version | grep -F " $SELECTED_GO_TOOLCHAIN " >/dev/null || die "selected Go version mismatch"
+go tool compile -V=full | tee "$OUTPUT_DIR/go-compile-version.log"
+go env GOPROXY GONOSUMDB GOSUMDB GOTOOLCHAIN GOOS GOARCH > "$OUTPUT_DIR/go-environment.txt"
 
 # Resolve the complete Candidate module graph on the inner host, where the
 # approved corporate proxy and CA trust have already been verified. The
@@ -1744,6 +1849,10 @@ profile=$PROFILE
 mode=$MODE
 kubernetes_version=$K8S_VERSION
 kind_version=$KIND_VERSION
+packaged_kind_versions=$(IFS=,; printf '%s' "${AVAILABLE_KIND_VERSIONS[*]}")
+default_go_toolchain=$GO_TOOLCHAIN
+selected_go_toolchain=$SELECTED_GO_TOOLCHAIN
+packaged_go_toolchains=$(IFS=,; printf '%s' "${AVAILABLE_GO_VERSIONS[*]}")
 candidate_repository=$VOLCANO_REPO
 candidate_requested_ref=$VOLCANO_REF
 candidate_commit=$CANDIDATE_COMMIT

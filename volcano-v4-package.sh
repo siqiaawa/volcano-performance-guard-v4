@@ -28,7 +28,7 @@ Overrides:
   --kind-version VERSION      Required with --node-image for an unlisted K8s
   --node-image IMAGE          Exact kindest/node reference, preferably digest-pinned
   --helm-version VERSION      Override configured Helm version
-  --go-version VERSION        Generic inner Go toolchain, e.g. go1.25.0
+  --go-version VERSION        Add/select one packaged host Go toolchain, e.g. go1.25.0
   --go-sha256 SHA256          Required together with --go-version
   --set-image KEY=IMAGE       Pull a selected image from an accessible mirror
   --add-image IMAGE           Add one exact Candidate-specific dependency image
@@ -45,7 +45,8 @@ Inspection/output:
 This command never accepts a Volcano ref, checks out Volcano source, downloads
 Go modules, or builds final Candidate images. The same bundle is reusable for
 different Candidate commits while its configured tools, bases and test images
-still cover those commits.
+still cover those commits. tools.tar.gz contains every configured GO row, but
+only the exact Kind version selected for this Kubernetes bundle.
 EOF
 }
 
@@ -101,6 +102,14 @@ valid_text "$PROFILE" || die "invalid --profile"
 
 HELM_VERSION=""; JQ_VERSION=""; JQ_SHA256=""; KWOK_VERSION=""; GO_TOOLCHAIN=""; GO_SHA256=""
 KIND_VERSION=""; NODE_IMAGE=""
+GO_TOOLCHAINS=(); GO_SHA256S=()
+add_go_toolchain() {
+  local version="$1" checksum="$2" index
+  for ((index=0; index<${#GO_TOOLCHAINS[@]}; index++)); do
+    if [[ "${GO_TOOLCHAINS[$index]}" == "$version" ]]; then GO_SHA256S[index]="$checksum"; return; fi
+  done
+  GO_TOOLCHAINS+=("$version"); GO_SHA256S+=("$checksum")
+}
 while IFS='|' read -r type a b c extra; do
   [[ -n "$type" && "$type" != \#* ]] || continue
   case "$type" in
@@ -109,10 +118,11 @@ while IFS='|' read -r type a b c extra; do
         helm) HELM_VERSION="$b" ;;
         jq) JQ_VERSION="$b"; JQ_SHA256="$c" ;;
         kwok) KWOK_VERSION="$b" ;;
-        go) GO_TOOLCHAIN="$b"; GO_SHA256="$c" ;;
+        go) GO_TOOLCHAIN="$b"; GO_SHA256="$c"; add_go_toolchain "$b" "$c" ;;
         *) die "unknown DEFAULT key in versions.tsv: $a" ;;
       esac
       ;;
+    GO) add_go_toolchain "$a" "$b" ;;
     K8S)
       if [[ "$a" == "$K8S_VERSION" ]]; then KIND_VERSION="$b"; NODE_IMAGE="$c"; fi
       ;;
@@ -124,7 +134,7 @@ done < "$VERSIONS_CONFIG"
 [[ -z "$NODE_OVERRIDE" ]] || NODE_IMAGE="$NODE_OVERRIDE"
 [[ -z "$GO_OVERRIDE" && -z "$GO_SHA_OVERRIDE" ]] || {
   [[ -n "$GO_OVERRIDE" && -n "$GO_SHA_OVERRIDE" ]] || die "--go-version and --go-sha256 must be used together"
-  GO_TOOLCHAIN="$GO_OVERRIDE"; GO_SHA256="$GO_SHA_OVERRIDE"
+  GO_TOOLCHAIN="$GO_OVERRIDE"; GO_SHA256="$GO_SHA_OVERRIDE"; add_go_toolchain "$GO_OVERRIDE" "$GO_SHA_OVERRIDE"
 }
 if [[ -z "$KIND_VERSION" || -z "$NODE_IMAGE" ]]; then
   die "Kubernetes $K8S_VERSION is not fully configured; pass --kind-version and --node-image together"
@@ -136,6 +146,20 @@ valid_semver "$HELM_VERSION" || die "invalid Helm version: $HELM_VERSION"
 valid_semver "$KWOK_VERSION" || die "invalid KWOK version in config"
 [[ "$GO_TOOLCHAIN" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Go toolchain must be exact goMAJOR.MINOR.PATCH"
 [[ "$GO_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "Go toolchain SHA256 must contain 64 lowercase hex characters"
+found=false
+for ((index=0; index<${#GO_TOOLCHAINS[@]}; index++)); do
+  if [[ "${GO_TOOLCHAINS[$index]}" == "$GO_TOOLCHAIN" ]]; then
+    [[ "${GO_SHA256S[$index]}" == "$GO_SHA256" ]] || die "default Go checksum conflicts with its GO record"
+    found=true
+  fi
+done
+[[ "$found" == true ]] || die "default Go toolchain is not included in the configured GO list"
+for value in "${GO_TOOLCHAINS[@]}"; do
+  [[ "$value" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid configured Go toolchain: $value"
+done
+for value in "${GO_SHA256S[@]}"; do
+  [[ "$value" =~ ^[0-9a-f]{64}$ ]] || die "invalid configured Go checksum"
+done
 
 PROFILE_MODE=""; DEFAULT_RUN=""; PROFILE_GROUPS=""
 E2E_FULL_TYPES=(); BENCHMARK_FULL_SCENARIOS=(); BENCHMARK_FULL_CONFIGS=()
@@ -211,6 +235,9 @@ done
 if [[ "$LIST_IMAGES" == true ]]; then
   printf 'profile=%s\nmode=%s\nkubernetes=%s\nkind=%s\nnode=%s\ngo=%s\n' \
     "$PROFILE" "$PROFILE_MODE" "$K8S_VERSION" "$KIND_VERSION" "$NODE_IMAGE" "$GO_TOOLCHAIN"
+  printf 'selected_kind=%s\ndefault_go=%s\n' "$KIND_VERSION" "$GO_TOOLCHAIN"
+  printf 'packaged_kind=%s\n' "$KIND_VERSION"
+  printf 'packaged_go='; (IFS=,; printf '%s\n' "${GO_TOOLCHAINS[*]}")
   for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
     printf '%s=%s -> %s\n' "${IMAGE_KEYS[$index]}" "${IMAGE_PULL_REFS[$index]}" "${IMAGE_SAVE_REFS[$index]}"
   done
@@ -234,6 +261,8 @@ BAKE_CONTAINERS=()
 mkdir -p "$STAGE" "$TOOLS_BIN" "$RESOURCES_STAGE"
 cleanup() {
   status=$?
+  # Remove only temporary containers created by this packaging run. Host
+  # images and Docker/containerd caches are intentionally never pruned here.
   for container in "${BAKE_CONTAINERS[@]}"; do
     docker rm -f "$container" >/dev/null 2>&1 || true
   done
@@ -255,10 +284,15 @@ download_verified() {
 }
 
 log "downloading exact generic tools"
+TOOLCHAIN_MANIFEST="$TOOLS_STAGE/toolchains.tsv"
+printf '# TYPE|VERSION|PATH|SHA256\n' > "$TOOLCHAIN_MANIFEST"
 download_verified \
   "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \
   "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" \
   "$TOOLS_BIN/kind"
+chmod 0755 "$TOOLS_BIN/kind"
+printf 'KIND|%s|bin/kind|%s\n' \
+  "$KIND_VERSION" "$(sha256sum "$TOOLS_BIN/kind" | awk '{print $1}')" >> "$TOOLCHAIN_MANIFEST"
 download_verified \
   "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl" \
   "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl.sha256" \
@@ -275,16 +309,25 @@ curl --fail --location --retry 3 --connect-timeout 30 -o "$TOOLS_BIN/jq" \
 [[ "$(sha256sum "$TOOLS_BIN/jq" | awk '{print $1}')" == "$JQ_SHA256" ]] || die "jq checksum mismatch"
 chmod 0755 "$TOOLS_BIN/kind" "$TOOLS_BIN/kubectl" "$TOOLS_BIN/helm" "$TOOLS_BIN/jq"
 
-go_filename="${GO_TOOLCHAIN}.linux-amd64.tar.gz"; go_archive="$WORK_DIR/$go_filename"
-if ! curl --fail --location --retry 3 --connect-timeout 30 -o "$go_archive.part" "https://go.dev/dl/$go_filename"; then
-  log "go.dev archive endpoint failed; retrying the official download host"
-  curl --fail --location --retry 3 --connect-timeout 30 -o "$go_archive.part" "https://dl.google.com/go/$go_filename"
-fi
-mv "$go_archive.part" "$go_archive"
-[[ "$(sha256sum "$go_archive" | awk '{print $1}')" == "$GO_SHA256" ]] || die "Go checksum mismatch"
-tar -xzf "$go_archive" -C "$TOOLS_STAGE"
-[[ -d "$TOOLS_STAGE/go/bin" && -d "$TOOLS_STAGE/go/pkg/tool/linux_amd64" ]] || die "invalid Go toolchain archive"
-chmod 0755 "$TOOLS_STAGE/go/bin/"* "$TOOLS_STAGE/go/pkg/tool/linux_amd64/"*
+for ((index=0; index<${#GO_TOOLCHAINS[@]}; index++)); do
+  value="${GO_TOOLCHAINS[$index]}"; expected="${GO_SHA256S[$index]}"
+  go_filename="${value}.linux-amd64.tar.gz"; go_archive="$WORK_DIR/$go_filename"
+  if ! curl --fail --location --retry 3 --connect-timeout 30 -o "$go_archive.part" "https://go.dev/dl/$go_filename"; then
+    log "go.dev archive endpoint failed for $value; retrying the official download host"
+    curl --fail --location --retry 3 --connect-timeout 30 -o "$go_archive.part" "https://dl.google.com/go/$go_filename"
+  fi
+  mv "$go_archive.part" "$go_archive"
+  [[ "$(sha256sum "$go_archive" | awk '{print $1}')" == "$expected" ]] || die "Go checksum mismatch: $value"
+  go_root="$TOOLS_STAGE/go-versions/$value"
+  mkdir -p "$go_root"
+  tar -xzf "$go_archive" -C "$go_root" --strip-components=1
+  [[ -d "$go_root/bin" && -d "$go_root/pkg/tool/linux_amd64" ]] || die "invalid Go toolchain archive: $value"
+  chmod 0755 "$go_root/bin/"* "$go_root/pkg/tool/linux_amd64/"*
+  printf 'GO|%s|go-versions/%s/bin/go|%s\n' \
+    "$value" "$value" "$(sha256sum "$go_root/bin/go" | awk '{print $1}')" >> "$TOOLCHAIN_MANIFEST"
+done
+[[ -d "$TOOLS_STAGE/go-versions/$GO_TOOLCHAIN" ]] || die "default Go toolchain was not packaged"
+ln -s "go-versions/$GO_TOOLCHAIN" "$TOOLS_STAGE/go"
 tar -C "$TOOLS_STAGE" -czf "$STAGE/tools.tar.gz" .
 
 log "downloading ${#RESOURCE_KEYS[@]} small resources"

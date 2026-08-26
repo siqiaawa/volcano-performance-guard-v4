@@ -31,10 +31,11 @@ PROFILE|full|both|FULL|e2e-common,e2e-jobseq,e2e-dra,benchmark-common,benchmark-
 # IMAGE|GROUP|KEY|PULL_REFERENCE|LOCAL_REFERENCE
 # Generic Candidate build bases. These are selected for every profile and are
 # maintained here instead of being discovered from one Volcano checkout.
-# The three Go builders cover the maintained stable Volcano v1.12-v1.15 lines.
+# Go builders cover the maintained stable lines and newer Candidate branches.
 IMAGE|candidate-build|candidate-builder-go1-23|golang:1.23.7|golang:1.23.7
 IMAGE|candidate-build|candidate-builder-go1-24|golang:1.24.0|golang:1.24.0
 IMAGE|candidate-build|candidate-builder|golang:1.25.0|golang:1.25.0
+IMAGE|candidate-build|candidate-builder-go1-26|golang:1.26.0|golang:1.26.0
 IMAGE|candidate-build|candidate-runtime|alpine:latest|alpine:latest
 IMAGE|e2e-common|busybox-default|busybox:1.36|busybox:latest
 # busybox:1.24 is schema-1 and rejected by Docker 29/containerd 2.1.

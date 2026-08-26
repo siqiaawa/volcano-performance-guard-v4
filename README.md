@@ -241,7 +241,7 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --list-images
 | `--config-dir DIR`                          | 使用另一套同时包含 `versions.tsv` 和 `profiles.tsv` 的配置目录               |
 | `--kind-version VERSION --node-image IMAGE` | 使用 `config/versions.tsv` 尚未维护的 Kubernetes/Kind 组合；两项必须一起指定 |
 | `--helm-version VERSION`                    | 临时覆盖 `versions.tsv` 中的 Helm 版本                                       |
-| `--go-version goX.Y.Z --go-sha256 SHA256`   | 临时覆盖内网宿主 Go toolchain；版本与官方压缩包 SHA256 必须一起指定          |
+| `--go-version goX.Y.Z --go-sha256 SHA256`   | 向包中增加该 Go toolchain 并将它设为默认；版本与官方 SHA256 必须一起指定    |
 | `--set-image KEY=IMAGE`                     | 从外网可访问的镜像或镜像代理拉取某个已选 Key，但仍按配置中的内网引用保存     |
 | `--add-image IMAGE`                         | 向本次包临时增加一个配置中没有的精确基础镜像或测试运行镜像                   |
 
@@ -279,7 +279,7 @@ SHA256SUMS
 
 - `bundle.meta`：Kubernetes/Profile、工具、镜像、资源及 E2E/Benchmark 能力元数据；
 - `images.tar.gz`：选中 Profile 的 `linux/amd64` 基础镜像和测试运行镜像；
-- `tools.tar.gz`：Kind、kubectl、Helm、jq 和完整 Go toolchain；
+- `tools.tar.gz`：当前 Kubernetes 组合指定的唯一 Kind、多个隔离的完整 Go toolchain、kubectl、Helm 和 jq；
 - `resources.tar.gz`：KWOK manifest、stage 等固定小资源；
 - `SHA256SUMS`：上述四个内容文件的 SHA256。
 
@@ -306,6 +306,12 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 
 打包临时目录默认在 `/tmp/volcano-v4-package.*`，成功或失败后自动清理。排查下载、镜像保存或归档问题时增加 `--keep-work-dir`，日志会显示保留下来的准确目录；它只保留 staging，不改变最终输出目录。
 
+### 镜像和自动清理边界
+
+打包脚本和部署脚本都不会自动执行 `docker system prune`、`docker image prune`、批量 `docker rmi`、`ctr images rm`，也不会删除 `/var/lib/docker` 或 `/var/lib/containerd`。打包阶段拉取的镜像、部署阶段加载的 Bundle 镜像和内网构建的 Candidate 镜像都会保留在宿主机，供后续工作目录或再次验证复用。
+
+脚本自动删除的范围只有它自己创建的临时打包容器、未要求保留的临时目录，以及未使用 `--keep-cluster` 保存的项目 Kind 集群。删除 Kind 集群会删除该集群的节点容器及节点容器内部的数据，但不会清空宿主 Docker 的全部镜像。需要释放磁盘时应由使用者在任务之外审计准确对象后手动清理，部署命令不会隐式替使用者做全局镜像清理。
+
 ### 什么时候必须重新制作外网包
 
 | 变化                                                | 是否重打包 | 原因                                      |
@@ -319,7 +325,7 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 | Kubernetes、Kind、节点镜像或通用工具变化            | 是         | 它们属于包内容                            |
 | Candidate Dockerfile 新增基础镜像                   | 是         | 内网构建不能自动拉取公共镜像              |
 | E2E/Benchmark 新增运行镜像或固定资源                | 是         | 必须预装进内网 Docker                     |
-| Candidate 要求比包内更新的 Go toolchain             | 是         | 宿主 Go toolchain 属于 `tools.tar.gz`     |
+| Candidate 要求的 Go 主次版本不在包内                | 是         | 需要把对应 Go 版本加入 `tools.tar.gz`     |
 
 打包脚本遇到未知 Profile、未配置的 Kubernetes/Kind 组合、缺失镜像 Key、错误平台或校验不一致时会直接停止，不会静默改用其他版本。
 
@@ -334,23 +340,23 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 | `v0.30.0` | `v1.34.0`、`v1.33.4`、`v1.32.8`、`v1.31.12`             |
 | `v0.29.0` | `v1.33.1`、`v1.32.5`、`v1.31.9`、`v1.30.13`             |
 
-未列出的 Kubernetes 版本必须同时提供准确 Kind 版本和最好带 digest 的节点镜像，使用前文的 `--kind-version` 与 `--node-image` 配对覆盖。
+未列出的 Kubernetes 版本必须同时提供准确 Kind 版本和最好带 digest 的节点镜像，使用前文的 `--kind-version` 与 `--node-image` 配对覆盖。表中维护多个可选择组合，但每次打包只把当前 `--k8s-version` 对应的一个 Kind、一个 kubectl 和一个 `kindest/node` 镜像放进 Bundle，不会把不同 Kubernetes/Kind 组合混装。命令行指定新组合时也只打入该次明确指定的 Kind 和节点镜像。
 
 默认通用工具：
 
-| 工具         | 默认版本/来源                          |
-| ------------ | -------------------------------------- |
-| Kind         | 随 Kubernetes 组合                     |
-| kubectl      | 与 Kubernetes 相同                     |
-| Helm         | `v3.21.4`                              |
-| jq           | `jq-1.8.2`，校验 SHA256                |
-| KWOK         | `v0.7.0`                               |
-| Go toolchain | `go1.25.0`                             |
-| Ginkgo       | 不打包；内网按 Candidate `go.mod` 安装 |
+| 工具         | 打包版本/来源                                       |
+| ------------ | --------------------------------------------------- |
+| Kind         | 仅包含当前 `--k8s-version` 映射或命令行明确指定的一个版本 |
+| kubectl      | 与当前 Bundle 的 Kubernetes 相同                    |
+| Helm         | `v3.21.4`                                           |
+| jq           | `jq-1.8.2`，校验 SHA256                             |
+| KWOK         | `v0.7.0`                                            |
+| Go toolchain | `go1.23.7`、`go1.24.0`、`go1.25.0`、`go1.26.0`，默认 `go1.25.0` |
+| Ginkgo       | 不打包；内网按 Candidate `go.mod` 安装              |
 
-包内 `go1.25.0` 可以运行最低 Go 版本不高于它的 Candidate，并保留 Candidate Dockerfile 自己选择的准确 Go builder。若 Candidate 将最低 Go toolchain 提高到更新版本，重新制作通用包时同时使用前文的 `--go-version`、`--go-sha256` 和 `--add-image golang:X.Y.Z`。
+部署脚本启动时仍使用默认 `go1.25.0`，拉取 Candidate 后再读取其 `toolchain` 或 `go` 声明，在包内选择相同 Go 主次版本且不低于最低要求的最小补丁版本。Candidate 要求 `go1.24.0` 时使用包内 `go1.24.0`；最低要求为 `go1.26.0` 时，默认 `go1.25.0` 不再满足要求，脚本会自动切换到 `go1.26.0`。若对应主次版本不存在，脚本会在下载 Go modules 和构建前直接报错；此时应在 `versions.tsv` 增加 `GO|版本|官方SHA256|-` 后重新打包，或者使用前文的 `--go-version` 与 `--go-sha256` 临时补充。
 
-Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像是两个独立依赖。默认宿主工具链是 `go1.25.0`；构建基础镜像同时维护 `golang:1.23.7`、`golang:1.24.0` 和 `golang:1.25.0`，对应稳定 Volcano `v1.12.x` 到 `v1.15.x`。未来 Candidate 使用其他 builder 时仍需更新 `profiles.tsv` 或使用 `--add-image`。
+Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像仍是两个独立依赖。工具包中的多版本 Go 用于宿主机执行 `go mod download`、安装 Ginkgo 和运行上游 Go 测试；`profiles.tsv` 中的 `golang:1.23.7`、`golang:1.24.0`、`golang:1.25.0`、`golang:1.26.0` 则用于 Candidate Docker builder。这样要求 Go 1.26 的分支在 Dockerfile 同步更新 builder 时也能离线构建。未来 Candidate 使用其他 Go 主次版本时，仍需要同时检查宿主 Go toolchain 与 Docker builder 基础镜像是否都已覆盖。
 
 ### 默认基础镜像和运行镜像
 
@@ -447,7 +453,7 @@ Volcano v1.15.0 的 Kind 配置包含 Kubernetes v1.34 才提供的 `DRAConsumab
 
 终端已经 `export HTTP_PROXY/HTTPS_PROXY` 时，脚本会传入 Candidate 的 Docker build。没有这些环境变量时，脚本会读取对 GitHub 生效的 Git `http.proxy`。
 
-Go 模块的 HTTPS 下载只发生在内网宿主机。部署脚本拉取 Candidate 后先使用包内 Go toolchain 和相同的 `GOPROXY/GONOSUMDB/GOSUMDB` 执行 `go mod download all`，再把 `$GOMODCACHE/cache/download` 转成临时标准 Go file proxy。Candidate Dockerfile 中的 `go mod download` 会被临时改为：
+Go 模块的 HTTPS 下载只发生在内网宿主机。部署脚本拉取 Candidate 后先选择与 Candidate `go.mod` 主次版本匹配的包内 Go toolchain，再使用相同的 `GOPROXY/GONOSUMDB/GOSUMDB` 执行 `go mod download all`，随后把 `$GOMODCACHE/cache/download` 转成临时标准 Go file proxy。Candidate Dockerfile 中的 `go mod download` 会被临时改为：
 
 ```bash
 GOPROXY=file:///tmp/vpg4-goproxy GONOSUMDB='*' GOSUMDB=off go mod download
@@ -460,7 +466,7 @@ Webhook 离线运行时使用包内已有的 Go builder 基础镜像代替会执
 ## 维护配置
 
 - 新 Kubernetes/Kind/节点镜像组合：修改 `config/versions.tsv`；
-- 默认 Helm、jq、KWOK 或 Go toolchain：修改 `config/versions.tsv` 的 `DEFAULT`；
+- 默认 Helm、jq、KWOK 或 Go toolchain：修改 `config/versions.tsv` 的 `DEFAULT`；新增宿主 Go 版本时增加 `GO` 行；
 - 新 Profile、基础/运行镜像或固定资源：修改 `config/profiles.tsv`；
 - 新独立 E2E：增加 `E2E_FULL` 或 Profile；
 - 新 Benchmark 配置：增加 `BENCHMARK_FULL`。
