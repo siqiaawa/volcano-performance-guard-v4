@@ -1642,23 +1642,27 @@ patch_candidate_e2e_local_image_tags() {
   [[ "$changed" == true ]]
 }
 
-patch_candidate_kwok_fail_fast() {
-  local install="$CHECKOUT/hack/lib/install.sh" tmp="$WORK_DIR/patch-kwok-fail-fast.tmp" status
+patch_candidate_kwok_non_blocking() {
+  local install="$CHECKOUT/hack/lib/install.sh" tmp="$WORK_DIR/patch-kwok-non-blocking.tmp" status
   [[ -f "$install" ]] || return 1
   grep -Fq 'VPG_KWOK_MANIFEST' "$install" || return 1
-  if grep -Fq 'kubectl apply -f "${VPG_KWOK_MANIFEST:?}" || exit $?' "$install" && \
-     grep -Fq 'kubectl apply -f "${VPG_KWOK_STAGE:?}" || exit $?' "$install" && \
-     grep -Fq 'kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s || exit $?' "$install"; then
+  if ! grep -Fq 'kubectl apply -f "${VPG_KWOK_MANIFEST:?}" || exit $?' "$install" && \
+     ! grep -Fq 'kubectl apply -f "${VPG_KWOK_STAGE:?}" || exit $?' "$install" && \
+     ! grep -Fq 'kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s || exit $?' "$install"; then
     return 1
   fi
   set +e
   awk '
     BEGIN {changed=0}
     {
-      if ($0 == "  kubectl apply -f \"${VPG_KWOK_MANIFEST:?}\"") {print $0 " || exit $?"; changed++; next}
-      if ($0 == "  kubectl apply -f \"${VPG_KWOK_STAGE:?}\"") {print $0 " || exit $?"; changed++; next}
-      if ($0 == "  kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s") {
-        print $0 " || exit $?"; changed++; next
+      if ($0 == "  kubectl apply -f \"${VPG_KWOK_MANIFEST:?}\" || exit $?") {
+        print "  kubectl apply -f \"${VPG_KWOK_MANIFEST:?}\""; changed++; next
+      }
+      if ($0 == "  kubectl apply -f \"${VPG_KWOK_STAGE:?}\" || exit $?") {
+        print "  kubectl apply -f \"${VPG_KWOK_STAGE:?}\""; changed++; next
+      }
+      if ($0 == "  kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s || exit $?") {
+        print "  kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s"; changed++; next
       }
       print
     }
@@ -1669,7 +1673,7 @@ patch_candidate_kwok_fail_fast() {
   case "$status" in
     0) mv "$tmp" "$install"; return 0 ;;
     3) rm -f -- "$tmp"; return 1 ;;
-    *) rm -f -- "$tmp"; die "cannot make Candidate KWOK setup fail fast" ;;
+    *) rm -f -- "$tmp"; die "cannot restore Candidate KWOK non-blocking setup" ;;
   esac
 }
 
@@ -1682,9 +1686,9 @@ patch_e2e_environment() {
     BEGIN{inside=0; replaced=0}
     /^[[:space:]]*(function[[:space:]]+)?install-kwok-with-helm([[:space:]]*\(\))?[[:space:]]*\{/ {
       print "install-kwok-with-helm() {"
-      print "  kubectl apply -f \"${VPG_KWOK_MANIFEST:?}\" || exit $?"
-      print "  kubectl apply -f \"${VPG_KWOK_STAGE:?}\" || exit $?"
-      print "  kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s || exit $?"
+      print "  kubectl apply -f \"${VPG_KWOK_MANIFEST:?}\""
+      print "  kubectl apply -f \"${VPG_KWOK_STAGE:?}\""
+      print "  kubectl wait --for=condition=Available deployment/kwok-controller -n kube-system --timeout=120s"
       print "  kubectl delete stage pod-complete --ignore-not-found >/dev/null 2>&1 || true"
       print "}"
       inside=1; replaced++; next
@@ -1770,7 +1774,7 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   repaired_e2e_patch=false
   if patch_candidate_e2e_cluster_identity; then repaired_e2e_patch=true; fi
   if patch_candidate_e2e_local_image_tags; then repaired_e2e_patch=true; fi
-  if patch_candidate_kwok_fail_fast; then repaired_e2e_patch=true; fi
+  if patch_candidate_kwok_non_blocking; then repaired_e2e_patch=true; fi
   if [[ "$repaired_e2e_patch" == true ]]; then
     git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
     [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "repaired Candidate E2E patch evidence is empty"

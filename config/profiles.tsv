@@ -51,7 +51,7 @@ IMAGE|e2e-common|k8s-e2e-agnhost-2-59|registry.k8s.io/e2e-test-images/agnhost:2.
 IMAGE|e2e-common|k8s-e2e-busybox-1-36|registry.k8s.io/e2e-test-images/busybox:1.36.1-1|registry.k8s.io/e2e-test-images/busybox:1.36.1-1
 IMAGE|e2e-common|k8s-e2e-busybox-1-37|registry.k8s.io/e2e-test-images/busybox:1.37.0-1|registry.k8s.io/e2e-test-images/busybox:1.37.0-1
 IMAGE|e2e-common|k8s-e2e-nginx|registry.k8s.io/e2e-test-images/nginx:1.14-4|registry.k8s.io/e2e-test-images/nginx:1.14-4
-IMAGE|e2e-common|kwok|registry.k8s.io/kwok/kwok:v0.7.0|registry.k8s.io/kwok/kwok:v0.7.0
+IMAGE|e2e-common|kwok|registry.k8s.io/kwok/kwok:v0.8.0|registry.k8s.io/kwok/kwok:v0.8.0
 IMAGE|e2e-jobseq|mpi|volcanosh/example-mpi:0.0.3|volcanosh/example-mpi:0.0.3
 IMAGE|e2e-jobseq|tensorflow|volcanosh/dist-mnist-tf-example:0.0.1|volcanosh/dist-mnist-tf-example:0.0.1
 IMAGE|e2e-jobseq|pytorch|volcanosh/pytorch-mnist-v1beta1-9ee8fda-example:0.0.1|volcanosh/pytorch-mnist-v1beta1-9ee8fda-example:0.0.1
@@ -62,7 +62,7 @@ IMAGE|e2e-jobseq|ray|rayproject/ray:2.49.0|rayproject/ray:2.49.0
 IMAGE|e2e-dra|dra-hostpath-1-7|registry.k8s.io/sig-storage/hostpathplugin:v1.7.3|registry.k8s.io/sig-storage/hostpathplugin:v1.7.3
 IMAGE|e2e-dra|dra-hostpath|registry.k8s.io/sig-storage/hostpathplugin:v1.16.1|registry.k8s.io/sig-storage/hostpathplugin:v1.16.1
 IMAGE|benchmark-common|benchmark-busybox|busybox:1.36|busybox:1.36
-IMAGE|benchmark-common|kwok|registry.k8s.io/kwok/kwok:v0.7.0|registry.k8s.io/kwok/kwok:v0.7.0
+IMAGE|benchmark-common|kwok|registry.k8s.io/kwok/kwok:v0.8.0|registry.k8s.io/kwok/kwok:v0.8.0
 IMAGE|benchmark-monitoring|prometheus|prom/prometheus:latest|prom/prometheus:latest
 IMAGE|benchmark-monitoring|grafana|grafana/grafana:latest|grafana/grafana:latest
 IMAGE|benchmark-monitoring|kube-state-metrics|docker.io/volcanosh/kube-state-metrics:v2.0.0-beta|docker.io/volcanosh/kube-state-metrics:v2.0.0-beta

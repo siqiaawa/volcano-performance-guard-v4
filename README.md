@@ -315,7 +315,7 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 | kubectl      | 与当前 Bundle 的 Kubernetes 相同                                |
 | Helm         | `v3.21.4`                                                       |
 | jq           | `jq-1.8.2`，校验 SHA256                                         |
-| KWOK         | `v0.7.0`                                                        |
+| KWOK         | `v0.8.0`                                                        |
 | Go toolchain | `go1.23.7`、`go1.24.0`、`go1.25.0`、`go1.26.0`，默认 `go1.25.0` |
 | Ginkgo       | 不打包；内网按 Candidate `go.mod` 安装                          |
 
@@ -348,7 +348,7 @@ Profile 按需选择的默认镜像：
 | Kubernetes E2E | `k8s-e2e-busybox-1-36` | `registry.k8s.io/e2e-test-images/busybox:1.36.1-1`      | 同名                 |
 | Kubernetes E2E | `k8s-e2e-busybox-1-37` | `registry.k8s.io/e2e-test-images/busybox:1.37.0-1`      | 同名                 |
 | E2E            | `k8s-e2e-nginx`        | `registry.k8s.io/e2e-test-images/nginx:1.14-4`          | 同名                 |
-| E2E/Benchmark  | `kwok`                 | `registry.k8s.io/kwok/kwok:v0.7.0`                      | 同名                 |
+| E2E/Benchmark  | `kwok`                 | `registry.k8s.io/kwok/kwok:v0.8.0`                      | 同名                 |
 | JobSeq         | `mpi`                  | `volcanosh/example-mpi:0.0.3`                           | 同名                 |
 | JobSeq         | `tensorflow`           | `volcanosh/dist-mnist-tf-example:0.0.1`                 | 同名                 |
 | JobSeq         | `pytorch`              | `volcanosh/pytorch-mnist-v1beta1-9ee8fda-example:0.0.1` | 同名                 |
@@ -426,7 +426,7 @@ v1.15.0 VCCTL          -> 构建上游 vcctl 前置目标，并继承其 Make �
 
 每个独立 E2E 开始前都会先清空上一轮解析出的测试变量，再加载本轮契约，因此 DRA 或 SchedulingGates 的 Feature Gate 不会泄漏到后续测试。带前置构建目标的测试会先执行 Candidate 自己声明的前置目标，再以同一份 Make 输出目录环境调用上游 runner；这不是对 VCCTL 或其他测试名称的硬编码。对于较早的 Candidate，`FULL` 中该版本尚未定义的独立 Make 目标会在预检阶段记录并跳过；显式选择一个 Candidate 不存在的 TYPE 则会直接报错。
 
-KWOK manifest 应用或 `kwok-controller` 就绪等待失败属于整批测试共享的基础设施失败。部署脚本会立即结束当前批次并记录失败，再按所选 `FULL` 流程继续下一批，而不会在未就绪的 KWOK 集群上制造后续误报。这一判断只检查通用基础设施状态，不修改任何具体测试用例的等待时间、命令或通过条件。
+Candidate E2E 的 KWOK 安装保持上游原先的非阻断语义：`kwok-controller` 在 120 秒内未达到 `Available` 时会输出超时信息，但安装函数仍继续执行后续 stage 处理和测试。这样不会把启动较慢直接判定为整批失败；最终测试结果仍由 Candidate 自己的 E2E 流程决定。完整包默认提供 KWOK `v0.8.0`，其官方支持列表包含 Kubernetes `v1.34.8`。
 
 普通参数变化、参数新增或前置目标变化不要求重新制作外网包；只有上游改掉 Make 目标或 `hack/run-e2e-kind.sh` 的入口结构时，部署脚本才会在预检阶段 fail-closed，并需要增加小型兼容适配。`e2e:ALL` 保留 Candidate 自己的一次性 `E2E_TYPE=ALL` 语义，`FULL` 则逐个调用当前 Candidate 已定义的独立上游目标。
 
