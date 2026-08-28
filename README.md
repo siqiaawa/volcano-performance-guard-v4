@@ -321,18 +321,20 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 
 部署脚本启动时仍使用默认 `go1.25.0`，拉取 Candidate 后再读取其 `toolchain` 或 `go` 声明，在包内选择相同 Go 主次版本且不低于最低要求的最小补丁版本。Candidate 要求 `go1.24.0` 时使用包内 `go1.24.0`；最低要求为 `go1.26.0` 时，默认 `go1.25.0` 不再满足要求，脚本会自动切换到 `go1.26.0`。若对应主次版本不存在，脚本会在下载 Go modules 和构建前直接报错；此时应在 `versions.tsv` 增加 `GO|版本|官方SHA256|-` 后重新打包，或者使用前文的 `--go-version` 与 `--go-sha256` 临时补充。
 
-Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像仍是两个独立依赖。工具包中的多版本 Go 用于宿主机执行 `go mod download`、安装 Ginkgo 和运行上游 Go 测试；`profiles.tsv` 中的 `golang:1.23.7`、`golang:1.24.0`、`golang:1.25.0`、`golang:1.26.0` 则用于 Candidate Docker builder。这样要求 Go 1.26 的分支在 Dockerfile 同步更新 builder 时也能离线构建。未来 Candidate 使用其他 Go 主次版本时，仍需要同时检查宿主 Go toolchain 与 Docker builder 基础镜像是否都已覆盖。
+Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像仍是两个独立依赖。工具包中的多版本 Go 用于宿主机执行 `go mod download`、安装 Ginkgo 和运行上游 Go 测试；`profiles.tsv` 中的 `golang:1.23.7`、`golang:1.24.0`、`golang:1.25.0`、`golang:1.26.0`、`golang:1.26.2` 则用于 Candidate Docker builder。这样要求 Go 1.26 或精确使用 `golang:1.26.2` 的分支也能离线构建。未来 Candidate 使用其他 Go 主次版本或新的精确基础镜像时，仍需要同时检查宿主 Go toolchain 与 Docker builder 基础镜像是否都已覆盖。
 
 ### 默认基础镜像和运行镜像
 
 每个 Profile 都会包含以下 Candidate 通用构建基础镜像：
 
-| Key                        | 镜像            |
-| -------------------------- | --------------- |
-| `candidate-builder-go1-23` | `golang:1.23.7` |
-| `candidate-builder-go1-24` | `golang:1.24.0` |
-| `candidate-builder`        | `golang:1.25.0` |
-| `candidate-runtime`        | `alpine:latest` |
+| Key                          | 镜像            |
+| ---------------------------- | --------------- |
+| `candidate-builder-go1-23`   | `golang:1.23.7` |
+| `candidate-builder-go1-24`   | `golang:1.24.0` |
+| `candidate-builder`          | `golang:1.25.0` |
+| `candidate-builder-go1-26`   | `golang:1.26.0` |
+| `candidate-builder-go1-26-2` | `golang:1.26.2` |
+| `candidate-runtime`          | `alpine:latest` |
 
 Profile 按需选择的默认镜像：
 
