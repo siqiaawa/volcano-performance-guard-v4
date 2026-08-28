@@ -345,9 +345,11 @@ Profile 按需选择的默认镜像：
 | Kubernetes E2E | `k8s-e2e-agnhost-2-53` | `registry.k8s.io/e2e-test-images/agnhost:2.53`          | 同名                 |
 | Kubernetes E2E | `k8s-e2e-agnhost-2-56` | `registry.k8s.io/e2e-test-images/agnhost:2.56`          | 同名                 |
 | Kubernetes E2E | `k8s-e2e-agnhost-2-59` | `registry.k8s.io/e2e-test-images/agnhost:2.59`          | 同名                 |
+| Kubernetes E2E | `k8s-e2e-agnhost-2-63` | `registry.k8s.io/e2e-test-images/agnhost:2.63.0`        | 同名                 |
 | Kubernetes E2E | `k8s-e2e-busybox-1-36` | `registry.k8s.io/e2e-test-images/busybox:1.36.1-1`      | 同名                 |
 | Kubernetes E2E | `k8s-e2e-busybox-1-37` | `registry.k8s.io/e2e-test-images/busybox:1.37.0-1`      | 同名                 |
 | E2E            | `k8s-e2e-nginx`        | `registry.k8s.io/e2e-test-images/nginx:1.14-4`          | 同名                 |
+| Kubernetes E2E | `k8s-e2e-nginx-1-15`   | `registry.k8s.io/e2e-test-images/nginx:1.15-4`          | 同名                 |
 | E2E/Benchmark  | `kwok`                 | `registry.k8s.io/kwok/kwok:v0.8.0`                      | 同名                 |
 | JobSeq         | `mpi`                  | `volcanosh/example-mpi:0.0.3`                           | 同名                 |
 | JobSeq         | `tensorflow`           | `volcanosh/dist-mnist-tf-example:0.0.1`                 | 同名                 |
@@ -356,6 +358,7 @@ Profile 按需选择的默认镜像：
 | JobSeq         | `ray`                  | `rayproject/ray:2.49.0`                                 | 同名                 |
 | DRA            | `dra-hostpath-1-7`     | `registry.k8s.io/sig-storage/hostpathplugin:v1.7.3`     | 同名                 |
 | DRA            | `dra-hostpath`         | `registry.k8s.io/sig-storage/hostpathplugin:v1.16.1`    | 同名                 |
+| DRA            | `dra-hostpath-1-17`    | `registry.k8s.io/sig-storage/hostpathplugin:v1.17.1`    | 同名                 |
 | Benchmark      | `benchmark-busybox`    | `busybox:1.36`                                          | 同名                 |
 | Monitoring     | `prometheus`           | `prom/prometheus:latest`                                | 同名                 |
 | Monitoring     | `grafana`              | `grafana/grafana:latest`                                | 同名                 |
@@ -369,14 +372,15 @@ Candidate E2E 中无 tag 的 `busybox`/`nginx` 会在临时 checkout 内固定�
 
 Volcano `v1.13.0` 引用的 `bitnami/ray:2.49.0` 已无法从公共仓库取得，`v1.13.1` 起上游改为 `rayproject/ray:2.49.0`。打包脚本因此只下载仍可用的 upstream Ray 镜像，并额外保存旧本地标签；两个条目共享同一组镜像 layer。
 
-Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Candidate 的 `k8s.io/kubernetes` 模块选择。部署脚本会从已下载模块的 `test/utils/image/manifest.go` 和 DRA manifest 中解析准确引用，写入 `candidate-e2e-images.txt`，并在创建 Kind 前验证包内镜像。当前审计结果如下：
+Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Candidate 的 `k8s.io/kubernetes` 模块选择。部署脚本会从已下载模块的 `test/utils/image/manifest.go` 和 DRA manifest 中解析准确引用；新版本 DRA manifest 若使用 `to-be-replaced` 占位符，则继续从同一模块的 `storage-csi` manifests 解析实际 hostpathplugin 版本。最终引用写入 `candidate-e2e-images.txt`，并在创建 Kind 前验证包内镜像。当前审计结果如下：
 
-| Volcano 稳定线 | Kubernetes 测试模块 | agnhost | E2E busybox | DRA hostpathplugin |
-| -------------- | ------------------- | ------- | ----------- | ------------------ |
-| `v1.12.x`      | `v1.32.2`           | `2.53`  | `1.36.1-1`  | `v1.7.3`           |
-| `v1.13.x`      | `v1.33.2`           | `2.53`  | `1.36.1-1`  | `v1.7.3`           |
-| `v1.14.x`      | `v1.34.1`           | `2.56`  | `1.37.0-1`  | `v1.7.3`           |
-| `v1.15.x`      | `v1.35.3`           | `2.59`  | `1.37.0-1`  | `v1.16.1`          |
+| Volcano 稳定线/分支 | Kubernetes 测试模块 | agnhost | E2E busybox | E2E nginx | DRA hostpathplugin |
+| ------------------- | ------------------- | ------- | ----------- | --------- | ------------------ |
+| `v1.12.x`           | `v1.32.2`           | `2.53`  | `1.36.1-1`  | `1.14-4`  | `v1.7.3`           |
+| `v1.13.x`           | `v1.33.2`           | `2.53`  | `1.36.1-1`  | `1.14-4`  | `v1.7.3`           |
+| `v1.14.x`           | `v1.34.1`           | `2.56`  | `1.37.0-1`  | `1.14-4`  | `v1.7.3`           |
+| `v1.15.x`           | `v1.35.3`           | `2.59`  | `1.37.0-1`  | `1.14-4`  | `v1.16.1`          |
+| 开源仓当前主线      | `v1.36.x`           | `2.63.0` | `1.37.0-1`  | `1.15-4`  | `v1.17.1`          |
 
 完整 `e2e-full`/`full` 会包含上述全部版本变体、JobSeq 和 DRA 镜像。`benchmark-full` 的 Candidate `v1.15.x` 路径使用 `busybox:1.36`、KWOK、Prometheus、Grafana、kube-state-metrics，以及在内网从 Candidate 源码构建的 audit-exporter；这些镜像均已列入相应分组。Volcano `v1.12.x-v1.14.x` 的旧 Benchmark 目录结构与当前 `benchmark/testcases` 入口不同，不应仅凭镜像清单宣称可由当前 Benchmark runner 执行。
 

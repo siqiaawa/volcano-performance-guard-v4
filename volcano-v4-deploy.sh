@@ -1255,7 +1255,16 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   if [[ "$NEED_DRA_IMAGE" == true ]]; then
     K8S_DRA_MANIFEST="$K8S_E2E_MODULE_DIR/test/e2e/testing-manifests/dra/dra-test-driver-proxy.yaml"
     [[ -f "$K8S_DRA_MANIFEST" ]] || die "Candidate DRA runtime manifest is missing: $K8S_DRA_MANIFEST"
-    mapfile -t K8S_DRA_IMAGES < <(awk '$1=="image:" && $2 ~ /hostpathplugin:/ {print $2}' "$K8S_DRA_MANIFEST" | sort -u)
+    K8S_DRA_STORAGE_MANIFEST_DIR="$K8S_E2E_MODULE_DIR/test/e2e/testing-manifests/storage-csi"
+    mapfile -t K8S_DRA_IMAGES < <(
+      {
+        grep -Eho 'registry\.k8s\.io/sig-storage/hostpathplugin:v[0-9][0-9A-Za-z._-]*' "$K8S_DRA_MANIFEST" || true
+        if grep -q 'hostpathplugin:to-be-replaced' "$K8S_DRA_MANIFEST"; then
+          [[ -d "$K8S_DRA_STORAGE_MANIFEST_DIR" ]] && \
+            grep -RhoE 'registry\.k8s\.io/sig-storage/hostpathplugin:v[0-9][0-9A-Za-z._-]*' "$K8S_DRA_STORAGE_MANIFEST_DIR" || true
+        fi
+      } | sort -Vu | tail -n 1
+    )
     [[ ${#K8S_DRA_IMAGES[@]} -gt 0 ]] || die "cannot resolve Candidate DRA runtime image"
     REQUIRED_CANDIDATE_E2E_IMAGES+=("${K8S_DRA_IMAGES[@]}")
   fi
