@@ -20,7 +20,7 @@ README.md                   使用说明
 
 ## 最短使用方式
 
-下面只使用一个 Kubernetes `v1.34.8` 的 `full` 通用包。它覆盖完整 E2E、Gang/Pod/网络拓扑 Benchmark 和 Monitoring；`full` 包含 DRA，因此这里使用 Kubernetes `v1.34+`。
+下面只使用一个 Kubernetes `v1.34.8` 的 `full` 通用包。它覆盖除暂时停用的 JOBSEQ 外的独立 E2E、Gang/Pod/网络拓扑 Benchmark 和 Monitoring；`full` 包含 DRA，因此这里使用 Kubernetes `v1.34+`。
 
 ### 1. 外网制作完整包
 
@@ -41,13 +41,13 @@ volcano-v4-1.34.8-full.tar.gz.parts.sha256
 
 ### 2. 内网验证各个场景
 
-一次运行全部独立 E2E 和全部 Benchmark：
+一次运行当前启用的全部独立 E2E 和全部 Benchmark：
 
 ```bash
 bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode both --work-dir ./work/v1.15.0-full --output ./results/v1.15.0-full
 ```
 
-只运行全部独立 E2E：
+只运行当前启用的全部独立 E2E：
 
 ```bash
 bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode e2e --work-dir ./work/v1.15.0-e2e-full --output ./results/v1.15.0-e2e-full
@@ -57,6 +57,7 @@ bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --vo
 
 ```bash
 bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode benchmark --work-dir ./work/v1.15.0-benchmark-full --output ./results/v1.15.0-benchmark-full
+```
 
 只运行一个 E2E TYPE；把 `SCHEDULINGBASE` 换成“Profile 选择”列出的其他 TYPE 即可：
 
@@ -228,7 +229,7 @@ SHARDINGCONTROLLER GANGEVICT
 SCHEDULERSHARDING_NONE SCHEDULERSHARDING_SOFT SCHEDULERSHARDING_HARD
 ```
 
-`FULL` 是写入 `bundle.meta` 的多次运行集合，不等于上游一次 `E2E_TYPE=ALL`。修改 `config/profiles.tsv` 中的 `E2E_FULL`、`BENCHMARK_FULL` 或 Profile 依赖组后，必须重新制作对应包，旧包不会自动获得新的能力元数据或镜像。
+`FULL` 是写入 `bundle.meta` 的多次运行集合，不等于上游一次 `E2E_TYPE=ALL`。当前部署策略会从 `FULL` 中跳过 `JOBSEQ`；`JOBSEQ` 和会间接运行 JobSeq 的单体 `ALL` 暂时不可选。修改 `config/profiles.tsv` 中的 `E2E_FULL`、`BENCHMARK_FULL` 或 Profile 依赖组后，必须重新制作对应包，旧包不会自动获得新的能力元数据或镜像。
 
 由于 `full` 包包含 DRA，给 Volcano v1.15.x 使用时选择 Kubernetes `v1.34+`；Kubernetes `v1.32-v1.33` 只适合不启用 DRA 的较小 Profile。
 
@@ -323,6 +324,8 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 
 Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像仍是两个独立依赖。工具包中的多版本 Go 用于宿主机执行 `go mod download`、安装 Ginkgo 和运行上游 Go 测试；`profiles.tsv` 中的 `golang:1.23.7`、`golang:1.24.0`、`golang:1.25.0`、`golang:1.26.0`、`golang:1.26.2` 则用于 Candidate Docker builder。这样要求 Go 1.26 或精确使用 `golang:1.26.2` 的分支也能离线构建。未来 Candidate 使用其他 Go 主次版本或新的精确基础镜像时，仍需要同时检查宿主 Go toolchain 与 Docker builder 基础镜像是否都已覆盖。
 
+为了减少内网 Docker/containerd 根目录占用，当前部署脚本读取现有 Bundle 的镜像归档时不会导入 `golang:1.23.7` 和 `golang:1.24.0`。包内文件和外网配置没有改变，因此以前传入内网的 full 包可以继续使用，无需重新打包；但 Dockerfile 仍要求上述旧 builder 的 Candidate 会在构建预检时明确失败。宿主 Go 工具链仍按包内原有版本解压，不受这项 Docker 镜像导入策略影响。
+
 ### 默认基础镜像和运行镜像
 
 每个 Profile 都会包含以下 Candidate 通用构建基础镜像：
@@ -368,7 +371,7 @@ Profile 按需选择的默认镜像：
 
 Candidate E2E 中无 tag 的 `busybox`/`nginx` 会在临时 checkout 内固定为包中已有的非 `latest` tag，避免 Kubernetes 默认重新拉取。
 
-除上述镜像引用、Kubernetes 版本兼容、离线镜像加载和保存集群恢复外，部署脚本不改写某个具体 E2E 用例的启动命令、等待时间、网络参数或通过条件。TensorFlow、MPI、Ray 及其他测试均执行所选 Candidate 的原生实现；环境不满足时保留其原始失败结果，由使用者结合 `run-results.tsv` 和各批 `run.log` 判断。
+除上述镜像引用、Kubernetes 版本兼容、离线镜像加载和保存集群恢复外，部署脚本不改写某个具体 E2E 用例的启动命令、等待时间、网络参数或通过条件。当前 JOBSEQ 整体停用；以后重新启用时，TensorFlow、MPI、Ray 等测试仍应执行所选 Candidate 的原生实现。其他已启用测试的环境失败会保留原始结果，由使用者结合 `run-results.tsv` 和各批 `run.log` 判断。
 
 `busybox:1.24` 使用旧 schema 1，Docker 29/containerd 2.1 会拒绝拉取。因此脚本保存现代 `busybox:1.36`，同时创建 Candidate 仍引用的 `busybox:1.24` 本地标签。
 
@@ -384,7 +387,7 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 | `v1.15.x`           | `v1.35.3`           | `2.59`  | `1.37.0-1`  | `1.14-4`  | `v1.16.1`          |
 | 开源仓当前主线      | `v1.36.x`           | `2.63.0` | `1.37.0-1`  | `1.15-4`  | `v1.17.1`          |
 
-完整 `e2e-full`/`full` 会包含上述全部版本变体、JobSeq 和 DRA 镜像。`benchmark-full` 的 Candidate `v1.15.x` 路径使用 `busybox:1.36`、KWOK、Prometheus、Grafana、kube-state-metrics，以及在内网从 Candidate 源码构建的 audit-exporter；这些镜像均已列入相应分组。Volcano `v1.12.x-v1.14.x` 的旧 Benchmark 目录结构与当前 `benchmark/testcases` 入口不同，不应仅凭镜像清单宣称可由当前 Benchmark runner 执行。
+完整 `e2e-full`/`full` 包仍包含上述全部版本变体、JobSeq 和 DRA 镜像。当前部署脚本不会把 JobSeq 五个镜像或 Go 1.23/1.24 builder 导入 Docker/containerd，并把实际跳过项写入结果目录的 `skipped-bundle-images.txt`；这是对旧包的部署时筛选，不会修改 Bundle，也不需要重传。脚本也不会自动删除服务器上原来已有的镜像或缓存，因此先前已加载的旧镜像不会被本次改动强制清理。`benchmark-full` 的 Candidate `v1.15.x` 路径使用 `busybox:1.36`、KWOK、Prometheus、Grafana、kube-state-metrics，以及在内网从 Candidate 源码构建的 audit-exporter；这些镜像均已列入相应分组。Volcano `v1.12.x-v1.14.x` 的旧 Benchmark 目录结构与当前 `benchmark/testcases` 入口不同，不应仅凭镜像清单宣称可由当前 Benchmark runner 执行。
 
 ## 内网部署脚本说明
 
@@ -406,7 +409,7 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 | `--gonosumdb VALUE`           | 指定 `GONOSUMDB`；默认 `*`                                                             |
 | `--gosumdb VALUE`             | 指定 `GOSUMDB`；默认 `off`                                                             |
 | `--mode e2e\|benchmark\|both` | 选择运行 E2E、Benchmark 或两者，必须在 Bundle Profile 的覆盖范围内                     |
-| `--e2e-type TYPE`             | 指定一个 E2E TYPE 或 `FULL`                                                            |
+| `--e2e-type TYPE`             | 指定一个 E2E TYPE 或 `FULL`；当前 `JOBSEQ`、`ALL` 暂时不可选                           |
 | `--benchmark-scenario NAME`   | 指定 `gang`、`pod` 或 `FULL` Benchmark                                                 |
 | `--benchmark-config PATH`     | 为单次 Benchmark 指定 Candidate 内相对路径或绝对路径的 YAML                            |
 | `--benchmark-rounds N`        | 指定每个 Benchmark 的运行轮数；默认 `1`                                                |
@@ -434,7 +437,7 @@ v1.15.0 VCCTL          -> 构建上游 vcctl 前置目标，并继承其 Make �
 
 Candidate E2E 的 KWOK 安装保持上游原先的非阻断语义：`kwok-controller` 在 120 秒内未达到 `Available` 时会输出超时信息，但安装函数仍继续执行后续 stage 处理和测试。这样不会把启动较慢直接判定为整批失败；最终测试结果仍由 Candidate 自己的 E2E 流程决定。完整包默认提供 KWOK `v0.8.0`，其官方支持列表包含 Kubernetes `v1.34.8`。
 
-普通参数变化、参数新增或前置目标变化不要求重新制作外网包；只有上游改掉 Make 目标或 `hack/run-e2e-kind.sh` 的入口结构时，部署脚本才会在预检阶段 fail-closed，并需要增加小型兼容适配。`e2e:ALL` 保留 Candidate 自己的一次性 `E2E_TYPE=ALL` 语义，`FULL` 则逐个调用当前 Candidate 已定义的独立上游目标。
+普通参数变化、参数新增或前置目标变化不要求重新制作外网包；只有上游改掉 Make 目标或 `hack/run-e2e-kind.sh` 的入口结构时，部署脚本才会在预检阶段 fail-closed，并需要增加小型兼容适配。配置和旧包仍保留 `e2e:ALL` 的 Candidate 原生语义，但当前节省空间的部署策略暂时拒绝会运行 JobSeq 的 `ALL`；`FULL` 逐个调用当前 Candidate 已定义的独立上游目标，并跳过 `JOBSEQ`。
 
 ### 内网服务器和网络要求
 
