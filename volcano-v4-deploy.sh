@@ -69,6 +69,7 @@ Input/output:
   --output DIR                Default: ./volcano-v4-results-TIME
   --work-dir DIR              Use a new directory, or resume a saved v4 directory
   --keep-work-dir             Keep an automatically created resumable directory
+  --cleanup-after-run         Remove this run's Docker image refs and work dir
   --keep-cluster              Keep/reuse the only Kind cluster and its work directory
 
 Candidate selection:
@@ -109,6 +110,12 @@ temporarily unavailable.
 A saved work directory resumes only when its bundle and complete
 run identity match. A saved cluster restarts the selected E2E suite or failed
 Benchmark round; it cannot resume inside one Ginkgo spec or one go test process.
+--cleanup-after-run is a false-by-default Boolean switch. When present, it
+overrides --keep-work-dir and an explicit --work-dir: image references added by
+this invocation are removed, replaced pre-existing references are restored, and
+the verified work directory is deleted. It never prunes unrelated images or
+BuildKit cache. The result directory must be outside the work directory. This
+switch is incompatible with --keep-cluster and both manual-operation modes.
 The two manual-operation modes always keep their work directory and cluster,
 write manual-env.sh, and do not run E2E or Benchmark. cluster-only does not
 fetch Volcano or download Go modules. deploy-only installs the selected
@@ -123,7 +130,8 @@ EOF
 }
 
 BUNDLE_INPUT=""; BUNDLE_URL=""; OUTPUT_DIR=""; WORK_DIR=""
-KEEP_WORK_DIR=false; KEEP_CLUSTER=false; LIST_CAPABILITIES=false; RESUME_WORK=false
+KEEP_WORK_DIR=false; KEEP_CLUSTER=false; CLEANUP_AFTER_RUN=false
+LIST_CAPABILITIES=false; RESUME_WORK=false
 MANUAL_ACTION=""
 MODE_OVERRIDE=""; E2E_TYPE_OVERRIDE=""; BENCHMARK_SCENARIO_OVERRIDE=""
 BENCHMARK_CONFIG_OVERRIDE=""; BENCHMARK_ROUNDS=1; PODS=1000
@@ -140,6 +148,7 @@ while [[ $# -gt 0 ]]; do
     --output) OUTPUT_DIR="${2:-}"; shift 2 ;;
     --work-dir) WORK_DIR="${2:-}"; shift 2 ;;
     --keep-work-dir) KEEP_WORK_DIR=true; shift ;;
+    --cleanup-after-run) CLEANUP_AFTER_RUN=true; shift ;;
     --keep-cluster) KEEP_CLUSTER=true; shift ;;
     --cluster-only)
       [[ -z "$MANUAL_ACTION" || "$MANUAL_ACTION" == cluster-only ]] || die "use only one manual operation"
@@ -185,6 +194,9 @@ if [[ -n "$MANUAL_ACTION" ]]; then
   [[ "$BENCHMARK_ROUNDS" == 1 && "$PODS" == 1000 && "$SCHEDULER_NAME" == agent-scheduler ]] || \
     die "Benchmark tuning options cannot be combined with a manual operation"
   KEEP_CLUSTER=true; KEEP_WORK_DIR=true
+fi
+if [[ "$CLEANUP_AFTER_RUN" == true && "$KEEP_CLUSTER" == true ]]; then
+  die "--cleanup-after-run cannot be combined with --keep-cluster, --cluster-only, or --deploy-only"
 fi
 if [[ "$MANUAL_ACTION" == cluster-only ]]; then
   [[ -z "$VOLCANO_REF" ]] || die "--volcano-ref is not used with --cluster-only"
@@ -269,32 +281,171 @@ else
   state_set OUTPUT_DIR "$OUTPUT_DIR"
 fi
 if [[ "$KEEP_CLUSTER" == true ]]; then KEEP_WORK_DIR=true; fi
+if [[ "$CLEANUP_AFTER_RUN" == true && ( "$OUTPUT_DIR" == "$WORK_DIR" || "$OUTPUT_DIR" == "$WORK_DIR/"* ) ]]; then
+  die "--cleanup-after-run requires --output outside the work directory"
+fi
 printf 'source=%s\nhttp_configured=%s\nhttps_configured=%s\nresume=%s\n' \
   "$VPG_BUILD_PROXY_SOURCE" "$([[ -n "$HTTP_PROXY" ]] && printf true || printf false)" \
   "$([[ -n "$HTTPS_PROXY" ]] && printf true || printf false)" "$RESUME_WORK" > "$OUTPUT_DIR/build-proxy.txt"
 
 CURRENT_CLUSTER=""; CLUSTER_CREATED=false
+DOCKER_CLEANUP_BASELINE="$STATE_DIR/docker-image-baseline.$$.tsv"
+DOCKER_CLEANUP_LOG="$OUTPUT_DIR/docker-image-cleanup.log"
+DOCKER_CLEANUP_TOKEN="$(date -u +%Y%m%d%H%M%S)-$$-${RANDOM}"
+DOCKER_CLEANUP_COUNTER=0
+if [[ "$CLEANUP_AFTER_RUN" == true ]]; then
+  : > "$DOCKER_CLEANUP_BASELINE"
+  : > "$DOCKER_CLEANUP_LOG"
+fi
+
+remember_docker_image_ref() {
+  local ref="${1%@*}" backup old_id
+  [[ "$CLEANUP_AFTER_RUN" == true ]] || return 0
+  [[ -n "$ref" && "$ref" != *'|'* && "$ref" != *$'\n'* && "$ref" != *$'\r'* ]] || \
+    die "invalid Docker image reference for cleanup tracking"
+  awk -F '|' -v wanted="$ref" '$1==wanted {found=1} END {exit !found}' "$DOCKER_CLEANUP_BASELINE" && return 0
+  DOCKER_CLEANUP_COUNTER=$((DOCKER_CLEANUP_COUNTER + 1))
+  if docker image inspect "$ref" >/dev/null 2>&1; then
+    backup="vpg4-cleanup-backup:${DOCKER_CLEANUP_TOKEN}-${DOCKER_CLEANUP_COUNTER}"
+    docker image tag "$ref" "$backup" >/dev/null
+    old_id="$(docker image inspect --format '{{.Id}}' "$backup")"
+    printf '%s|present|%s|%s\n' "$ref" "$backup" "$old_id" >> "$DOCKER_CLEANUP_BASELINE"
+  else
+    printf '%s|absent|-|-\n' "$ref" >> "$DOCKER_CLEANUP_BASELINE"
+  fi
+}
+
+cleanup_tracked_docker_images() {
+  local ref previous_state backup old_id current_id backup_id failed=false ref_failed
+  [[ "$CLEANUP_AFTER_RUN" == true ]] || return 0
+  [[ -f "$DOCKER_CLEANUP_BASELINE" ]] || return 0
+  while IFS='|' read -r ref previous_state backup old_id; do
+    [[ -n "$ref" ]] || continue
+    case "$previous_state" in
+      absent)
+        if docker image inspect "$ref" >/dev/null 2>&1; then
+          printf 'remove-added|%s\n' "$ref" >> "$DOCKER_CLEANUP_LOG"
+          docker image rm "$ref" >> "$DOCKER_CLEANUP_LOG" 2>&1 || failed=true
+        fi
+        ;;
+      present)
+        ref_failed=false
+        if ! docker image inspect "$backup" >/dev/null 2>&1; then
+          printf 'missing-backup|%s|%s\n' "$ref" "$backup" >> "$DOCKER_CLEANUP_LOG"
+          failed=true
+          continue
+        fi
+        backup_id="$(docker image inspect --format '{{.Id}}' "$backup" 2>/dev/null || true)"
+        current_id="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+        if [[ -z "$current_id" || "$current_id" != "$backup_id" ]]; then
+          if [[ -n "$current_id" ]]; then
+            printf 'remove-replacement|%s|%s\n' "$ref" "$current_id" >> "$DOCKER_CLEANUP_LOG"
+            docker image rm "$ref" >> "$DOCKER_CLEANUP_LOG" 2>&1 || { ref_failed=true; failed=true; }
+          fi
+          if [[ "$ref_failed" != true ]]; then
+            printf 'restore-existing|%s|%s\n' "$ref" "$old_id" >> "$DOCKER_CLEANUP_LOG"
+            docker image tag "$backup" "$ref" >> "$DOCKER_CLEANUP_LOG" 2>&1 || { ref_failed=true; failed=true; }
+          fi
+        fi
+        if [[ "$ref_failed" != true ]]; then
+          docker image rm "$backup" >> "$DOCKER_CLEANUP_LOG" 2>&1 || failed=true
+        fi
+        ;;
+      *)
+        printf 'invalid-baseline|%s|%s\n' "$ref" "$previous_state" >> "$DOCKER_CLEANUP_LOG"
+        failed=true
+        ;;
+    esac
+  done < "$DOCKER_CLEANUP_BASELINE"
+  [[ "$failed" != true ]]
+}
+
+remove_work_directory() {
+  [[ -n "$WORK_DIR" && "$WORK_DIR" == /* ]] || return 1
+  case "$WORK_DIR" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+      return 1
+      ;;
+  esac
+  [[ -f "$STATE_FILE" && "$(state_get STATE_FORMAT)" == "$RESUME_STATE_FORMAT" ]] || return 1
+  chmod -R u+w "$WORK_DIR" 2>/dev/null || true
+  rm -rf --one-file-system -- "$WORK_DIR"
+}
+
+summary_set() {
+  local key="$1" value="$2" tmp
+  [[ -f "$OUTPUT_DIR/summary.txt" ]] || return 0
+  tmp="$OUTPUT_DIR/.summary.tmp.$$"
+  awk -v key="$key" 'index($0,key "=")!=1' "$OUTPUT_DIR/summary.txt" > "$tmp"
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  mv "$tmp" "$OUTPUT_DIR/summary.txt"
+}
+
 cleanup() {
-  status=$?
+  local status=$? cleanup_status=not-requested work_directory_removed=false cluster_cleanup_failed=false recorded_active_cluster=""
+  trap - EXIT
   # Cleanup is project-scoped: the active Kind cluster and an automatic work
-  # directory only. Never prune host Docker images or containerd storage.
+  # directory only. Explicit post-run cleanup additionally restores/removes
+  # only image references tracked before this invocation changed them. It never
+  # prunes unrelated Docker images, BuildKit cache or containerd storage.
   if [[ "$CLUSTER_CREATED" == true && "$KEEP_CLUSTER" != true && -n "$CURRENT_CLUSTER" ]] && command -v kind >/dev/null 2>&1; then
     log "deleting project cluster after interruption: $CURRENT_CLUSTER"
-    kind delete cluster --name "$CURRENT_CLUSTER" >"$OUTPUT_DIR/kind-delete-trap.log" 2>&1 || true
-    state_set ACTIVE_CLUSTER "" 2>/dev/null || true
-    state_set ACTIVE_PURPOSE "" 2>/dev/null || true
+    if kind delete cluster --name "$CURRENT_CLUSTER" >"$OUTPUT_DIR/kind-delete-trap.log" 2>&1; then
+      state_set ACTIVE_CLUSTER "" 2>/dev/null || true
+      state_set ACTIVE_PURPOSE "" 2>/dev/null || true
+    else
+      cluster_cleanup_failed=true
+      status=1
+      log "ERROR: failed to delete project cluster: $CURRENT_CLUSTER"
+    fi
   fi
   state_set LAST_STATUS "$status" 2>/dev/null || true
   state_set LAST_FINISHED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null || true
-  if [[ "$AUTO_WORK" == true && "$KEEP_WORK_DIR" != true ]]; then
-    chmod -R u+w "$WORK_DIR" 2>/dev/null || true
-    rm -rf -- "$WORK_DIR" || log "could not completely remove work directory: $WORK_DIR"
+  recorded_active_cluster="$(state_get ACTIVE_CLUSTER 2>/dev/null || true)"
+  if [[ "$CLEANUP_AFTER_RUN" == true ]]; then
+    cleanup_status=passed
+    if [[ "$cluster_cleanup_failed" == true || -n "$recorded_active_cluster" ]]; then
+      cleanup_status=failed
+      status=1
+      log "ERROR: skipping image cleanup because a project cluster is still recorded: ${recorded_active_cluster:-$CURRENT_CLUSTER}"
+    elif command -v docker >/dev/null 2>&1; then
+      if ! cleanup_tracked_docker_images; then
+        cleanup_status=failed
+        status=1
+        log "ERROR: could not completely restore/remove this invocation's Docker image references; see $DOCKER_CLEANUP_LOG"
+      fi
+    elif [[ -s "$DOCKER_CLEANUP_BASELINE" ]]; then
+      cleanup_status=failed
+      status=1
+      log "ERROR: Docker is unavailable while tracked image references require cleanup"
+    fi
+  fi
+  if [[ "$cluster_cleanup_failed" == true || -n "$recorded_active_cluster" ]]; then
+    status=1
+    [[ "$CLEANUP_AFTER_RUN" != true ]] || cleanup_status=failed
+    log "kept work directory because its recorded project cluster was not safely deleted: $WORK_DIR"
+  elif [[ "$CLEANUP_AFTER_RUN" == true && "$cleanup_status" == failed ]]; then
+    status=1
+    log "kept work directory because the requested project cleanup did not finish safely: $WORK_DIR"
+  elif [[ "$CLEANUP_AFTER_RUN" == true || ( "$AUTO_WORK" == true && "$KEEP_WORK_DIR" != true ) ]]; then
+    if remove_work_directory; then
+      work_directory_removed=true
+      log "removed work directory: $WORK_DIR"
+    else
+      status=1
+      [[ "$CLEANUP_AFTER_RUN" != true ]] || cleanup_status=failed
+      log "ERROR: refused or failed to remove verified work directory: $WORK_DIR"
+    fi
   else log "kept work directory: $WORK_DIR"; fi
   if [[ "$status" -ne 0 && ! -f "$OUTPUT_DIR/summary.txt" ]]; then
     printf 'status=failed\nscript_version=%s\nprofile=%s\nmode=%s\nfinished_at=%s\n' \
       "$SCRIPT_VERSION" "${PROFILE:-unknown}" "${MODE:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       > "$OUTPUT_DIR/summary.txt"
   fi
+  if [[ "$status" -ne 0 ]]; then summary_set status failed; fi
+  summary_set cleanup_after_run "$CLEANUP_AFTER_RUN"
+  summary_set cleanup_status "$cleanup_status"
+  summary_set work_directory_removed "$work_directory_removed"
   exit "$status"
 }
 trap cleanup EXIT
@@ -753,6 +904,11 @@ load_required_bundle_images() {
   [[ "$BUNDLE_IMAGES_LOADED" != true ]] || die "bundle images were already loaded for this invocation"
   sort -u -o "$SELECTED_IMAGE_REFS_FILE" "$SELECTED_IMAGE_REFS_FILE"
   [[ -s "$SELECTED_IMAGE_REFS_FILE" ]] || die "task-derived bundle image selection is empty"
+  if [[ "$CLEANUP_AFTER_RUN" == true ]]; then
+    while IFS= read -r save_ref; do
+      [[ -z "$save_ref" ]] || remember_docker_image_ref "$save_ref"
+    done < "$SELECTED_IMAGE_REFS_FILE"
+  fi
   : > "$SELECTED_IMAGE_REPORT"
   : > "$SKIPPED_IMAGE_REPORT"
   for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
@@ -1786,6 +1942,9 @@ BUILD_TARGETS=(vc-scheduler-image vc-controller-manager-image vc-webhook-manager
 [[ "$BUILD_AGENT" != true ]] || BUILD_TARGETS+=(vc-agent-scheduler-image)
 CANDIDATE_IMAGES=("volcanosh/vc-scheduler:$CANDIDATE_COMMIT" "volcanosh/vc-controller-manager:$CANDIDATE_COMMIT" "volcanosh/vc-webhook-manager:$CANDIDATE_COMMIT")
 [[ "$BUILD_AGENT" != true ]] || CANDIDATE_IMAGES+=("volcanosh/vc-agent-scheduler:$CANDIDATE_COMMIT")
+if [[ "$CLEANUP_AFTER_RUN" == true ]]; then
+  for image in "${CANDIDATE_IMAGES[@]}"; do remember_docker_image_ref "$image"; done
+fi
 candidate_images_available() {
   local image
   for image in "${CANDIDATE_IMAGES[@]}"; do
@@ -1861,7 +2020,13 @@ delete_cluster() {
     kind delete cluster --name "$CURRENT_CLUSTER" 2>&1 | tee "$OUTPUT_DIR/kind-delete-${purpose}.log"
     delete_status=$?
     set -e
-    [[ "$delete_status" -eq 0 ]] || log "WARNING: failed to completely delete cluster $CURRENT_CLUSTER; continuing after batch cleanup"
+    if [[ "$delete_status" -ne 0 ]]; then
+      if [[ "$CLEANUP_AFTER_RUN" == true ]]; then
+        log "ERROR: failed to completely delete cluster required by --cleanup-after-run: $CURRENT_CLUSTER"
+        return "$delete_status"
+      fi
+      log "WARNING: failed to completely delete cluster $CURRENT_CLUSTER; continuing after batch cleanup"
+    fi
   fi
   state_set ACTIVE_CLUSTER ""; state_set ACTIVE_PURPOSE ""
   CLUSTER_CREATED=false; CURRENT_CLUSTER=""

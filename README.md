@@ -274,9 +274,9 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 
 ### 镜像和自动清理边界
 
-打包脚本和部署脚本都不会自动执行 `docker system prune`、`docker image prune`、批量 `docker rmi`、`ctr images rm`，也不会删除 `/var/lib/docker` 或 `/var/lib/containerd`。打包阶段拉取的镜像、部署阶段加载的 Bundle 镜像和内网构建的 Candidate 镜像都会保留在宿主机，供后续工作目录或再次验证复用。
+打包脚本和部署脚本都不会自动执行 `docker system prune`、`docker image prune`、批量 `docker rmi`、`ctr images rm`，也不会删除 `/var/lib/docker` 或 `/var/lib/containerd`。默认情况下，打包阶段拉取的镜像、部署阶段加载的 Bundle 镜像和内网构建的 Candidate 镜像都会保留在宿主机，供后续工作目录或再次验证复用。显式增加 `--cleanup-after-run` 时是唯一例外：部署脚本只回滚本次调用跟踪的具体镜像引用，不做全局 prune。
 
-脚本自动删除的范围只有它自己创建的临时打包容器、未要求保留的临时目录，以及未使用 `--keep-cluster` 保存的项目 Kind 集群。删除 Kind 集群会删除该集群的节点容器及节点容器内部的数据，但不会清空宿主 Docker 的全部镜像。需要释放磁盘时应由使用者在任务之外审计准确对象后手动清理，部署命令不会隐式替使用者做全局镜像清理。
+脚本自动删除的范围只有它自己创建的临时打包容器、未要求保留的临时目录，以及未使用 `--keep-cluster` 保存的项目 Kind 集群。删除 Kind 集群会删除该集群的节点容器及节点容器内部的数据，但不会清空宿主 Docker 的全部镜像。未增加 `--cleanup-after-run` 时，需要释放宿主镜像空间仍应由使用者在任务之外审计准确对象后手动清理；部署命令不会隐式替使用者做全局镜像清理。
 
 ### 什么时候必须重新制作外网包
 
@@ -323,8 +323,6 @@ bash volcano-v4-package.sh --k8s-version v1.34.8 --profile full --output ./relea
 部署脚本启动时仍使用默认 `go1.25.0`，拉取 Candidate 后再读取其 `toolchain` 或 `go` 声明，在包内选择相同 Go 主次版本且不低于最低要求的最小补丁版本。Candidate 要求 `go1.24.0` 时使用包内 `go1.24.0`；最低要求为 `go1.26.0` 时，默认 `go1.25.0` 不再满足要求，脚本会自动切换到 `go1.26.0`。若对应主次版本不存在，脚本会在下载 Go modules 和构建前直接报错；此时应在 `versions.tsv` 增加 `GO|版本|官方SHA256|-` 后重新打包，或者使用前文的 `--go-version` 与 `--go-sha256` 临时补充。
 
 Go toolchain 压缩包和 Candidate Dockerfile 的 `golang:` 基础镜像仍是两个独立依赖。工具包中的多版本 Go 用于宿主机执行 `go mod download`、安装 Ginkgo 和运行上游 Go 测试；`profiles.tsv` 中的 `golang:1.23.7`、`golang:1.24.0`、`golang:1.25.0`、`golang:1.26.0`、`golang:1.26.2` 则用于 Candidate Docker builder。这样要求 Go 1.26 或精确使用 `golang:1.26.2` 的分支也能离线构建。未来 Candidate 使用其他 Go 主次版本或新的精确基础镜像时，仍需要同时检查宿主 Go toolchain 与 Docker builder 基础镜像是否都已覆盖。
-
-为了减少内网 Docker/containerd 根目录占用，当前部署脚本读取现有 Bundle 的镜像归档时不会导入 `golang:1.23.7` 和 `golang:1.24.0`。包内文件和外网配置没有改变，因此以前传入内网的 full 包可以继续使用，无需重新打包；但 Dockerfile 仍要求上述旧 builder 的 Candidate 会在构建预检时明确失败。宿主 Go 工具链仍按包内原有版本解压，不受这项 Docker 镜像导入策略影响。
 
 ### 默认基础镜像和运行镜像
 
@@ -411,6 +409,7 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 | `--output DIR`                | 指定测试结果目录；未指定时使用带时间戳的默认目录                                       |
 | `--work-dir DIR`              | 指定新的工作目录，或恢复一个此前保存且身份匹配的工作目录                               |
 | `--keep-work-dir`             | 保留脚本自动创建的工作目录，供后续恢复或排查问题                                       |
+| `--cleanup-after-run`         | 布尔开关，默认关闭；运行结束后清理本次新增/替换的镜像引用并删除工作目录                 |
 | `--keep-cluster`              | 保留并复用当前工作目录唯一的 Kind 集群                                                 |
 | `--cluster-only`              | 创建并保留普通双 worker Kind 集群，不拉取 Candidate，也不运行测试                      |
 | `--deploy-only`               | 构建并安装指定 Candidate Volcano，保留集群但不运行 E2E 或 Benchmark                     |
@@ -429,6 +428,16 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 | `--cluster-prefix NAME`       | 指定 Kind 集群名称前缀；默认 `volcano-v4`                                              |
 | `--list-capabilities`         | 校验 Bundle 元数据并显示当前包可运行的 E2E 和 Benchmark，不执行测试                    |
 | `-h`、`--help`                | 显示脚本帮助信息                                                                       |
+
+`--cleanup-after-run` 不接收值：不写时内部布尔变量为 `false`，写在命令中时为 `true`。它会覆盖 `--keep-work-dir` 和显式 `--work-dir` 的保留行为，例如：
+
+```bash
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode both --work-dir ./work/v1.15.0-full --output ./results/v1.15.0-full --cleanup-after-run
+```
+
+清理前，脚本会记录本次可能改变的 Bundle 镜像引用和 Candidate 组件镜像引用：运行前不存在的引用在退出时删除；运行前已经存在而本次被替换的引用恢复到原镜像；运行前已经存在且内容未改变的镜像继续保留。它不会运行 `docker image prune`、`docker builder prune` 或 `docker system prune`，因此不会删除其他工作目录/项目使用的镜像，也不负责全局 BuildKit 缓存。清理日志保存在结果目录的 `docker-image-cleanup.log`，`summary.txt` 会记录 `cleanup_after_run`、`cleanup_status` 和 `work_directory_removed`。
+
+结果目录必须放在工作目录外部。该参数不能和 `--keep-cluster`、`--cluster-only` 或 `--deploy-only` 同时使用，因为这些模式需要保留工作目录中的恢复身份、kubeconfig 和工具。如果项目 Kind 集群、Docker 镜像引用回滚或工作目录删除没有安全完成，脚本会返回失败；前两种情况下会保留工作目录和清理基线，避免留下无法恢复的集群或丢失镜像恢复证据。此功能只改变部署端退出清理，不改变 Bundle 格式和脚本版本，已有 FULL 包无需重打或重传。
 
 ### E2E 参数自动跟随 Candidate
 
