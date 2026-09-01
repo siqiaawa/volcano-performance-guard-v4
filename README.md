@@ -37,7 +37,7 @@ volcano-v4-1.34.8-full.tar.gz.part-002
 volcano-v4-1.34.8-full.tar.gz.parts.sha256
 ```
 
-部署时把 `.part-000` 交给 `--bundle`；脚本会校验全部分卷并自动重组。以后只更新部署逻辑时，只替换 `volcano-v4-deploy.sh`，不需要重新制作或传输 full 包。
+部署时把 `.part-000` 交给 `--bundle`；脚本会校验全部分卷并自动重组。部署脚本只从这个完整归档导入本次任务真正需要的镜像，不会把包内所有版本都写入服务器镜像存储。以后只更新部署逻辑时，只替换 `volcano-v4-deploy.sh`，不需要重新制作或传输 full 包。
 
 ### 2. 内网验证各个场景
 
@@ -125,7 +125,7 @@ bash volcano-v4-deploy.sh --work-dir ./work/v1.15.0-e2e-schedulingbase --volcano
 
 #### 仅创建 Kind 集群
 
-`--cluster-only` 只校验并解压 Bundle、加载镜像并创建一个包含一个 control-plane 和两个 worker 的普通 Kind 集群，不拉取 Volcano、不下载 Go modules，也不运行测试。该模式自动保留工作目录和集群：
+`--cluster-only` 只校验并解压 Bundle、仅加载本包的 `kindest/node` 节点镜像，并创建一个包含一个 control-plane 和两个 worker 的普通 Kind 集群；它不加载 Go/E2E/Benchmark 镜像，不拉取 Volcano、不下载 Go modules，也不运行测试。该模式自动保留工作目录和集群：
 
 ```bash
 bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --cluster-only --work-dir ./work/kind-1.34.8 --output ./results/kind-1.34.8
@@ -387,7 +387,18 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 | `v1.15.x`           | `v1.35.3`           | `2.59`  | `1.37.0-1`  | `1.14-4`  | `v1.16.1`          |
 | 开源仓当前主线      | `v1.36.x`           | `2.63.0` | `1.37.0-1`  | `1.15-4`  | `v1.17.1`          |
 
-完整 `e2e-full`/`full` 包仍包含上述全部版本变体、JobSeq 和 DRA 镜像。当前部署脚本不会把 JobSeq 五个镜像或 Go 1.23/1.24 builder 导入 Docker/containerd，并把实际跳过项写入结果目录的 `skipped-bundle-images.txt`；这是对旧包的部署时筛选，不会修改 Bundle，也不需要重传。脚本也不会自动删除服务器上原来已有的镜像或缓存，因此先前已加载的旧镜像不会被本次改动强制清理。`benchmark-full` 的 Candidate `v1.15.x` 路径使用 `busybox:1.36`、KWOK、Prometheus、Grafana、kube-state-metrics，以及在内网从 Candidate 源码构建的 audit-exporter；这些镜像均已列入相应分组。Volcano `v1.12.x-v1.14.x` 的旧 Benchmark 目录结构与当前 `benchmark/testcases` 入口不同，不应仅凭镜像清单宣称可由当前 Benchmark runner 执行。
+完整 `e2e-full`/`full` 包仍包含上述全部版本变体、JobSeq 和 DRA 镜像，但部署脚本不再维护“禁止导入 Go 1.23/1.24、JobSeq”等固定排除名单。它先根据本次操作、Candidate Dockerfile 和测试选择生成正向需求集合，再从旧包的 `images.tar.gz` 过滤并仅导入该集合：
+
+- `--cluster-only`：只导入指定 Kubernetes 对应的 Kind 节点镜像。
+- `--deploy-only`：导入 Kind 节点镜像，以及本次实际构建的 Candidate Dockerfile `FROM` 所需基础镜像。
+- 单个或完整 E2E：在上述基础上导入公共测试镜像、KWOK，以及 Candidate 的 `k8s.io/kubernetes` 模块选出的唯一一组 agnhost/E2E busybox/E2E nginx；只有运行 DRA 时才导入该 Candidate 的准确 hostpathplugin。
+- Benchmark：在构建基础镜像之外导入 Benchmark busybox、KWOK；Profile 启用 Monitoring 时再导入 Prometheus、Grafana 和 kube-state-metrics。
+
+因此 Go 1.23、1.24、1.25、1.26.x 只有在所选 Candidate 的实际 Dockerfile 使用对应版本时才会导入；多个 agnhost 或 hostpathplugin 版本也不会因同处一个 full 包而全部进入 Docker/containerd。当前 `FULL` 的执行集合明确跳过 `JOBSEQ`，所以 MPI、TensorFlow、PyTorch、Ray 不会产生镜像需求，会自然留在归档中，不需要在导入代码里逐项写“不导入”。本次实际选择和未选择的 Bundle 条目分别写入结果目录的 `selected-bundle-images.txt` 与 `skipped-bundle-images.txt`。
+
+精确导入并不等于假设依赖永远不变。部署脚本会在创建集群前检查本次 Dockerfile 的所有外部基础镜像、Candidate Kubernetes 模块选择的 E2E/DRA 镜像，以及 Candidate DRA helper 直接声明的镜像；DRA helper 中旧的 KWOK/hostpathplugin tag 会统一映射到本包和当前 Kubernetes 模块已经选定的准确版本。当前维护的稳定线已覆盖这些已知入口。若未来 Candidate 在其他测试源码或运行时生成的 YAML 中引入一个全新镜像，旧 Bundle 又没有该镜像，则无法靠部署脚本凭空补齐：能够从上述契约发现的缺失会在 Kind 创建前报错；无法静态发现的动态引用仍可能在 Pod 阶段表现为 `ErrImagePull`/`ImagePullBackOff`。这种情况应把新镜像加入 `config/profiles.tsv` 或在外网用 `--add-image` 重新制作 Bundle，而不是恢复“每次导入所有版本”。
+
+这是对现有包的部署时过滤，不会修改 Bundle，也不需要重传。脚本不会自动删除服务器原来已有的镜像或缓存，因此旧运行曾经加载的镜像仍会保留；报告只描述本次调用。`benchmark-full` 的 Candidate `v1.15.x` 路径使用 `busybox:1.36`、KWOK、Prometheus、Grafana、kube-state-metrics，以及在内网从 Candidate 源码构建的 audit-exporter；这些镜像均已列入相应分组。Volcano `v1.12.x-v1.14.x` 的旧 Benchmark 目录结构与当前 `benchmark/testcases` 入口不同，不应仅凭镜像清单宣称可由当前 Benchmark runner 执行。
 
 ## 内网部署脚本说明
 
@@ -437,7 +448,7 @@ v1.15.0 VCCTL          -> 构建上游 vcctl 前置目标，并继承其 Make �
 
 Candidate E2E 的 KWOK 安装保持上游原先的非阻断语义：`kwok-controller` 在 120 秒内未达到 `Available` 时会输出超时信息，但安装函数仍继续执行后续 stage 处理和测试。这样不会把启动较慢直接判定为整批失败；最终测试结果仍由 Candidate 自己的 E2E 流程决定。完整包默认提供 KWOK `v0.8.0`，其官方支持列表包含 Kubernetes `v1.34.8`。
 
-普通参数变化、参数新增或前置目标变化不要求重新制作外网包；只有上游改掉 Make 目标或 `hack/run-e2e-kind.sh` 的入口结构时，部署脚本才会在预检阶段 fail-closed，并需要增加小型兼容适配。配置和旧包仍保留 `e2e:ALL` 的 Candidate 原生语义，但当前节省空间的部署策略暂时拒绝会运行 JobSeq 的 `ALL`；`FULL` 逐个调用当前 Candidate 已定义的独立上游目标，并跳过 `JOBSEQ`。
+普通参数变化、参数新增或前置目标变化不要求重新制作外网包；只有上游改掉 Make 目标或 `hack/run-e2e-kind.sh` 的入口结构时，部署脚本才会在预检阶段 fail-closed，并需要增加小型兼容适配。配置和旧包仍保留 `e2e:ALL` 的 Candidate 原生语义，但当前执行策略暂时拒绝会运行 JobSeq 的 `ALL`；`FULL` 逐个调用当前 Candidate 已定义的独立上游目标，并跳过 `JOBSEQ`。镜像导入只是这一运行选择的结果，不再负责决定哪些测试可运行。
 
 ### 内网服务器和网络要求
 

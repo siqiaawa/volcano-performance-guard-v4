@@ -101,9 +101,11 @@ complete Go module graph and selected Ginkgo are first downloaded on the inner
 host through its configured Go module source. Docker builders then consume a
 temporary file proxy and never contact that HTTPS proxy. The generic bundle
 contains no Volcano source or Go modules. Nothing is installed system-wide. A
-full bundle stays unchanged, but deploy-time image import currently omits Go
-1.23/1.24 builders and JobSeq-only images. FULL therefore skips JOBSEQ, while
-explicit JOBSEQ and monolithic ALL selections are temporarily unavailable.
+full bundle stays unchanged; deploy-time import derives an exact image set from
+the selected operation, Candidate Dockerfiles and test types. Unselected image
+versions remain only in the archive. FULL skips JOBSEQ by execution policy, so
+its images naturally remain unselected; explicit JOBSEQ and monolithic ALL are
+temporarily unavailable.
 A saved work directory resumes only when its bundle and complete
 run identity match. A saved cluster restarts the selected E2E suite or failed
 Benchmark round; it cannot resume inside one Ginkgo spec or one go test process.
@@ -459,7 +461,7 @@ printf 'bundle_scope=%s\nprofile=%s\nmode=%s\ndefault_run=%s\n' \
 if [[ ${#E2E_CAPS[@]} -gt 0 ]]; then
   for value in "${E2E_CAPS[@]}"; do
     case "$value" in
-      JOBSEQ|ALL) printf 'e2e_disabled=%s|jobseq-images-not-loaded\n' "$value" ;;
+      JOBSEQ|ALL) printf 'e2e_disabled=%s|jobseq-execution-policy\n' "$value" ;;
       *) printf 'e2e=%s\n' "$value" ;;
     esac
   done
@@ -608,25 +610,92 @@ IMAGE_ARCHIVE_MANIFEST="$WORK_DIR/image-manifest.json"
 LOADED_IMAGE_MANIFEST="$WORK_DIR/loaded-image-manifest.json"
 LOADED_IMAGE_MANIFEST_READY=false
 
-# Keep the generic full bundle reusable while avoiding Docker/containerd space
-# for temporarily disabled legacy builders and environment-bound JobSeq cases.
-# The package and its metadata remain unchanged; only this deploy-time import
-# policy decides which entries from the Docker archive reach the local store.
-bundle_image_load_enabled() {
-  local index="$1" key ref
-  key="${IMAGE_KEYS[$index]}"
-  ref="${IMAGE_SAVE_REFS[$index]%@*}"
-  case "$key" in
-    candidate-builder-go1-23|candidate-builder-go1-24|mpi|tensorflow|pytorch|ray-bitnami|ray)
-      return 1
-      ;;
-  esac
-  case "$ref" in
-    golang:1.23.*|docker.io/library/golang:1.23.*|golang:1.24.*|docker.io/library/golang:1.24.*)
-      return 1
-      ;;
-  esac
-  return 0
+# The full archive remains generic. Each invocation builds a positive image
+# requirement set from its concrete operation, Candidate Dockerfiles and test
+# selection. Images which are not required by that set never reach the host
+# Docker/containerd store; there is no per-image deny list to maintain.
+SELECTED_IMAGE_REFS_FILE="$WORK_DIR/selected-image-refs.txt"
+SELECTED_IMAGE_REPORT="$OUTPUT_DIR/selected-bundle-images.txt"
+SKIPPED_IMAGE_REPORT="$OUTPUT_DIR/skipped-bundle-images.txt"
+E2E_COMMON_RUNTIME_IMAGES_FILE="$WORK_DIR/e2e-common-runtime-images.txt"
+E2E_DRA_RUNTIME_IMAGES_FILE="$WORK_DIR/e2e-dra-runtime-images.txt"
+E2E_JOBSEQ_RUNTIME_IMAGES_FILE="$WORK_DIR/e2e-jobseq-runtime-images.txt"
+BENCHMARK_RUNTIME_IMAGES_FILE="$WORK_DIR/benchmark-runtime-images.txt"
+FILTERED_IMAGE_MANIFEST="$WORK_DIR/selected-image-manifest.json"
+FILTERED_IMAGE_MEMBERS="$WORK_DIR/selected-image-members.txt"
+SELECTIVE_IMAGE_ROOT="$WORK_DIR/selected-image-load"
+BUNDLE_IMAGES_LOADED=false
+for file in "$SELECTED_IMAGE_REFS_FILE" "$SELECTED_IMAGE_REPORT" "$SKIPPED_IMAGE_REPORT" \
+  "$E2E_COMMON_RUNTIME_IMAGES_FILE" "$E2E_DRA_RUNTIME_IMAGES_FILE" \
+  "$E2E_JOBSEQ_RUNTIME_IMAGES_FILE" "$BENCHMARK_RUNTIME_IMAGES_FILE"; do
+  : > "$file"
+done
+
+has_image_key() { local wanted="$1" x; for x in "${IMAGE_KEYS[@]}"; do [[ "$x" == "$wanted" ]] && return 0; done; return 1; }
+canonical_image_ref() {
+  local ref="${1%@*}"
+  ref="${ref#index.docker.io/}"
+  ref="${ref#docker.io/}"
+  [[ "$ref" == */* ]] || ref="library/$ref"
+  printf '%s\n' "$ref"
+}
+bundle_matching_save_ref() {
+  local wanted i candidate found=""
+  wanted="$(canonical_image_ref "$1")"
+  for ((i=0; i<${#IMAGE_SAVE_REFS[@]}; i++)); do
+    candidate="${IMAGE_SAVE_REFS[$i]%@*}"
+    if [[ "$(canonical_image_ref "$candidate")" == "$wanted" ]]; then
+      [[ -z "$found" || "$found" == "$candidate" ]] || return 1
+      found="$candidate"
+    fi
+  done
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+bundle_declares_image_ref() {
+  bundle_matching_save_ref "$1" >/dev/null
+}
+bundle_image_ref_for_key() {
+  local wanted="$1" i found=0 ref=""
+  for ((i=0; i<${#IMAGE_KEYS[@]}; i++)); do
+    if [[ "${IMAGE_KEYS[$i]}" == "$wanted" ]]; then
+      ref="${IMAGE_SAVE_REFS[$i]%@*}"
+      found=$((found + 1))
+    fi
+  done
+  [[ $found -eq 1 ]] || return 1
+  printf '%s\n' "$ref"
+}
+require_bundle_image_ref() {
+  local requested="${1%@*}" ref
+  ref="$(bundle_matching_save_ref "$requested")" || die "required image is not declared by this generic bundle: $requested"
+  printf '%s\n' "$ref" >> "$SELECTED_IMAGE_REFS_FILE"
+}
+require_bundle_image_key() {
+  local key="$1" ref
+  ref="$(bundle_image_ref_for_key "$key")" || die "bundle image key is missing or ambiguous: $key"
+  require_bundle_image_ref "$ref"
+}
+require_runtime_image_ref() {
+  local output="$1" requested="${2%@*}" ref
+  ref="$(bundle_matching_save_ref "$requested")" || die "required runtime image is not declared by this generic bundle: $requested"
+  require_bundle_image_ref "$ref"
+  printf '%s\n' "$ref" >> "$output"
+}
+require_runtime_image_key() {
+  local output="$1" key="$2" ref
+  ref="$(bundle_image_ref_for_key "$key")" || die "bundle image key is missing or ambiguous: $key"
+  require_runtime_image_ref "$output" "$ref"
+}
+bundle_image_selected() {
+  local wanted
+  wanted="$(bundle_matching_save_ref "$1" 2>/dev/null || printf '%s' "${1%@*}")"
+  grep -Fxq -- "$wanted" "$SELECTED_IMAGE_REFS_FILE"
+}
+bundle_has_image_ref() {
+  local wanted
+  wanted="$(bundle_matching_save_ref "$1" 2>/dev/null || printf '%s' "${1%@*}")"
+  bundle_image_selected "$wanted" && docker image inspect "$wanted" >/dev/null 2>&1
 }
 
 image_config_id_from_manifest() {
@@ -654,20 +723,10 @@ image_config_id_from_manifest() {
 }
 
 write_loaded_image_manifest() {
-  local index ref existing duplicate
+  local ref
   local -a refs=()
   [[ "$LOADED_IMAGE_MANIFEST_READY" != true ]] || return 0
-  for ((index=0; index<${#IMAGE_SAVE_REFS[@]}; index++)); do
-    bundle_image_load_enabled "$index" || continue
-    ref="${IMAGE_SAVE_REFS[$index]}"
-    duplicate=false
-    if [[ ${#refs[@]} -gt 0 ]]; then
-      for existing in "${refs[@]}"; do
-        if [[ "$existing" == "$ref" ]]; then duplicate=true; break; fi
-      done
-    fi
-    [[ "$duplicate" == true ]] || refs+=("$ref")
-  done
+  while IFS= read -r ref; do [[ -z "$ref" ]] || refs+=("$ref"); done < "$SELECTED_IMAGE_REFS_FILE"
   [[ ${#refs[@]} -gt 0 ]] || die "cannot normalize an empty loaded image list"
   log "normalizing Docker containerd image identities through config digests"
   if docker image save --help 2>&1 | grep -q -- '--platform'; then
@@ -681,96 +740,87 @@ write_loaded_image_manifest() {
 
 gzip -dc "$BUNDLE_ROOT/images.tar.gz" | tar -xOf - manifest.json > "$IMAGE_ARCHIVE_MANIFEST"
 jq -e 'type=="array" and length>0' "$IMAGE_ARCHIVE_MANIFEST" >/dev/null || die "invalid image archive manifest"
-SELECTED_IMAGE_REFS_FILE="$WORK_DIR/selected-image-refs.txt"
-SKIPPED_IMAGE_REPORT="$OUTPUT_DIR/skipped-bundle-images.txt"
-FILTERED_IMAGE_MANIFEST="$WORK_DIR/selected-image-manifest.json"
-FILTERED_IMAGE_MEMBERS="$WORK_DIR/selected-image-members.txt"
-SELECTIVE_IMAGE_ROOT="$WORK_DIR/selected-image-load"
-: > "$SELECTED_IMAGE_REFS_FILE"
-: > "$SKIPPED_IMAGE_REPORT"
-for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
-  if bundle_image_load_enabled "$index"; then
-    printf '%s\n' "${IMAGE_SAVE_REFS[$index]%@*}" >> "$SELECTED_IMAGE_REFS_FILE"
-  else
-    printf '%s|%s\n' "${IMAGE_KEYS[$index]}" "${IMAGE_SAVE_REFS[$index]%@*}" >> "$SKIPPED_IMAGE_REPORT"
-  fi
-done
-sort -u -o "$SELECTED_IMAGE_REFS_FILE" "$SELECTED_IMAGE_REFS_FILE"
-[[ -s "$SELECTED_IMAGE_REFS_FILE" ]] || die "deploy image selection is empty"
-if [[ -s "$SKIPPED_IMAGE_REPORT" ]]; then
-  log "skipping legacy Go 1.23/1.24 and JobSeq Docker images from the existing bundle archive"
-fi
-jq --rawfile refs "$SELECTED_IMAGE_REFS_FILE" '
-  def canonical_ref:
-    sub("^index\\.docker\\.io/"; "")
-    | sub("^docker\\.io/"; "")
-    | if test("/") then . else "library/" + . end;
-  ($refs | split("\n") | map(select(length > 0) | canonical_ref)) as $wanted
-  | [ .[]
-      | .RepoTags = [
-          (.RepoTags // [])[]
-          | . as $tag
-          | ($tag | canonical_ref) as $normalized
-          | select($wanted | index($normalized))
-        ]
-      | select((.RepoTags | length) > 0)
-    ]
-' "$IMAGE_ARCHIVE_MANIFEST" > "$FILTERED_IMAGE_MANIFEST"
-jq -e 'type=="array" and length>0' "$FILTERED_IMAGE_MANIFEST" >/dev/null || \
-  die "none of the selected bundle images exist in the Docker archive"
-jq -r '.[] | .Config, (.Layers[]?)' "$FILTERED_IMAGE_MANIFEST" | sort -u > "$FILTERED_IMAGE_MEMBERS"
-while IFS= read -r member; do
-  [[ -n "$member" && "$member" != /* && "$member" != ../* && "$member" != */../* ]] || \
-    die "unsafe member in image archive manifest: $member"
-done < "$FILTERED_IMAGE_MEMBERS"
-rm -rf -- "$SELECTIVE_IMAGE_ROOT"
-mkdir -p "$SELECTIVE_IMAGE_ROOT"
-if ! gzip -dc "$BUNDLE_ROOT/images.tar.gz" | tar -x -C "$SELECTIVE_IMAGE_ROOT" \
-    --no-same-owner --no-same-permissions -T "$FILTERED_IMAGE_MEMBERS"; then
-  rm -rf -- "$SELECTIVE_IMAGE_ROOT"
-  die "cannot extract selected images from the bundle archive"
-fi
-cp "$FILTERED_IMAGE_MANIFEST" "$SELECTIVE_IMAGE_ROOT/manifest.json"
-if ! tar -C "$SELECTIVE_IMAGE_ROOT" -cf - manifest.json -T "$FILTERED_IMAGE_MEMBERS" | \
-    docker image load | tee "$OUTPUT_DIR/docker-load.log"; then
-  rm -rf -- "$SELECTIVE_IMAGE_ROOT"
-  die "cannot load selected images from the bundle archive"
-fi
-rm -rf -- "$SELECTIVE_IMAGE_ROOT"
 NODE_IMAGE=""
 for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
-  bundle_image_load_enabled "$index" || continue
   key="${IMAGE_KEYS[$index]}"; save_ref="${IMAGE_SAVE_REFS[$index]}"; expected_id="${IMAGE_IDS[$index]}"
   [[ "$key" =~ ^[a-z0-9][a-z0-9-]*$ && "$expected_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid image metadata"
-  config_id="$(image_config_id_from_manifest "$IMAGE_ARCHIVE_MANIFEST" "$save_ref")" || die "archive image identity missing: $save_ref"
-  observed="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "$save_ref")"
-  [[ "${observed%%|*}" == linux/amd64 ]] || die "image platform mismatch: $save_ref"
-  observed_id="${observed#*|}"
-  if [[ "$observed_id" != "$expected_id" && "$observed_id" != "$config_id" ]]; then
-    write_loaded_image_manifest
-    loaded_config_id="$(image_config_id_from_manifest "$LOADED_IMAGE_MANIFEST" "$save_ref")" || die "loaded image identity missing: $save_ref"
-    [[ "$loaded_config_id" == "$config_id" ]] || die "loaded image config mismatch: $save_ref"
-  fi
   [[ "$key" != kind-node ]] || NODE_IMAGE="$save_ref"
 done
 [[ -n "$NODE_IMAGE" ]] || die "bundle does not contain kind-node"
 
-has_image_key() { local wanted="$1" x; for x in "${IMAGE_KEYS[@]}"; do [[ "$x" == "$wanted" ]] && return 0; done; return 1; }
-bundle_declares_image_ref() {
-  local wanted="${1%@*}" i
-  for ((i=0; i<${#IMAGE_SAVE_REFS[@]}; i++)); do
-    [[ "${IMAGE_SAVE_REFS[$i]%@*}" != "$wanted" ]] || return 0
+load_required_bundle_images() {
+  local index key save_ref expected_id config_id observed observed_id loaded_config_id member selected_count skipped_count
+  [[ "$BUNDLE_IMAGES_LOADED" != true ]] || die "bundle images were already loaded for this invocation"
+  sort -u -o "$SELECTED_IMAGE_REFS_FILE" "$SELECTED_IMAGE_REFS_FILE"
+  [[ -s "$SELECTED_IMAGE_REFS_FILE" ]] || die "task-derived bundle image selection is empty"
+  : > "$SELECTED_IMAGE_REPORT"
+  : > "$SKIPPED_IMAGE_REPORT"
+  for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
+    key="${IMAGE_KEYS[$index]}"; save_ref="${IMAGE_SAVE_REFS[$index]%@*}"
+    if bundle_image_selected "$save_ref"; then
+      printf '%s|%s\n' "$key" "$save_ref" >> "$SELECTED_IMAGE_REPORT"
+    else
+      printf '%s|%s\n' "$key" "$save_ref" >> "$SKIPPED_IMAGE_REPORT"
+    fi
   done
-  return 1
-}
-bundle_has_image_ref() {
-  local wanted="${1%@*}" i
-  for ((i=0; i<${#IMAGE_SAVE_REFS[@]}; i++)); do
-    bundle_image_load_enabled "$i" || continue
-    [[ "${IMAGE_SAVE_REFS[$i]%@*}" != "$wanted" ]] || return 0
+  selected_count="$(wc -l < "$SELECTED_IMAGE_REFS_FILE" | tr -d '[:space:]')"
+  skipped_count="$(wc -l < "$SKIPPED_IMAGE_REPORT" | tr -d '[:space:]')"
+  log "loading $selected_count task-required bundle images; leaving $skipped_count unselected metadata entries in the archive"
+
+  jq --rawfile refs "$SELECTED_IMAGE_REFS_FILE" '
+    def canonical_ref:
+      sub("^index\\.docker\\.io/"; "")
+      | sub("^docker\\.io/"; "")
+      | if test("/") then . else "library/" + . end;
+    ($refs | split("\n") | map(select(length > 0) | canonical_ref)) as $wanted
+    | [ .[]
+        | .RepoTags = [
+            (.RepoTags // [])[]
+            | . as $tag
+            | ($tag | canonical_ref) as $normalized
+            | select($wanted | index($normalized))
+          ]
+        | select((.RepoTags | length) > 0)
+      ]
+  ' "$IMAGE_ARCHIVE_MANIFEST" > "$FILTERED_IMAGE_MANIFEST"
+  jq -e 'type=="array" and length>0' "$FILTERED_IMAGE_MANIFEST" >/dev/null || \
+    die "none of the task-required bundle images exist in the Docker archive"
+  jq -r '.[] | .Config, (.Layers[]?)' "$FILTERED_IMAGE_MANIFEST" | sort -u > "$FILTERED_IMAGE_MEMBERS"
+  while IFS= read -r member; do
+    [[ -n "$member" && "$member" != /* && "$member" != ../* && "$member" != */../* ]] || \
+      die "unsafe member in image archive manifest: $member"
+  done < "$FILTERED_IMAGE_MEMBERS"
+  rm -rf -- "$SELECTIVE_IMAGE_ROOT"
+  mkdir -p "$SELECTIVE_IMAGE_ROOT"
+  if ! gzip -dc "$BUNDLE_ROOT/images.tar.gz" | tar -x -C "$SELECTIVE_IMAGE_ROOT" \
+      --no-same-owner --no-same-permissions -T "$FILTERED_IMAGE_MEMBERS"; then
+    rm -rf -- "$SELECTIVE_IMAGE_ROOT"
+    die "cannot extract task-required images from the bundle archive"
+  fi
+  cp "$FILTERED_IMAGE_MANIFEST" "$SELECTIVE_IMAGE_ROOT/manifest.json"
+  if ! tar -C "$SELECTIVE_IMAGE_ROOT" -cf - manifest.json -T "$FILTERED_IMAGE_MEMBERS" | \
+      docker image load | tee "$OUTPUT_DIR/docker-load.log"; then
+    rm -rf -- "$SELECTIVE_IMAGE_ROOT"
+    die "cannot load task-required images from the bundle archive"
+  fi
+  rm -rf -- "$SELECTIVE_IMAGE_ROOT"
+
+  for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
+    save_ref="${IMAGE_SAVE_REFS[$index]}"; bundle_image_selected "$save_ref" || continue
+    expected_id="${IMAGE_IDS[$index]}"
+    config_id="$(image_config_id_from_manifest "$IMAGE_ARCHIVE_MANIFEST" "$save_ref")" || die "archive image identity missing: $save_ref"
+    observed="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Id}}' "${save_ref%@*}")"
+    [[ "${observed%%|*}" == linux/amd64 ]] || die "image platform mismatch: $save_ref"
+    observed_id="${observed#*|}"
+    if [[ "$observed_id" != "$expected_id" && "$observed_id" != "$config_id" ]]; then
+      write_loaded_image_manifest
+      loaded_config_id="$(image_config_id_from_manifest "$LOADED_IMAGE_MANIFEST" "$save_ref")" || die "loaded image identity missing: $save_ref"
+      [[ "$loaded_config_id" == "$config_id" ]] || die "loaded image config mismatch: $save_ref"
+    fi
   done
-  return 1
+  BUNDLE_IMAGES_LOADED=true
 }
+
 resource_for_key() { local wanted="$1" i; for ((i=0;i<${#RESOURCE_KEYS[@]};i++)); do [[ "${RESOURCE_KEYS[$i]}" != "$wanted" ]] || { printf '%s\n' "$RESOURCES_DIR/${RESOURCE_PATHS[$i]}"; return; }; done; return 1; }
 
 cluster_exists() { kind get clusters 2>/dev/null | grep -Fxq "$1"; }
@@ -897,6 +947,8 @@ EOF
 }
 
 if [[ "$MANUAL_ACTION" == cluster-only ]]; then
+  require_bundle_image_key kind-node
+  load_required_bundle_images
   manual_name="$(manual_cluster_name "kind-${K8S_VERSION#v}")"
   manual_kubeconfig="$OUTPUT_DIR/kubeconfig"
   create_manual_cluster "$manual_name" cluster-only "$manual_kubeconfig"
@@ -1278,12 +1330,12 @@ elif [[ "$MODE" != benchmark ]]; then
         *) E2E_RUNS+=("$value") ;;
       esac
     done
-    log "FULL E2E is temporarily skipping JOBSEQ and its environment-bound images"
+    log "FULL E2E is temporarily skipping JOBSEQ under the current execution policy"
     [[ ${#E2E_RUNS[@]} -gt 0 ]] || die "profile $PROFILE exposes no E2E entry after skipping JOBSEQ"
   else
     case "$E2E_SELECTION" in
       JOBSEQ|ALL)
-        die "E2E $E2E_SELECTION is temporarily unavailable because JobSeq images are not loaded; use FULL or another independent E2E type"
+        die "E2E $E2E_SELECTION is temporarily unavailable under the current JobSeq execution policy; use FULL or another independent E2E type"
         ;;
     esac
     found=false; for value in "${E2E_CAPS[@]}"; do [[ "$value" != "$E2E_SELECTION" ]] || found=true; done
@@ -1379,11 +1431,8 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   fi
   printf '%s\n' "${REQUIRED_CANDIDATE_E2E_IMAGES[@]}" > "$OUTPUT_DIR/candidate-e2e-images.txt"
   for value in "${REQUIRED_CANDIDATE_E2E_IMAGES[@]}"; do
-    bundle_has_image_ref "$value" || die "Candidate E2E runtime image is not bundled: $value; update config/profiles.tsv or package with --add-image $value"
-    docker image inspect "${value%@*}" >/dev/null 2>&1 || die "Candidate E2E runtime image was not loaded: $value"
+    bundle_declares_image_ref "$value" || die "Candidate E2E runtime image is not bundled: $value; update config/profiles.tsv or package with --add-image $value"
   done
-  log "verified Candidate-selected Kubernetes E2E runtime images"
-
 fi
 
 # Local image reuse requires the Docker buildx driver; docker-container cannot
@@ -1403,6 +1452,153 @@ fi
 DOCKERFILES=(scheduler controller-manager webhook-manager)
 [[ "$BUILD_AGENT" != true ]] || DOCKERFILES+=(agent-scheduler)
 if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]] && has_image_key prometheus; then DOCKERFILES+=(benchmark-audit-exporter); fi
+
+candidate_dockerfile_path() {
+  local name="$1"
+  if [[ "$name" == benchmark-audit-exporter ]]; then
+    printf '%s\n' "$CHECKOUT/benchmark/manifests/audit-exporter/Dockerfile"
+  else
+    printf '%s\n' "$CHECKOUT/installer/dockerfile/$name/Dockerfile"
+  fi
+}
+
+candidate_external_dockerfile_bases() {
+  local path="$1"
+  awk '
+    toupper($1)=="FROM" {
+      base=""; base_index=0
+      for (i=2; i<=NF; i++) {
+        if ($i !~ /^--/) {base=$i; base_index=i; break}
+      }
+      gsub(/\r/, "", base)
+      normalized=tolower(base)
+      if (base!="" && normalized!="scratch" && !(normalized in stages)) print base
+      for (i=base_index+1; i<NF; i++) {
+        if (toupper($i)=="AS") {
+          alias=$(i+1); gsub(/\r/, "", alias); stages[tolower(alias)]=1; break
+        }
+      }
+    }
+  ' "$path" | sort -u
+}
+
+task_selects_e2e_type() {
+  local wanted="$1" type
+  for type in "${E2E_RUNS[@]}"; do [[ "$type" != "$wanted" ]] || return 0; done
+  return 1
+}
+
+candidate_dra_helper_image_refs() {
+  local install="$CHECKOUT/hack/lib/install.sh"
+  [[ -f "$install" ]] || return 0
+  awk '
+    /dra_images[[:space:]]*=\(/ {inside=1; next}
+    inside && /^[[:space:]]*\)/ {exit}
+    inside {
+      line=$0
+      while (match(line, /"[^"]+"/)) {
+        ref=substr(line, RSTART+1, RLENGTH-2)
+        if (ref ~ /^[A-Za-z0-9._\/-]+:[A-Za-z0-9._-]+$/) print ref
+        line=substr(line, RSTART+RLENGTH)
+      }
+    }
+  ' "$install" | sort -u
+}
+
+resolve_candidate_dra_helper_image_ref() {
+  local ref="$1" normalized kwok_ref
+  normalized="$(canonical_image_ref "$ref")"
+  case "$normalized" in
+    registry.k8s.io/kwok/kwok:*)
+      kwok_ref="$(bundle_image_ref_for_key kwok)" || die "bundle does not define the selected KWOK image"
+      printf '%s\n' "$kwok_ref"
+      ;;
+    registry.k8s.io/sig-storage/hostpathplugin:*)
+      [[ ${#K8S_DRA_IMAGES[@]} -eq 1 ]] || die "cannot map the Candidate DRA helper to one exact hostpathplugin image"
+      printf '%s\n' "${K8S_DRA_IMAGES[0]}"
+      ;;
+    *) printf '%s\n' "$ref" ;;
+  esac
+}
+
+assemble_task_bundle_images() {
+  local name path base index key ref value
+  require_bundle_image_key kind-node
+
+  # Only Dockerfiles which this invocation will build contribute base images.
+  # A Candidate requiring Go 1.23, 1.24, 1.25 or 1.26 therefore selects exactly
+  # that base instead of importing every packaged Go version.
+  for name in "${DOCKERFILES[@]}"; do
+    path="$(candidate_dockerfile_path "$name")"
+    [[ -f "$path" ]] || die "Candidate Dockerfile missing: $path"
+    while IFS= read -r base; do
+      [[ "$base" != *'${'* ]] || die "unresolved Candidate base in $path: $base"
+      bundle_declares_image_ref "$base" || \
+        die "Candidate base is not declared by this generic bundle: $base; add it to config/profiles.tsv or use --add-image when packaging"
+      require_bundle_image_ref "$base"
+    done < <(candidate_external_dockerfile_bases "$path")
+  done
+
+  if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
+    # Static images are referenced directly by Volcano tests. Kubernetes-owned
+    # agnhost/busybox/nginx versions are added separately from the Candidate's
+    # downloaded k8s.io/kubernetes manifest, one exact version per role.
+    for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
+      key="${IMAGE_KEYS[$index]}"; ref="${IMAGE_SAVE_REFS[$index]%@*}"
+      case "$key" in
+        busybox-*|nginx-*|kwok|extra-*) require_runtime_image_ref "$E2E_COMMON_RUNTIME_IMAGES_FILE" "$ref" ;;
+      esac
+    done
+    for ((index=0; index<${#REQUIRED_CANDIDATE_E2E_IMAGES[@]}; index++)); do
+      value="${REQUIRED_CANDIDATE_E2E_IMAGES[$index]}"
+      if (( index < 3 )); then
+        require_runtime_image_ref "$E2E_COMMON_RUNTIME_IMAGES_FILE" "$value"
+      else
+        require_runtime_image_ref "$E2E_DRA_RUNTIME_IMAGES_FILE" "$value"
+      fi
+    done
+    if task_selects_e2e_type DRA || task_selects_e2e_type ALL; then
+      while IFS= read -r value; do
+        [[ -z "$value" ]] || require_runtime_image_ref "$E2E_DRA_RUNTIME_IMAGES_FILE" \
+          "$(resolve_candidate_dra_helper_image_ref "$value")"
+      done < <(candidate_dra_helper_image_refs)
+    fi
+
+    # JobSeq is a positive task requirement, not a hard-coded import exclusion.
+    # When FULL omits JOBSEQ, this branch is never selected and none of these
+    # images enter either the host import set or a Kind runtime archive.
+    if task_selects_e2e_type JOBSEQ || task_selects_e2e_type ALL; then
+      for value in mpi tensorflow pytorch ray-bitnami ray; do
+        has_image_key "$value" && require_runtime_image_key "$E2E_JOBSEQ_RUNTIME_IMAGES_FILE" "$value"
+      done
+    fi
+  fi
+
+  if [[ ${#BENCHMARK_RUN_SCENARIOS[@]} -gt 0 ]]; then
+    require_runtime_image_key "$BENCHMARK_RUNTIME_IMAGES_FILE" benchmark-busybox
+    require_runtime_image_key "$BENCHMARK_RUNTIME_IMAGES_FILE" kwok
+    if has_image_key prometheus; then
+      require_runtime_image_key "$BENCHMARK_RUNTIME_IMAGES_FILE" prometheus
+      require_runtime_image_key "$BENCHMARK_RUNTIME_IMAGES_FILE" grafana
+      require_runtime_image_key "$BENCHMARK_RUNTIME_IMAGES_FILE" kube-state-metrics
+    fi
+    for ((index=0; index<${#IMAGE_KEYS[@]}; index++)); do
+      key="${IMAGE_KEYS[$index]}"; ref="${IMAGE_SAVE_REFS[$index]%@*}"
+      [[ "$key" != extra-* ]] || require_runtime_image_ref "$BENCHMARK_RUNTIME_IMAGES_FILE" "$ref"
+    done
+  fi
+
+  for path in "$E2E_COMMON_RUNTIME_IMAGES_FILE" "$E2E_DRA_RUNTIME_IMAGES_FILE" \
+    "$E2E_JOBSEQ_RUNTIME_IMAGES_FILE" "$BENCHMARK_RUNTIME_IMAGES_FILE"; do
+    sort -u -o "$path" "$path"
+  done
+  load_required_bundle_images
+  if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
+    log "verified and loaded Candidate-selected Kubernetes E2E runtime images"
+  fi
+}
+
+assemble_task_bundle_images
 
 patch_candidate_build_network() {
   local makefile="$CHECKOUT/Makefile" dockerignore="$CHECKOUT/.dockerignore"
@@ -1482,7 +1678,7 @@ patch_candidate_build_network() {
     runtime_ref="${runtime_base%@*}"
     if ! bundle_has_image_ref "$runtime_base"; then
       bundle_declares_image_ref "$runtime_base" && \
-        die "Candidate webhook runtime base is present in the Bundle but intentionally not loaded by the current storage policy: $runtime_base"
+        die "Candidate webhook runtime base was not selected by the exact task image plan: $runtime_base"
       die "Candidate webhook offline runtime base is not bundled: $runtime_base"
     fi
     docker image inspect "$runtime_ref" >/dev/null 2>&1 || die "Candidate webhook offline runtime base is not bundled: $runtime_base"
@@ -1578,12 +1774,12 @@ for name in "${DOCKERFILES[@]}"; do
     [[ "$base" != *'${'* ]] || die "unresolved Candidate base in $path: $base"
     if ! bundle_has_image_ref "$base"; then
       bundle_declares_image_ref "$base" && \
-        die "Candidate base is present in the Bundle but intentionally not loaded by the current storage policy: $base"
+        die "Candidate base was not selected by the exact task image plan: $base"
       die "Candidate base is not declared by this generic bundle: $base; add it to config/profiles.tsv or use --add-image when packaging"
     fi
     docker image inspect "${base%@*}" >/dev/null 2>&1 || die "Candidate base is not bundled: $base; repack for this Candidate"
   # Keep the inner preflight identical to the packager for CRLF Dockerfiles.
-  done < <(awk 'toupper($1)=="FROM" {for(i=2;i<=NF;i++) if($i!~/^--/){gsub(/\r/,"",$i);print $i;break}}' "$path" | sort -u)
+  done < <(candidate_external_dockerfile_bases "$path")
 done
 
 BUILD_TARGETS=(vc-scheduler-image vc-controller-manager-image vc-webhook-manager-image)
@@ -1695,27 +1891,18 @@ load_image_list() {
   kind load image-archive "$archive" --name "$name"
 }
 write_runtime_images() {
-  local purpose="$1" output="$2" i key ref
+  local purpose="$1" output="$2" type
   : > "$output"
-  for ((i=0;i<${#IMAGE_KEYS[@]};i++)); do
-    key="${IMAGE_KEYS[$i]}"; ref="${IMAGE_SAVE_REFS[$i]}"
-    case "$key" in
-      kind-node|candidate-*) ;;
-      extra-*) printf '%s\n' "$ref" >> "$output" ;;
-      busybox-*|nginx-*|k8s-e2e-*)
-        [[ "$purpose" == e2e* ]] && printf '%s\n' "$ref" >> "$output" ;;
-      kwok)
-        [[ "$purpose" == e2e* || "$purpose" == benchmark* ]] && printf '%s\n' "$ref" >> "$output" ;;
-      mpi|tensorflow|pytorch|ray*)
-        [[ "$purpose" == e2e-ALL || "$purpose" == e2e-JOBSEQ ]] && printf '%s\n' "$ref" >> "$output" ;;
-      dra-hostpath*)
-        [[ "$purpose" == e2e-ALL || "$purpose" == e2e-DRA ]] && printf '%s\n' "$ref" >> "$output" ;;
-      benchmark-busybox)
-        [[ "$purpose" == benchmark* ]] && printf '%s\n' "$ref" >> "$output" ;;
-      prometheus|grafana|kube-state-metrics)
-        [[ "$purpose" == benchmark* ]] && printf '%s\n' "$ref" >> "$output" ;;
-    esac
-  done
+  case "$purpose" in
+    e2e-*)
+      cat "$E2E_COMMON_RUNTIME_IMAGES_FILE" >> "$output"
+      type="${purpose#e2e-}"
+      case "$type" in DRA|ALL) cat "$E2E_DRA_RUNTIME_IMAGES_FILE" >> "$output" ;; esac
+      case "$type" in JOBSEQ|ALL) cat "$E2E_JOBSEQ_RUNTIME_IMAGES_FILE" >> "$output" ;; esac
+      ;;
+    benchmark*) cat "$BENCHMARK_RUNTIME_IMAGES_FILE" >> "$output" ;;
+    *) die "unknown runtime image purpose: $purpose" ;;
+  esac
   sort -u -o "$output" "$output"
 }
 
@@ -1766,6 +1953,26 @@ patch_candidate_e2e_local_image_tags() {
   [[ ! -f "$util" ]] || ! grep -Eq 'Default(BusyBox|Nginx)Image[[:space:]]*=[[:space:]]*"(busybox|nginx)"' "$util" || \
     die "Candidate E2E still defines an implicit latest runtime image"
   [[ "$changed" == true ]]
+}
+
+patch_candidate_dra_runtime_image_refs() {
+  local install="$CHECKOUT/hack/lib/install.sh" kwok_ref dra_ref before after ref
+  task_selects_e2e_type DRA || task_selects_e2e_type ALL || return 1
+  [[ -f "$install" ]] || return 1
+  kwok_ref="$(bundle_image_ref_for_key kwok)" || die "bundle does not define the selected KWOK image"
+  [[ ${#K8S_DRA_IMAGES[@]} -eq 1 ]] || die "cannot patch the Candidate DRA helper without one exact hostpathplugin image"
+  dra_ref="${K8S_DRA_IMAGES[0]}"
+  before="$(sha256sum "$install" | awk '{print $1}')"
+  sed -Ei \
+    -e "s|registry\\.k8s\\.io/kwok/kwok:[A-Za-z0-9._-]+|$kwok_ref|g" \
+    -e "s|registry\\.k8s\\.io/sig-storage/hostpathplugin:[A-Za-z0-9._-]+|$dra_ref|g" \
+    "$install"
+  after="$(sha256sum "$install" | awk '{print $1}')"
+  while IFS= read -r ref; do
+    [[ -z "$ref" ]] || bundle_has_image_ref "$ref" || \
+      die "Candidate DRA helper image is not in the exact loaded task set: $ref"
+  done < <(candidate_dra_helper_image_refs)
+  [[ "$before" != "$after" ]]
 }
 
 patch_candidate_kwok_non_blocking() {
@@ -1884,6 +2091,7 @@ patch_e2e_environment() {
       "$kind_config"
   fi
   patch_candidate_e2e_local_image_tags || true
+  patch_candidate_dra_runtime_image_refs || true
   patch_candidate_e2e_cluster_identity || true
   git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
   [[ -s "$OUTPUT_DIR/candidate-environment.patch" ]] || die "Candidate environment patch is empty"
@@ -1900,6 +2108,7 @@ if [[ ${#E2E_RUNS[@]} -gt 0 ]]; then
   repaired_e2e_patch=false
   if patch_candidate_e2e_cluster_identity; then repaired_e2e_patch=true; fi
   if patch_candidate_e2e_local_image_tags; then repaired_e2e_patch=true; fi
+  if patch_candidate_dra_runtime_image_refs; then repaired_e2e_patch=true; fi
   if patch_candidate_kwok_non_blocking; then repaired_e2e_patch=true; fi
   if [[ "$repaired_e2e_patch" == true ]]; then
     git -C "$CHECKOUT" diff -- hack/lib/install.sh hack/run-e2e-kind.sh hack/e2e-kind-config.yaml test/e2e > "$OUTPUT_DIR/candidate-environment.patch"
