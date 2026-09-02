@@ -95,6 +95,18 @@ bash volcano-v4-package.sh --k8s-version v1.35.5 --profile full --output ./relea
 
 ### 内网部署脚本
 
+#### 运行后定向清理
+
+```bash
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode both --work-dir ./work/v1.15.0-full --output ./results/v1.15.0-full --cleanup-after-run
+```
+
+清理前，脚本会记录本次可能改变的 Bundle 镜像引用和 Candidate 组件镜像引用：运行前不存在的引用在退出时删除；运行前已经存在而本次被替换的引用恢复到原镜像；运行前已经存在且内容未改变的镜像继续保留。
+
+`--cleanup-after-run` 是不接收值的布尔开关；启用后会删除经过校验的本次工作目录，即使已经显式指定 `--work-dir` 或 `--keep-work-dir`。`--output` 必须位于工作目录之外。
+
+该开关不会执行 `docker image prune`、`docker builder prune` 或 `docker system prune`，不会清理其他项目的镜像或全局 BuildKit 缓存；清理结果记录在结果目录的 `docker-image-cleanup.log` 和 `summary.txt` 中。该参数不能和 `--keep-cluster`、`--cluster-only` 或 `--deploy-only` 同时使用。
+
 #### 保留工作目录并继续运行
 
 直接指定 `--work-dir` 时，该目录无论成功或失败都会保留，不需要再加 `--keep-work-dir`：
@@ -377,12 +389,12 @@ Volcano `v1.13.0` 引用的 `bitnami/ray:2.49.0` 已无法从公共仓库取得�
 
 Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Candidate 的 `k8s.io/kubernetes` 模块选择。部署脚本会从已下载模块的 `test/utils/image/manifest.go` 和 DRA manifest 中解析准确引用；新版本 DRA manifest 若使用 `to-be-replaced` 占位符，则继续从同一模块的 `storage-csi` manifests 解析实际 hostpathplugin 版本。最终引用写入 `candidate-e2e-images.txt`，并在创建 Kind 前验证包内镜像。当前审计结果如下：
 
-| Volcano 稳定线/分支 | Kubernetes 测试模块 | agnhost | E2E busybox | E2E nginx | DRA hostpathplugin |
-| ------------------- | ------------------- | ------- | ----------- | --------- | ------------------ |
-| `v1.12.x`           | `v1.32.2`           | `2.53`  | `1.36.1-1`  | `1.14-4`  | `v1.7.3`           |
-| `v1.13.x`           | `v1.33.2`           | `2.53`  | `1.36.1-1`  | `1.14-4`  | `v1.7.3`           |
-| `v1.14.x`           | `v1.34.1`           | `2.56`  | `1.37.0-1`  | `1.14-4`  | `v1.7.3`           |
-| `v1.15.x`           | `v1.35.3`           | `2.59`  | `1.37.0-1`  | `1.14-4`  | `v1.16.1`          |
+| Volcano 稳定线/分支 | Kubernetes 测试模块 | agnhost  | E2E busybox | E2E nginx | DRA hostpathplugin |
+| ------------------- | ------------------- | -------- | ----------- | --------- | ------------------ |
+| `v1.12.x`           | `v1.32.2`           | `2.53`   | `1.36.1-1`  | `1.14-4`  | `v1.7.3`           |
+| `v1.13.x`           | `v1.33.2`           | `2.53`   | `1.36.1-1`  | `1.14-4`  | `v1.7.3`           |
+| `v1.14.x`           | `v1.34.1`           | `2.56`   | `1.37.0-1`  | `1.14-4`  | `v1.7.3`           |
+| `v1.15.x`           | `v1.35.3`           | `2.59`   | `1.37.0-1`  | `1.14-4`  | `v1.16.1`          |
 | 开源仓当前主线      | `v1.36.x`           | `2.63.0` | `1.37.0-1`  | `1.15-4`  | `v1.17.1`          |
 
 完整 `e2e-full`/`full` 包仍包含上述全部版本变体、JobSeq 和 DRA 镜像，但部署脚本不再维护“禁止导入 Go 1.23/1.24、JobSeq”等固定排除名单。它先根据本次操作、Candidate Dockerfile 和测试选择生成正向需求集合，再从旧包的 `images.tar.gz` 过滤并仅导入该集合：
@@ -409,11 +421,11 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 | `--output DIR`                | 指定测试结果目录；未指定时使用带时间戳的默认目录                                       |
 | `--work-dir DIR`              | 指定新的工作目录，或恢复一个此前保存且身份匹配的工作目录                               |
 | `--keep-work-dir`             | 保留脚本自动创建的工作目录，供后续恢复或排查问题                                       |
-| `--cleanup-after-run`         | 布尔开关，默认关闭；运行结束后清理本次新增/替换的镜像引用并删除工作目录                 |
+| `--cleanup-after-run`         | 布尔开关，默认关闭；运行结束后清理本次新增/替换的镜像引用并删除工作目录                |
 | `--keep-cluster`              | 保留并复用当前工作目录唯一的 Kind 集群                                                 |
 | `--cluster-only`              | 创建并保留普通双 worker Kind 集群，不拉取 Candidate，也不运行测试                      |
-| `--deploy-only`               | 构建并安装指定 Candidate Volcano，保留集群但不运行 E2E 或 Benchmark                     |
-| `--volcano-ref REF`           | 指定 Volcano tag、branch 或 commit；除 `--cluster-only` 外均为必填                      |
+| `--deploy-only`               | 构建并安装指定 Candidate Volcano，保留集群但不运行 E2E 或 Benchmark                    |
+| `--volcano-ref REF`           | 指定 Volcano tag、branch 或 commit；除 `--cluster-only` 外均为必填                     |
 | `--volcano-repo URL`          | 指定 Volcano Git 仓库；默认使用官方仓库                                                |
 | `--goproxy VALUE`             | 指定内网下载 Candidate Go modules 使用的 Go Proxy                                      |
 | `--gonosumdb VALUE`           | 指定 `GONOSUMDB`；默认 `*`                                                             |
@@ -429,15 +441,6 @@ Kubernetes E2E 镜像不是 Volcano 源码中的普通字符串，而是由 Cand
 | `--list-capabilities`         | 校验 Bundle 元数据并显示当前包可运行的 E2E 和 Benchmark，不执行测试                    |
 | `-h`、`--help`                | 显示脚本帮助信息                                                                       |
 
-`--cleanup-after-run` 不接收值：不写时内部布尔变量为 `false`，写在命令中时为 `true`。它会覆盖 `--keep-work-dir` 和显式 `--work-dir` 的保留行为，例如：
-
-```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode both --work-dir ./work/v1.15.0-full --output ./results/v1.15.0-full --cleanup-after-run
-```
-
-清理前，脚本会记录本次可能改变的 Bundle 镜像引用和 Candidate 组件镜像引用：运行前不存在的引用在退出时删除；运行前已经存在而本次被替换的引用恢复到原镜像；运行前已经存在且内容未改变的镜像继续保留。它不会运行 `docker image prune`、`docker builder prune` 或 `docker system prune`，因此不会删除其他工作目录/项目使用的镜像，也不负责全局 BuildKit 缓存。清理日志保存在结果目录的 `docker-image-cleanup.log`，`summary.txt` 会记录 `cleanup_after_run`、`cleanup_status` 和 `work_directory_removed`。
-
-结果目录必须放在工作目录外部。该参数不能和 `--keep-cluster`、`--cluster-only` 或 `--deploy-only` 同时使用，因为这些模式需要保留工作目录中的恢复身份、kubeconfig 和工具。如果项目 Kind 集群、Docker 镜像引用回滚或工作目录删除没有安全完成，脚本会返回失败；前两种情况下会保留工作目录和清理基线，避免留下无法恢复的集群或丢失镜像恢复证据。此功能只改变部署端退出清理，不改变 Bundle 格式和脚本版本，已有 FULL 包无需重打或重传。
 
 ### E2E 参数自动跟随 Candidate
 
