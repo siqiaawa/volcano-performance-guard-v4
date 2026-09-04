@@ -44,19 +44,19 @@ volcano-v4-1.34.8-full.tar.gz.parts.sha256
 一次运行当前启用的全部独立 E2E 和全部 Benchmark：
 
 ```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode both --work-dir ./work/v1.15.0-full --output ./results/v1.15.0-full
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode both --work-dir ./work/v1.15.0-full --output ./results/v1.15.0-full --cleanup-after-run
 ```
 
 只运行当前启用的全部独立 E2E：
 
 ```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode e2e --work-dir ./work/v1.15.0-e2e-full --output ./results/v1.15.0-e2e-full
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode e2e --work-dir ./work/v1.15.0-e2e-full --output ./results/v1.15.0-e2e-full --cleanup-after-run
 ```
 
 只运行全部 Benchmark（Gang comprehensive、Gang net-topo 和 Pod）：
 
 ```bash
-bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode benchmark --work-dir ./work/v1.15.0-benchmark-full --output ./results/v1.15.0-benchmark-full
+bash volcano-v4-deploy.sh --bundle ./volcano-v4-1.34.8-full.tar.gz.part-000 --volcano-ref v1.15.0 --mode benchmark --work-dir ./work/v1.15.0-benchmark-full --output ./results/v1.15.0-benchmark-full --cleanup-after-run
 ```
 
 只运行一个 E2E TYPE；把 `SCHEDULINGBASE` 换成“Profile 选择”列出的其他 TYPE 即可：
